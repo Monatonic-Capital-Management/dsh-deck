@@ -1,0 +1,15 @@
+# Line-ending policy.
+#
+# The remote service script is deployed to a LINUX host and executed by bash. A
+# CRLF there produces "bad interpreter: /bin/bash^M" or mysterious `$'\r'`
+# errors, so shell scripts must stay LF in the repository and in the working
+# tree regardless of the committer's platform.
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.jpg binary

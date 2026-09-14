@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Runtime state and logs: machine-specific, never committed.
+# ---------------------------------------------------------------------------
+state/
+logs/
+browser-profile/
+
+# ---------------------------------------------------------------------------
+# Per-machine configuration. This is the important one: hosts.json records the
+# SSH hosts and paths of whoever is running the tool, so it must never be
+# pushed. Commit .dshproj.json (the shared, team-wide profile list) instead, and
+# keep personal values in userProfiles or in hosts.json.
+# ---------------------------------------------------------------------------
+hosts.json
+userProfiles.json
+.dsh-launcher/
+
+# ---------------------------------------------------------------------------
+# Windows / PowerShell noise
+# ---------------------------------------------------------------------------
+*.lnk
+Thumbs.db
+desktop.ini
+*.log
+*.log.1
+*.log.err
+
+# ---------------------------------------------------------------------------
+# Editors
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---------------------------------------------------------------------------
+# Node (only used by the bundled app backend, which itself has no dependencies)
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*

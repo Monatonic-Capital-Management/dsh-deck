@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Harness</title>
+<style>
+  /* ---------------------------------------------------------------------
+     Design tokens. Single dark theme on purpose: this is a control surface
+     that sits open all day, and a stable dark palette keeps the state dots
+     and accents readable.
+     --------------------------------------------------------------------- */
+  :root {
+    --bg:            #0a0d14;
+    --bg-elev:       #121722;
+    --bg-elev-2:     #182031;
+    --line:          #232c40;
+    --line-soft:     #1b2333;
+    --text:          #e8ecf5;
+    --text-dim:      #8b98b0;
+    --text-faint:    #5d6a82;
+    --accent:        #4d8dff;
+    --accent-2:      #7c5cff;
+    --ok:            #2fd48f;
+    --warn:          #ffb454;
+    --bad:           #ff5f6d;
+    --radius:        16px;
+    --radius-sm:     10px;
+    --shadow:        0 10px 30px -12px rgba(0,0,0,.7);
+    --sans: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+    --mono: "Cascadia Code", "Cascadia Mono", Consolas, "SF Mono", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body { height: 100%; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* Ambient colour wash so the window does not read as a flat black rectangle. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: -30%;
+    background:
+      radial-gradient(38% 32% at 18% 8%,  rgba(77,141,255,.16), transparent 60%),
+      radial-gradient(34% 30% at 86% 12%, rgba(124,92,255,.14), transparent 62%),
+      radial-gradient(40% 34% at 60% 100%, rgba(47,212,143,.07), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  #app { position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column; }
+
+  /* ----------------------------------------------------------- titlebar */
+  .titlebar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 18px 22px 14px;
+    flex-shrink: 0;
+  }
+
+  .brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0;
+    background: linear-gradient(140deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center;
+    box-shadow: 0 6px 18px -6px rgba(77,141,255,.7);
+  }
+  .logo svg { width: 19px; height: 19px; }
+
+  .brand-text h1 { font-size: 15px; font-weight: 650; letter-spacing: .2px; }
+  .brand-text p  { font-size: 11.5px; color: var(--text-faint); }
+
+  .spacer { flex: 1; }
+
+  /* ------------------------------------------------------------- buttons */  button {
+    font-family: inherit; font-size: 13px; font-weight: 550;
+    color: var(--text); background: var(--bg-elev-2);
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 8px 14px; cursor: pointer;
+    transition: background .15s, border-color .15s, transform .08s, opacity .15s;
+    display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  }
+  button:hover   { background: #1e2739; border-color: #2d3a54; }
+  button:active  { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+  button svg { width: 15px; height: 15px; flex-shrink: 0; }
+
+  button.primary {
+    background: linear-gradient(140deg, var(--accent), #3f7bf0);
+    border-color: transparent; color: #fff;
+    box-shadow: 0 6px 16px -8px rgba(77,141,255,.9);
+  }
+  button.primary:hover { background: linear-gradient(140deg, #5c98ff, #4a84f5); }
+
+  button.ghost { background: transparent; border-color: transparent; color: var(--text-dim); padding: 7px 10px; }
+  button.ghost:hover { background: var(--bg-elev-2); color: var(--text); }
+
+  button.danger:hover { border-color: rgba(255,95,109,.5); color: #ffb3b8; background: rgba(255,95,109,.1); }
+
+  button.icon { padding: 7px 9px; }
+  button.icon svg { width: 16px; height: 16px; }
+
+  button.spin svg { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* --------------------------------------------------------------- body */
+  .content { flex: 1; overflow-y: auto; padding: 4px 22px 26px; }
+  .content::-webkit-scrollbar { width: 10px; }
+  .content::-webkit-scrollbar-thumb { background: #222c3e; border-radius: 6px; border: 3px solid var(--bg); }
+  .content::-webkit-scrollbar-thumb:hover { background: #2c384e; }
+
+  .section-head {
+    display: flex; align-items: baseline; gap: 10px;
+    margin: 6px 0 12px;
+  }
+  .section-head h2 { font-size: 12px; font-weight: 650; letter-spacing: .9px;
+    text-transform: uppercase; color: var(--text-faint); }
+  .section-head .count { font-size: 11.5px; color: var(--text-faint); }
+
+  /* --------------------------------------------------------------- cards */
+  .grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  }
+
+  .card {
+    position: relative;
+    background: linear-gradient(168deg, var(--bg-elev), #0e131d);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius);
+    padding: 16px;
+    box-shadow: var(--shadow);
+    transition: border-color .18s, transform .18s;
+    overflow: hidden;
+  }
+  .card:hover { border-color: #2a3550; transform: translateY(-1px); }
+
+  /* A thin state-coloured bar along the top edge: readable at a glance. */
+  .card::after {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: var(--state-color, var(--line));
+    opacity: .85;
+  }
+
+  .card.state-up          { --state-color: var(--ok); }
+  .card.state-up-external { --state-color: var(--ok); }
+  .card.state-remote-only { --state-color: var(--warn); }
+  .card.state-tunnel-only { --state-color: var(--warn); }
+  .card.state-down,
+  .card.state-unreachable,
+  .card.state-port-busy   { --state-color: var(--bad); }
+  .card.state-disabled    { --state-color: var(--line); opacity: .6; }
+
+  .card-top { display: flex; align-items: flex-start; gap: 11px; margin-bottom: 13px; }
+
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%; margin-top: 5px; flex-shrink: 0;
+    background: var(--state-color, var(--text-faint));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-color, #555) 20%, transparent);
+  }
+  .dot.live { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-color) 20%, transparent); }
+    50%      { box-shadow: 0 0 0 6px color-mix(in srgb, var(--state-color) 6%, transparent); }
+  }
+
+  .card-id { flex: 1; min-width: 0; }
+  .card-name {
+    font-size: 15px; font-weight: 620; letter-spacing: .1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .card-sub {
+    font-size: 11.5px; color: var(--text-faint); margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--mono);
+  }
+
+  .badge {
+    font-size: 10.5px; font-weight: 650; letter-spacing: .5px; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 6px; flex-shrink: 0;
+    background: color-mix(in srgb, var(--state-color) 15%, transparent);
+    color: var(--state-color);
+    border: 1px solid color-mix(in srgb, var(--state-color) 28%, transparent);
+  }
+
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 6px 8px; margin-bottom: 14px;
+    font-size: 11.5px; color: var(--text-dim);
+  }
+  .chip {
+    background: rgba(255,255,255,.035); border: 1px solid var(--line-soft);
+    border-radius: 6px; padding: 3px 8px;
+    font-family: var(--mono); font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+  }
+
+  .url-row {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 14px;
+    background: rgba(0,0,0,.28); border: 1px solid var(--line-soft);
+    border-radius: 8px; padding: 7px 10px;
+  }
+  .url-row .u {
+    flex: 1; min-width: 0; font-family: var(--mono); font-size: 11px;
+    color: #7fc7ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .url-row button { padding: 3px 7px; font-size: 11px; }
+
+  .actions { display: flex; gap: 8px; }
+  .actions .grow { flex: 1; justify-content: center; }
+
+  /* ------------------------------------------------------------ log view */
+  .logbox {
+    background: #070a10; border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+    padding: 12px; font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
+    color: #b6c2d6; white-space: pre-wrap; word-break: break-word;
+    max-height: 240px; overflow: auto; margin-top: 12px;
+  }
+  .logbox::-webkit-scrollbar { width: 9px; height: 9px; }
+  .logbox::-webkit-scrollbar-thumb { background: #222c3e; border-radius: 5px; }
+
+  /* -------------------------------------------------------------- modals */
+  .overlay {
+    position: fixed; inset: 0; z-index: 40;
+    background: rgba(4,7,12,.72); backdrop-filter: blur(6px);
+    display: grid; place-items: center; padding: 24px;
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .18s, visibility .18s;
+  }
+  .overlay.open { opacity: 1; visibility: visible; pointer-events: auto; }
+
+  .modal {
+    width: min(560px, 100%); max-height: 84vh; display: flex; flex-direction: column;
+    background: linear-gradient(168deg, var(--bg-elev), #0d121b);
+    border: 1px solid var(--line); border-radius: 18px;
+    box-shadow: 0 26px 70px -20px rgba(0,0,0,.9);
+    transform: scale(.97) translateY(6px); transition: transform .18s;
+  }
+  .overlay.open .modal { transform: scale(1) translateY(0); }
+
+  .modal-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 17px 20px; border-bottom: 1px solid var(--line-soft);
+  }
+  .modal-head h3 { font-size: 15px; font-weight: 620; flex: 1; }
+  .modal-body { padding: 18px 20px; overflow-y: auto; }
+
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; }
+  input[type=text], input[type=number], select {
+    width: 100%; font-family: inherit; font-size: 13px; color: var(--text);
+    background: #0a0e16; border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 9px 11px; margin-bottom: 14px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(77,141,255,.16);
+  }
+  .hint { font-size: 11.5px; color: var(--text-faint); margin: -9px 0 14px; }
+
+  .host-list { display: flex; flex-direction: column; gap: 7px; margin-bottom: 6px; }
+  .host-item {
+    display: flex; align-items: center; gap: 10px;
+    background: #0b1018; border: 1px solid var(--line-soft);
+    border-radius: var(--radius-sm); padding: 9px 12px;
+  }
+  .host-item .hn { flex: 1; font-family: var(--mono); font-size: 12.5px; }
+  .host-item .tag { font-size: 10.5px; color: var(--text-faint); }
+
+  .modal-foot {
+    display: flex; gap: 9px; justify-content: flex-end;
+    padding: 15px 20px; border-top: 1px solid var(--line-soft);
+  }
+
+  /* ------------------------------------------------------------- toasts */
+  .toasts {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    z-index: 60; display: flex; flex-direction: column; gap: 9px; align-items: center;
+    pointer-events: none;
+  }
+  .toast {
+    background: var(--bg-elev-2); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm); padding: 10px 16px;
+    font-size: 12.5px; box-shadow: var(--shadow);
+    animation: rise .22s ease-out;
+    max-width: 560px;
+  }
+  .toast.ok   { border-left-color: var(--ok); }
+  .toast.bad  { border-left-color: var(--bad); }
+  .toast.warn { border-left-color: var(--warn); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+
+  /* -------------------------------------------------------- empty / busy */
+  .empty { text-align: center; padding: 60px 20px; color: var(--text-faint); }
+  .empty svg { width: 40px; height: 40px; margin-bottom: 14px; opacity: .5; }
+  .empty p { font-size: 13px; margin-bottom: 16px; }
+
+  .loading { display: flex; align-items: center; justify-content: center; gap: 9px;
+    padding: 50px; color: var(--text-faint); font-size: 13px; }
+  .spinner {
+    width: 15px; height: 15px; border: 2px solid var(--line);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+
+  .busy-veil {
+    position: absolute; inset: 0; z-index: 5;
+    background: rgba(10,13,20,.6); backdrop-filter: blur(1.5px);
+    display: grid; place-items: center; border-radius: var(--radius);
+  }
+
+  /* --------------------------------------------------------------- legend */
+  .legend {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 7px 18px;
+    margin-top: 22px; padding: 13px 16px;
+    border: 1px dashed var(--line-soft); border-radius: var(--radius-sm);
+    font-size: 12px; color: var(--text-dim);
+  }
+  .legend > span { display: inline-flex; align-items: center; gap: 7px; }
+  .lg { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .lg-ok   { background: var(--ok); }
+  .lg-warn { background: var(--warn); }
+  .lg-bad  { background: var(--bad); }
+  .legend .lg-hint { color: var(--text-faint); margin-left: auto; }
+
+  /* ------------------------------------------------------------ statusbar */
+  .statusbar {
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 9px;
+    padding: 9px 22px;
+    border-top: 1px solid var(--line-soft);
+    background: rgba(9,12,18,.6);
+    font-size: 11.5px; color: var(--text-faint);
+  }
+  .sb-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--ok);
+    box-shadow: 0 0 0 3px rgba(47,212,143,.14);
+  }
+  .sb-dot.busy { background: var(--accent); box-shadow: 0 0 0 3px rgba(77,141,255,.16); }
+  .sb-dot.err  { background: var(--bad);    box-shadow: 0 0 0 3px rgba(255,95,109,.14); }
+  .sb-dot.idle { background: var(--text-faint); box-shadow: 0 0 0 3px rgba(93,106,130,.14); }
+
+  @media (max-width: 720px) {
+    .brand-text p { display: none; }
+    .legend .lg-hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="titlebar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2 4 6.5v11L12 22l8-4.5v-11L12 2Z"/>
+          <path d="m4 6.5 8 4.5 8-4.5M12 11v11"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>DeepSeek Harness</h1>
+        <p id="subtitle">正在连接…</p>
+      </div>
+    </div>
+
+    <div class="spacer"></div>
+
+    <button id="btn-refresh" class="icon" title="刷新状态">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>
+      </svg>
+    </button>
+    <button id="btn-start-all">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 3l14 9-14 9V3Z"/>
+      </svg>
+      全部启动
+    </button>
+    <button id="btn-add" class="icon" title="添加服务器">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 5v14M5 12h14"/>
+      </svg>
+    </button>
+    <button id="btn-more" class="icon" title="更多">
+      <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
+    </button>
+  </div>
+
+  <div class="content">
+    <div class="section-head">
+      <h2>连接</h2>
+      <span class="count" id="count"></span>
+    </div>
+    <div id="list">
+      <div class="loading"><div class="spinner"></div>正在检查各个实例…</div>
+    </div>
+
+    <div class="legend">
+      <span><i class="lg lg-ok"></i>运行中</span>
+      <span><i class="lg lg-warn"></i>部分可用</span>
+      <span><i class="lg lg-bad"></i>未运行</span>
+      <span class="lg-hint">点「打开」在新的窗口里使用 dsh，本面板会一直留在这里</span>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <span class="sb-dot"></span>
+    <span id="sb-text">就绪</span>
+    <span class="spacer"></span>
+    <span id="sb-updated"></span>
+  </div>
+</div>
+
+<!-- ------------------------------------------------------------- add host -->
+<div class="overlay" id="ov-add">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>添加服务器</h3>
+      <button class="ghost icon" data-close>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <label for="in-host">SSH 主机</label>
+      <input type="text" id="in-host" placeholder="DuckServer" list="ssh-hosts" autocomplete="off">
+      <datalist id="ssh-hosts"></datalist>
+      <div class="hint" id="host-hint">来自 ~/.ssh/config 的别名，密钥与端口都会自动沿用。</div>
+
+      <label for="in-name">显示名称（可留空）</label>
+      <input type="text" id="in-name" placeholder="默认与主机名相同" autocomplete="off">
+
+      <label for="in-port">远程端口</label>
+      <input type="number" id="in-port" value="3080" min="1" max="65535">
+      <div class="hint">服务器上 <code>dsh web</code> 监听的端口，默认 3080。</div>
+    </div>
+    <div class="modal-foot">
+      <button data-close>取消</button>
+      <button class="primary" id="btn-add-ok">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- ----------------------------------------------------------------- more -->
+<div class="overlay" id="ov-more">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>更多</h3>
+      <button class="ghost icon" data-close>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;flex-direction:column;gap:9px">
+        <button id="btn-stop-all" class="danger" style="justify-content:center">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          全部停止
+        </button>
+        <button id="btn-doctor" style="justify-content:center">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M3 12h18"/></svg>
+          环境自检
+        </button>
+      </div>
+      <div id="doctor-out" class="logbox" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<!-- --------------------------------------------------------------- details -->
+<div class="overlay" id="ov-detail">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="detail-title">实例</h3>
+      <button class="ghost icon" data-close>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="meta" id="detail-meta"></div>
+      <div id="detail-cmds" style="display:flex;gap:9px;flex-wrap:wrap"></div>
+      <div id="detail-log" class="logbox">选择「查看日志」以载入。</div>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+const TOKEN = "__TOKEN__";
+const api = (p, opts) => fetch(p + (p.includes("?") ? "&" : "?") + "t=" + TOKEN,
+                              Object.assign({ headers: { "Content-Type": "application/json" } }, opts || {}))
+  .then(async r => {
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+    return body;
+  });
+
+const $  = (s) => document.querySelector(s);
+
+/* ------------------------------------------------------------------ toasts */
+function toast(msg, kind) {
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "");
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, 3400);
+  setTimeout(() => el.remove(), 3800);
+}
+
+/* ------------------------------------------------------------------- state */
+let INSTANCES = [];
+let BUSY = new Set();
+
+const STATE_TEXT = {
+  "up": "运行中",
+  "up-external": "运行中",
+  "remote-only": "仅服务端",
+  "tunnel-only": "仅隧道",
+  "down": "已停止",
+  "disabled": "已禁用",
+  "unreachable": "连不上",
+  "port-busy": "端口占用",
+};
+
+const isUp = (s) => s === "up" || s === "up-external";
+
+function shortDetail(it) {
+  if (it.kind === "local") return "本机 · 端口 " + it.port;
+  const rp = it.remotePort || 3080;
+  const lp = it.port || it.localPort;
+  return (it.sshHost || "远程") + " · " + lp + " → " + rp;
+}
+
+/* ------------------------------------------------------------------- icons */
+const ICON = {
+  play:  '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 3.5l14 8.5-14 8.5v-17Z"/></svg>',
+  open:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></svg>',
+  stop:  '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  again: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+  log:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>',
+  copy:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+};
+
+/* -------------------------------------------------------------- rendering */
+function render() {
+  const list = $("#list");
+  const total = INSTANCES.length;
+  const up = INSTANCES.filter(i => isUp(i.state)).length;
+  $("#count").textContent = total ? up + " / " + total + " 个运行中" : "";
+  $("#subtitle").textContent = "本地与远程实例控制台";
+
+  if (!total) {
+    list.innerHTML = '<div class="empty">' + ICON.play +
+      "<p>还没有配置任何实例。</p>" +
+      '<button class="primary" onclick="document.getElementById(\'btn-add\').click()">添加服务器</button></div>';
+    return;
+  }
+
+  list.innerHTML = '<div class="grid">' + INSTANCES.map(card).join("") + "</div>";
+}
+
+function card(it) {
+  const busy = BUSY.has(it.name);
+  const upNow = isUp(it.state);
+  const label = STATE_TEXT[it.state] || it.state;
+
+  const live = (it.state === "up" || it.state === "up-external" || it.state === "remote-only") ? " live" : "";
+
+  let actions = "";
+  if (it.state === "disabled") {
+    actions = '<button class="grow" disabled>已在配置中禁用</button>';
+  } else if (upNow) {
+    actions =
+      '<button class="primary grow" onclick="act(\'open\',\'' + esc(it.name) + '\')">' + ICON.open + "打开</button>" +
+      '<button class="icon" title="重启" onclick="act(\'restart\',\'' + esc(it.name) + '\')">' + ICON.again + "</button>" +
+      '<button class="icon danger" title="停止" onclick="act(\'stop\',\'' + esc(it.name) + '\')">' + ICON.stop + "</button>";
+  } else {
+    actions =
+      '<button class="primary grow" onclick="act(\'start\',\'' + esc(it.name) + '\')">' + ICON.play + "启动</button>" +
+      '<button class="icon" title="详情与日志" onclick="detail(\'' + esc(it.name) + '\')">' + ICON.log + "</button>";
+    if (it.kind === "remote" && it.dshInstalled === false) {
+      actions += '<button class="icon" title="部署远程服务" onclick="act(\'install\',\'' + esc(it.name) + '\')">' +
+                 '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg></button>';
+    }
+  }
+
+  return '<div class="card state-' + esc(it.state) + '">' +
+      (busy ? '<div class="busy-veil"><div class="spinner"></div></div>' : "") +
+      '<div class="card-top">' +
+        '<div class="dot' + live + '"></div>' +
+        '<div class="card-id">' +
+          '<div class="card-name">' + esc(it.name) + "</div>" +
+          '<div class="card-sub">' + esc(shortDetail(it)) + "</div>" +
+        "</div>" +
+        '<div class="badge">' + esc(label) + "</div>" +
+      "</div>" +
+      (it.detail ? '<div class="meta"><span class="chip">' + esc(it.detail) + "</span></div>" : "") +
+      (upNow && it.url ? urlRow(it.url) : "") +
+      '<div class="actions">' + actions + "</div>" +
+    "</div>";
+}
+
+function urlRow(url) {
+  const shown = url.replace(/\?t=.*$/, "");
+  return '<div class="url-row">' +
+      '<span class="u" title="' + esc(url) + '">' + esc(shown) + "</span>" +
+      '<button class="ghost icon" title="复制链接" onclick="copyUrl(\'' + esc(url) + '\')">' + ICON.copy + "</button>" +
+    "</div>";
+}
+
+function esc(s) {
+  return String(s === undefined || s === null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/* -------------------------------------------------------------- statusbar */
+/* The status line is driven directly from load(); no separate setter. */
+
+/* ---------------------------------------------------------------- actions */
+async function load(probe) {
+  const dot = document.querySelector(".sb-dot");
+  dot.className = "sb-dot busy";
+  $("#sb-text").textContent = "正在检查…";
+  try {
+    INSTANCES = await api("/api/instances" + (probe === false ? "?probe=0" : ""));
+    render();
+    const up = INSTANCES.filter(i => isUp(i.state)).length;
+    dot.className = "sb-dot" + (up ? "" : " idle");
+    $("#sb-text").textContent = up + " / " + INSTANCES.length + " 个实例运行中";
+    $("#sb-updated").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  } catch (e) {
+    dot.className = "sb-dot err";
+    $("#sb-text").textContent = "无法连接后端：" + e.message;
+    $("#list").innerHTML = '<div class="empty">' + "<p>无法读取实例状态：" + esc(e.message) + "</p>" +
+      '<button onclick="load()">重试</button></div>';
+  }
+}
+
+async function act(kind, name) {
+  BUSY.add(name); render();
+  try {
+    if (kind === "open") {
+      const it = INSTANCES.find(i => i.name === name);
+      if (it && it.url) {
+        /* Open dsh in its OWN window instead of navigating this one: the panel
+           is the app's home, and losing it on every launch would be hostile.
+           A named window also means re-opening an instance reuses its window
+           rather than piling up duplicates. */
+        const w = window.open(it.url, "dsh-" + name, "width=1280,height=880,noopener");
+        if (!w) toast("浏览器拦截了新窗口，请允许弹出窗口", "warn");
+        else toast("已打开 " + name, "ok");
+      } else {
+        toast("该实例没有可用地址", "warn");
+      }
+      BUSY.delete(name); render();
+      return;
+    }
+    if (kind === "install") {
+      toast("正在部署远程服务…");
+      const r = await api("/api/instances/" + encodeURIComponent(name) + "/install", { method: "POST" });
+      toast(r.ok ? name + " 部署完成" : name + " 部署失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
+    } else if (kind === "start") {
+      toast("正在启动 " + name + "…");
+      const r = await api("/api/instances/" + encodeURIComponent(name) + "/start", { method: "POST" });
+      const ok = r.state && isUp(r.state.State);
+      toast(ok ? name + " 已就绪" : name + " 启动失败", ok ? "ok" : "bad");
+    } else if (kind === "stop") {
+      toast("正在停止 " + name + "…");
+      await api("/api/instances/" + encodeURIComponent(name) + "/stop", { method: "POST" });
+      toast(name + " 已停止", "ok");
+    } else if (kind === "restart") {
+      toast("正在重启 " + name + "…");
+      const r = await api("/api/instances/" + encodeURIComponent(name) + "/restart", { method: "POST" });
+      const ok = r.state && isUp(r.state.State);
+      toast(ok ? name + " 已重启" : name + " 重启失败", ok ? "ok" : "bad");
+    }
+  } catch (e) {
+    toast(name + " 操作失败：" + e.message, "bad");
+  } finally {
+    BUSY.delete(name);
+    await load();
+  }
+}
+
+async function actAll(kind) {
+  const targets = INSTANCES.filter(i => i.enabled !== false && (kind === "stop" ? isUp(i.state) : !isUp(i.state)));
+  if (!targets.length) { toast(kind === "stop" ? "没有正在运行的实例" : "所有实例都已在运行", "warn"); return; }
+  const btn = kind === "stop" ? $("#btn-stop-all") : $("#btn-start-all");
+  btn.classList.add("spin"); btn.disabled = true;
+  toast("正在" + (kind === "stop" ? "停止" : "启动") + " " + targets.length + " 个实例…");
+  let ok = 0;
+  for (const it of targets) {
+    BUSY.add(it.name); render();
+    try {
+      await api("/api/instances/" + encodeURIComponent(it.name) + "/" + kind, { method: "POST" });
+      ok++;
+    } catch (e) { toast(it.name + "：" + e.message, "bad"); }
+    BUSY.delete(it.name); render();
+  }
+  btn.classList.remove("spin"); btn.disabled = false;
+  toast(ok + " / " + targets.length + " 个实例已" + (kind === "stop" ? "停止" : "启动"), "ok");
+  await load();
+}
+
+function copyUrl(url) {
+  navigator.clipboard.writeText(url).then(
+    () => toast("链接已复制", "ok"),
+    () => toast("复制失败", "bad")
+  );
+}
+
+/* ---------------------------------------------------------------- details */
+async function detail(name) {
+  const it = INSTANCES.find(i => i.name === name);
+  if (!it) return;
+  $("#detail-title").textContent = name;
+  $("#detail-meta").innerHTML =
+    '<span class="chip">' + esc(it.kind === "local" ? "本机" : "远程") + "</span>" +
+    '<span class="chip">' + esc(STATE_TEXT[it.state] || it.state) + "</span>" +
+    (it.sshHost ? '<span class="chip">ssh ' + esc(it.sshHost) + "</span>" : "") +
+    '<span class="chip">端口 ' + esc(it.port) + "</span>" +
+    (it.description ? '<span class="chip">' + esc(it.description) + "</span>" : "");
+
+  const cmds = [];
+  if (!isUp(it.state)) cmds.push('<button class="primary" onclick="act(\'start\',\'' + esc(name) + '\')">' + ICON.play + "启动</button>");
+  if (isUp(it.state)) {
+    cmds.push('<button class="primary" onclick="act(\'open\',\'' + esc(name) + '\')">' + ICON.open + "打开</button>");
+    cmds.push('<button onclick="act(\'restart\',\'' + esc(name) + '\')">' + ICON.again + "重启</button>");
+    cmds.push('<button class="danger" onclick="act(\'stop\',\'' + esc(name) + '\')">' + ICON.stop + "停止</button>");
+  }
+  cmds.push('<button onclick="loadLog(\'' + esc(name) + '\')">' + ICON.log + "载入日志</button>");
+  if (it.kind === "remote") cmds.push('<button onclick="act(\'install\',\'' + esc(name) + '\')">部署远程服务</button>');
+  $("#detail-cmds").innerHTML = cmds.join("");
+
+  $("#detail-log").textContent = "正在载入日志…";
+  openOverlay("#ov-detail");
+  loadLog(name);
+}
+
+async function loadLog(name) {
+  const box = $("#detail-log");
+  box.textContent = "正在载入日志…";
+  try {
+    const r = await api("/api/instances/" + encodeURIComponent(name) + "/logs?lines=200");
+    box.textContent = r.text;
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    box.textContent = "无法载入日志：" + e.message;
+  }
+}
+
+/* ----------------------------------------------------------------- modals */
+function openOverlay(sel)  { $(sel).classList.add("open"); }
+function closeOverlay(sel) { $(sel).classList.remove("open"); }
+
+document.querySelectorAll("[data-close]").forEach(b =>
+  b.addEventListener("click", () => b.closest(".overlay").classList.remove("open")));
+document.querySelectorAll(".overlay").forEach(o =>
+  o.addEventListener("click", (e) => { if (e.target === o) o.classList.remove("open"); }));
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") document.querySelectorAll(".overlay.open").forEach(o => o.classList.remove("open"));
+});
+
+/* --------------------------------------------------------------- add host */
+async function openAdd() {
+  openOverlay("#ov-add");
+  $("#in-host").value = ""; $("#in-name").value = ""; $("#in-port").value = "3080";
+  $("#host-hint").textContent = "正在读取 ~/.ssh/config…";
+  try {
+    const r = await api("/api/ssh-hosts");
+    $("#ssh-hosts").innerHTML = r.hosts
+      .filter(h => !h.configured)
+      .map(h => '<option value="' + esc(h.name) + '"></option>').join("");
+    const free = r.hosts.filter(h => !h.configured).length;
+    $("#host-hint").textContent = free
+      ? "来自 " + r.configPath + " 的 " + free + " 个未添加主机，输入或下拉选择。"
+      : "~/.ssh/config 中的主机都已添加。";
+  } catch (e) {
+    $("#host-hint").textContent = "读取 ssh 配置失败：" + e.message;
+  }
+  setTimeout(() => $("#in-host").focus(), 60);
+}
+
+async function submitAdd() {
+  const sshHost = $("#in-host").value.trim();
+  if (!sshHost) { toast("请填写 SSH 主机", "warn"); return; }
+  const body = { sshHost };
+  if ($("#in-name").value.trim()) body.name = $("#in-name").value.trim();
+  const p = parseInt($("#in-port").value, 10);
+  if (p) body.port = p;
+  const btn = $("#btn-add-ok");
+  btn.disabled = true; btn.textContent = "添加中…";
+  try {
+    const r = await api("/api/instances", { method: "POST", body: JSON.stringify(body) });
+    if (!r.ok) { toast("添加失败：" + (r.raw || ""), "bad"); return; }
+    toast("已添加 " + sshHost, "ok");
+    closeOverlay("#ov-add");
+    await load();
+  } catch (e) {
+    toast("添加失败：" + e.message, "bad");
+  } finally {
+    btn.disabled = false; btn.textContent = "添加";
+  }
+}
+
+/* -------------------------------------------------------------- wiring up */
+$("#btn-refresh").addEventListener("click", async (e) => {
+  const b = e.currentTarget; b.classList.add("spin");
+  await load(); b.classList.remove("spin"); toast("状态已刷新");
+});
+$("#btn-start-all").addEventListener("click", () => actAll("start"));
+$("#btn-stop-all").addEventListener("click", async () => { closeOverlay("#ov-more"); await actAll("stop"); });
+$("#btn-add").addEventListener("click", openAdd);
+$("#btn-more").addEventListener("click", () => openOverlay("#ov-more"));
+$("#btn-add-ok").addEventListener("click", submitAdd);
+$("#in-host").addEventListener("keydown", (e) => { if (e.key === "Enter") submitAdd(); });
+
+$("#btn-doctor").addEventListener("click", async (e) => {
+  const box = $("#doctor-out");
+  box.style.display = "block"; box.textContent = "正在自检…";
+  try {
+    const r = await api("/api/doctor");
+    box.textContent = r.text;
+  } catch (err) {
+    box.textContent = "自检失败：" + err.message;
+  }
+});
+
+/* Poll while the window is visible so state stays truthful, but back off when
+   it is hidden: no point probing ssh tunnels behind the user's back. */
+let timer = null;
+function schedule() {
+  clearInterval(timer);
+  timer = setInterval(() => { if (!document.hidden) load(); }, document.hidden ? 60000 : 20000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); schedule(); });
+
+load().then(schedule);
+</script>
+</body>
+</html>

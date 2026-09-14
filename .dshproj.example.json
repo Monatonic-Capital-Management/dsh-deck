@@ -1,0 +1,62 @@
+{
+  "//": "Example shared configuration. Copy to .dshproj.json in the repo root, or",
+  "//2": "to hosts.json for a private per-machine setup. See docs/configuration.md.",
+
+  "version": 1,
+
+  "//profiles": "Named server profiles, safe to commit and share with a team.",
+  "profiles": [
+    {
+      "name": "prod",
+      "description": "Production box, reached over an SSH alias",
+      "sshHost": "prod",
+      "remotePort": 3080
+    },
+    {
+      "name": "gpu-box",
+      "description": "Training box; needs a jump host and a different user",
+      "sshHost": "gpu",
+      "sshUser": "ml",
+      "identityFile": "~/.ssh/gpu_ed25519",
+      "jumpHost": "bastion",
+      "remotePort": 3080
+    }
+  ],
+
+  "//userProfiles": "Per-user overrides, keyed by OS username. Use this to keep",
+  "//userProfiles2": "credentials and usernames out of the shared file.",
+  "userProfiles": {
+    "alice": {
+      "prod": { "sshUser": "alice", "identityFile": "~/.ssh/id_ed25519" }
+    },
+    "bob": {
+      "prod": { "sshUser": "bob", "identityFile": "~/.ssh/work_rsa" }
+    }
+  },
+
+  "//instances": "What shows up in the panel. Omit sshHost and reference a",
+  "//instances2": "profile instead; local instances need no ssh at all.",
+  "instances": [
+    {
+      "name": "local",
+      "kind": "local",
+      "enabled": true,
+      "port": 3080,
+      "description": "dsh web on this machine"
+    },
+    {
+      "name": "prod",
+      "profile": "prod",
+      "enabled": true,
+      "localPort": 3099,
+      "description": "dsh web in production, reached over an SSH tunnel"
+    },
+    {
+      "name": "gpu",
+      "profile": "gpu-box",
+      "enabled": false,
+      "localPort": 3100,
+      "description": "Disabled for now; flip enabled to true when needed"
+    }
+  ]
+}
