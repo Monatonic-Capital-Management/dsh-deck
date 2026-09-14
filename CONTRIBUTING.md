@@ -15,21 +15,39 @@ cd dsh-deck
 No build step and no dependencies. `app/server.js` is required by CI to use only
 Node builtins — please keep it that way, since "clone and run" is a feature.
 
-## The one rule that will bite you
+## The traps that will actually bite you
 
-**`.ps1` files must keep their UTF-8 BOM.** Windows PowerShell 5.1 decodes a
+**1. `.ps1` files must keep their UTF-8 BOM.** Windows PowerShell 5.1 decodes a
 BOM-less file as ANSI, which turns the Chinese UI strings into mojibake and often
-stops the file parsing entirely. Many editors and patch tools strip the BOM
-without telling you.
+stops the file parsing entirely:
 
-After editing any `.ps1`:
+```
+Unexpected token '鏈嶅姟绔繍琛屼腑' in expression or statement.
+```
+
+Many editors and patch tools silently strip the BOM when they write a file, so
+this is not a one-off mistake you make and learn from — it comes back. After
+editing any `.ps1`:
 
 ```powershell
 .\tools\fix-bom.ps1
 ```
 
-CI fails the build if a `.ps1` lacks a BOM, so this is enforced rather than
-advised.
+CI fails the build if any `.ps1` lacks a BOM, so a missed case cannot reach `main`.
+
+**2. Never pass a trailing switch after a positional target.** `$Target` does not
+accept remaining arguments precisely because `ValueFromRemainingArguments` swallows
+trailing switches into it, silently dropping them:
+
+```powershell
+.\dsh.ps1 start prod -Json      # WRONG: -Json lands in $Target
+.\dsh.ps1 -Command start -Target prod -Json   # right
+```
+
+**3. Bash scripts are always single-quoted here-strings.** Inside `@"..."@`,
+PowerShell expands `$(...)` and `$VAR` locally, before anything reaches the remote
+host, producing an error that looks like a bash bug. Use `@'...'@` and substitute
+placeholders afterwards if you need values injected.
 
 ## House style
 

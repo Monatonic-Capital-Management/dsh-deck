@@ -153,9 +153,44 @@ could not bind, so it lingered as a stopped process while `systemctl` reported
 **Fix:** compare the pid that actually holds the port (`ss -ltnpH`) against the
 unit's `MainPID`, and clear the orphan before restarting.
 
+## 14. A process search that matches itself
+
+The tray is found by scanning for its own command line:
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*-Command tray-loop*' }
+```
+
+Every process whose command line merely *contains* that text matches. That
+includes any script that runs `dsh.ps1 -Command tray-loop`, and — the part that
+cost real time — the very script doing the searching, because the pattern appears
+in its own source. So the tool counted **itself** as a running tray, and a stop
+would kill one tray and immediately "find" another.
+
+Worse, the false positive was invisible: `$live.Count` was never zero, so every
+code path looked correct while behaving nonsensically.
+
+**Two fixes, both worth keeping:**
+1. Anchor the match to the real invocation shape
+   (`dsh\.ps1"?\s+-Command\s+tray-loop`) and exclude the current process.
+2. Prefer a **pid file owned by the long-lived process itself**, which cannot be
+   fooled this way. A parent-written pid file is not equivalent: it survives a
+   crashed child and then reports a process that does not exist.
+
+## 15. A default that performs an action
+
+The tray endpoint read its action from the request and defaulted to `"start"`
+when absent. An older cached page therefore POSTed with no action and silently
+started a tray on every poll, which looked exactly like "stop is resurrecting the
+tray". Two separate bugs — the stale page and the default — produced one
+convincing illusion.
+
+**Rule:** a mutating endpoint must reject a missing action; never default to the
+one that changes state.
+
 ## The pattern
 
-Twelve of these thirteen produce a **success report followed by nothing working**.
-That is why this project prefers loudly verifying the end state — does the port
-listen, does the binary print a version, does the token redeem — over trusting
-that a step "succeeded".
+The majority of these produce a **success report followed by nothing working**.
+That is why this project verifies the end state — does the port listen, does the
+binary print a version, does the token redeem — instead of trusting that a step
+"returned 0".

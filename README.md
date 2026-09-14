@@ -27,6 +27,9 @@ a working window. Adding a brand-new server auto-installs everything it needs.
   down", because those need different actions from you.
 - **Version drift detection.** Warns when a server's dsh differs from your local
   one — the mismatch that silently changes behaviour between releases.
+- **Tray and notifications.** An optional tray icon shows the worst state across
+  instances and notifies you when one changes, so a tunnel dying at 3am is not
+  something you discover later.
 - **Local by design.** The backend binds `127.0.0.1`, requires a per-launch token,
   sends no telemetry, and never exposes dsh to the network.
 
@@ -84,6 +87,8 @@ dsh.ps1 -Command install -Target prod   provision and deploy only
 dsh.ps1 -Command add -SshHost prod      register a host from ~/.ssh/config
 dsh.ps1 -Command list                   show configured instances
 dsh.ps1 -Command doctor                 diagnose this machine and every host
+dsh.ps1 -Command tray                   tray icon + state-change notifications
+dsh.ps1 -Command tray-stop              stop the tray
 dsh.ps1 -Command menu                   terminal control panel
 ```
 

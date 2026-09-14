@@ -105,6 +105,15 @@
   button.ghost { background: transparent; border-color: transparent; color: var(--text-dim); padding: 7px 10px; }
   button.ghost:hover { background: var(--bg-elev-2); color: var(--text); }
 
+  /* Active state for the tray toggle: filled accent, so "on" is obvious at a
+     glance without adding a second label. */
+  button.toggled {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  button.toggled svg { fill: color-mix(in srgb, var(--accent) 30%, transparent); }
+
   button.danger:hover { border-color: rgba(255,95,109,.5); color: #ffb3b8; background: rgba(255,95,109,.1); }
 
   button.icon { padding: 7px 9px; }
@@ -378,6 +387,12 @@
     <button id="btn-refresh" class="icon" title="刷新状态">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>
+      </svg>
+    </button>
+    <button id="btn-tray" class="icon" title="托盘监控：在通知区域显示状态，状态变化时提醒">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+        <path d="M13.7 21a2 2 0 0 1-3.4 0"/>
       </svg>
     </button>
     <button id="btn-start-all">
@@ -814,6 +829,49 @@ async function submitAdd() {
   }
 }
 
+/* ------------------------------------------------------------ tray toggle */
+let TRAY_ON = false;
+
+function paintTray() {
+  const b = $("#btn-tray");
+  b.classList.toggle("toggled", TRAY_ON);
+  b.title = TRAY_ON
+    ? "托盘监控已开启（点击关闭）"
+    : "托盘监控：在通知区域显示状态，状态变化时提醒";
+}
+
+async function refreshTray() {
+  try {
+    const r = await api("/api/tray");
+    TRAY_ON = Boolean(r.running);
+  } catch (e) {
+    TRAY_ON = false;
+  }
+  paintTray();
+}
+
+async function toggleTray() {
+  const b = $("#btn-tray");
+  b.disabled = true;
+  try {
+    // The action travels in the query string: a JSON body has to survive shell
+    // quoting to be testable from a script, and when it does not the server
+    // silently defaults to "start".
+    const r = await api("/api/tray?action=" + (TRAY_ON ? "stop" : "start"), {
+      method: "POST",
+    });
+    TRAY_ON = Boolean(r.running);
+    toast(TRAY_ON ? "托盘监控已开启，状态变化时会提醒你" : "托盘监控已关闭", "ok");
+  } catch (e) {
+    toast("托盘操作失败：" + e.message, "bad");
+  } finally {
+    b.disabled = false;
+    paintTray();
+  }
+}
+
+$("#btn-tray").addEventListener("click", toggleTray);
+
 /* -------------------------------------------------------------- wiring up */
 $("#btn-refresh").addEventListener("click", async (e) => {
   const b = e.currentTarget; b.classList.add("spin");
@@ -847,6 +905,7 @@ function schedule() {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); schedule(); });
 
 load().then(schedule);
+refreshTray();
 </script>
 </body>
 </html>

@@ -347,6 +347,49 @@ const routes = {
     };
   },
 
+  'GET /api/tray': async () => {
+    // The launcher owns tray process management, so ask it rather than tracking
+    // state here: the tray can equally be started from the command line.
+    const r = await psJson(show('tray'), 30000);
+    return { running: Boolean(r && r.running), pid: (r && r.pid) || 0 };
+  },
+
+  'POST /api/tray': async (ctx) => {
+    // The action is read from the QUERY STRING first and the body second, and it
+    // is REQUIRED. It used to default to "start", which meant any caller that
+    // omitted it -- an older cached page, a hand-run curl -- silently started a
+    // tray instead of doing nothing, and stops appeared to resurrect the tray.
+    const action = String(
+      ctx.url.searchParams.get('action') ||
+      (ctx.body && ctx.body.action) ||
+      ''
+    ).toLowerCase();
+    if (action !== 'start' && action !== 'stop') {
+      const e = new Error("action must be 'start' or 'stop'");
+      e.statusCode = 400;
+      throw e;
+    }
+    const stop = action === 'stop';
+
+    // Start/stop use the dedicated verbs, then CONFIRM by re-reading status
+    // rather than trusting the verb's own output. A detached process can lose its
+    // stdout before printing a result (its console may already be gone), so "did
+    // it report success" is not a reliable question; "is it running now" is.
+    const r = await psRun(show(stop ? 'tray-stop' : 'tray-start'), 60000);
+    let status = null;
+    try {
+      status = await psJson(show('tray'), 30000);
+    } catch (_) { /* fall through to the raw output */ }
+    const running = Boolean(status && status.running);
+    return {
+      ok: stop ? !running : running,
+      running,
+      pid: (status && status.pid) || 0,
+      action,
+      raw: (r.out || '').trim(),
+    };
+  },
+
   'GET /api/doctor': async () => {
     const r = await psRun(show('doctor'), 300000);
     return { text: (r.out || '').replace(/\r/g, '') };

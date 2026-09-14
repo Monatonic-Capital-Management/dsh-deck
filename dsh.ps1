@@ -60,7 +60,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu','app','status','start','stop','restart','open','logs','add','list','install','doctor')]
+  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','doctor')]
   [string]$Command = 'menu',
 
   [Parameter(Position = 1)]
@@ -88,7 +88,9 @@ param(
   # (NamedParameterNotFound) rather than treating it as a positional argument.
   [switch]$Stop,
 
-  [string]$SshConfigPath   # override the ssh config used for host discovery
+  [string]$SshConfigPath,  # override the ssh config used for host discovery
+
+  [int]$TrayInterval = 20  # seconds between tray state polls
 )
 
 Set-StrictMode -Version Latest
@@ -1666,6 +1668,269 @@ function Stop-App {
   if ($killed -gt 0) { Write-Ok "closed $killed app window process(es)" }
 }
 
+function Start-TrayLoop([int]$IntervalSeconds = 20) {
+  <# A tray icon that polls instance state and raises a balloon whenever an
+     instance changes state. This is the one genuinely event-like part of the
+     tool: a tunnel dying while you are not looking is only useful to know about
+     if something tells you.
+
+     Threading, because getting this wrong freezes the icon silently:
+       * WinForms needs an STA thread with a running message loop. PowerShell
+         5.1's console host is STA by default, so the icon and menu are created
+         here and Application.Run owns this thread.
+       * Polling must NOT run on that thread, or the loop stops pumping messages
+         and the icon stops responding to clicks. A WinForms Timer marshals each
+         tick back onto the UI thread between message pumps.
+     Balloon tips are used rather than WinRT toasts: no extra module, works on
+     every supported Windows version. #>
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+
+  $icon = New-Object System.Windows.Forms.NotifyIcon
+  # Borrow the shell's own icon so there is no binary asset to ship.
+  try {
+    $icon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon(
+      (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+  } catch { }
+  $icon.Text = 'dsh-deck'
+  $icon.Visible = $true
+
+  $menu = New-Object System.Windows.Forms.ContextMenuStrip
+  $miOpen  = $menu.Items.Add('打开面板')
+  $miStart = $menu.Items.Add('全部启动')
+  $miStop  = $menu.Items.Add('全部停止')
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  $miExit  = $menu.Items.Add('退出托盘（后端继续运行）')
+
+  $miOpen.add_Click({  try { Invoke-App -Quiet } catch { } })
+  $miStart.add_Click({ try { Invoke-Start $null -Quiet } catch { } })
+  $miStop.add_Click({  try { Invoke-Stop $null } catch { } })
+  $miExit.add_Click({
+    $icon.Visible = $false
+    [System.Windows.Forms.Application]::Exit()
+  })
+  $icon.ContextMenuStrip = $menu
+
+  $form = New-Object System.Windows.Forms.Form
+  $form.ShowInTaskbar = $false
+  $form.WindowState = 'Minimized'
+  $form.Visible = $false
+
+  $previous = @{}
+
+  $tick = {
+    try {
+      $rows = @(Get-AllStatus -NoProbeHttp)
+      foreach ($r in $rows) {
+        if ($previous.ContainsKey($r.Name)) {
+          $was = $previous[$r.Name]
+          if ($was -ne $r.State) {
+            $good = ($r.State -eq 'up' -or $r.State -eq 'up-external')
+            $icon.ShowBalloonTip(
+              6000,
+              "dsh-deck: $($r.Name)",
+              $(if ($good) { "现在可用（$($r.State)）" } else { "状态变为 $($r.State) — $($r.Detail)" }),
+              $(if ($good) { 'Info' } else { 'Warning' })
+            )
+            Write-Log "tray: $($r.Name) $was -> $($r.State)"
+          }
+        }
+        $previous[$r.Name] = $r.State
+      }
+      # Windows truncates the tooltip near 63 characters.
+      $up = @($rows | Where-Object { $_.State -eq 'up' -or $_.State -eq 'up-external' }).Count
+      $icon.Text = "dsh-deck  $up/$(@($rows).Count) 运行中"
+    } catch {
+      Write-Log "tray tick failed: $($_.Exception.Message)"
+    }
+  }
+
+  $timer = New-Object System.Windows.Forms.Timer
+  $timer.Interval = [Math]::Max(5, $IntervalSeconds) * 1000
+  $timer.add_Tick($tick)
+
+  # Claim the pid file from inside the long-lived process, so it is accurate for
+  # our whole lifetime and self-cleaning on exit. A parent-written record outlives
+  # a crashed child and would then report a tray that does not exist.
+  #
+  # The tick body is wrapped in try/catch deliberately: an unhandled exception
+  # inside a WinForms event handler is swallowed by the message loop without a
+  # trace, so a bug in status polling would silently freeze the icon rather than
+  # surface anywhere.
+  $pidFile = Join-Path $StateDir 'tray.json'
+  $form.add_Shown({
+    try {
+      [pscustomobject]@{
+        pid = $PID; interval = $IntervalSeconds; startedAt = (Get-Date).ToString('o')
+      } | ConvertTo-Json | Set-Content -Path $pidFile -Encoding UTF8
+    } catch {
+      Write-Log "tray: could not write pid file: $($_.Exception.Message)"
+    }
+    & $tick
+    $timer.Start()
+  })
+
+  $icon.ShowBalloonTip(4000, 'dsh-deck', '托盘已启动，正在监控实例状态', 'Info')
+
+  try {
+    [System.Windows.Forms.Application]::Run($form)
+  } finally {
+    $timer.Stop()
+    $icon.Visible = $false
+    $icon.Dispose()
+    # Only remove the pid file if it is still ours, so a newer tray is not erased.
+    try {
+      if (Test-Path $pidFile) {
+        $recorded = [int]((Get-Content $pidFile -Raw -Encoding UTF8 | ConvertFrom-Json).pid)
+        if ($recorded -eq $PID) { Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }
+      }
+    } catch { }
+  }
+}
+
+function Get-RunningTrayPid {
+  <# The pid of the live tray, or 0.
+
+     The pid file is the authority, and it is owned by the long-lived tray process
+     itself: it writes its own pid once its message loop is up and removes the file
+     on exit, including exit by taskkill, because PowerShell still runs a finally
+     block on termination. That self-cleaning property is the point. An earlier
+     design had the PARENT write the pid, so a crash or an external kill left an
+     entry claiming a tray existed when none did.
+
+     Deliberately does NOT also scan the process table. Matching trays by command
+     line proved unreliable -- the pattern also matched scripts and handlers whose
+     command line merely contained the text, so the tool repeatedly counted itself
+     as a tray, and a "stop" would kill one and instantly find another. A pid file
+     cannot be fooled that way. #>
+  $stateFile = Join-Path $StateDir 'tray.json'
+  if (-not (Test-Path $stateFile)) { return 0 }
+  try {
+    $pid_ = [int]((Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json).pid)
+    if ($pid_ -gt 0 -and (Get-Process -Id $pid_ -ErrorAction SilentlyContinue)) { return $pid_ }
+  } catch { }
+  Remove-Item $stateFile -Force -ErrorAction SilentlyContinue
+  return 0
+}
+
+function Get-LiveTrays {
+  <# Tray processes, identified by command line.
+
+     The match has to be anchored to the real invocation. A loose
+     `-like '*-Command tray-loop*'` also matches any process whose command line
+     merely CONTAINS that text -- a script that runs `dsh.ps1 -Command tray-loop`,
+     or even this function's own caller when the string appears in its source. The
+     tool was therefore counting itself as a tray, which is why a stop would kill
+     one and immediately "find" another. Anchoring on the
+     `-File ... dsh.ps1 -Command tray-loop` shape excludes those false positives.
+
+     Returns a plain array; callers wrap it in @(). Do NOT return ,@(...): that
+     nests the array one level deeper, so .Count reports 1 even when nothing
+     matched and $live[0] yields the inner array instead of a pid. #>
+  $out = @()
+  $all = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+           Where-Object {
+             $_.CommandLine -and
+             $_.ProcessId -ne $PID -and
+             $_.CommandLine -match 'dsh\.ps1"?\s+-Command\s+tray-loop(\s|$)'
+           })
+  foreach ($p in $all) { $out += [int]$p.ProcessId }
+  return $out
+}
+
+function Invoke-Tray([switch]$Stop) {
+  <# Manage the tray as a tracked background process.
+
+     The tray needs a WinForms message loop on its own STA thread, so it cannot
+     share a process with either a console command or the app backend. It is
+     therefore started detached with its pid recorded -- the same pattern the
+     backend uses. Without the record, every invocation would leave another icon
+     in the notification area.
+
+     The lock file is the authority on whether a tray is running, not the pid
+     cache and not a process count: the lock is atomic, so concurrent calls cannot
+     both decide to start one. The json file only records the pid for display and
+     for `tray-stop` to target. #>
+  $stateFile = Join-Path $StateDir 'tray.json'
+  $lockFile  = Join-Path $StateDir 'tray.lock'
+  $wantStop  = [bool]$Stop
+
+  if ($wantStop) {
+    $target = Get-RunningTrayPid
+    if ($target -gt 0) {
+      # taskkill writes "process not found" to the error stream when a child has
+      # already exited; with $ErrorActionPreference='Stop' an unhandled native
+      # error would abort the stop although the tray is in fact already gone.
+      try { $null = & taskkill.exe /PID $target /T /F 2>&1 } catch { }
+      # Give the tray's finally block a moment to remove its own pid file.
+      $deadline = (Get-Date).AddSeconds(5)
+      while ((Get-Date) -lt $deadline -and (Test-Path $stateFile)) { Start-Sleep -Milliseconds 200 }
+    }
+    Remove-Item $stateFile -Force -ErrorAction SilentlyContinue
+    if ($target -eq 0) {
+      if (-not $Json) { Write-Info 'tray was not running' }
+    } elseif (-not $Json) {
+      Write-Ok "tray stopped (pid $target)"
+    }
+    if ($Json) { Write-Json @{ ok = $true; running = $false; stopped = $(if ($target -gt 0) { 1 } else { 0 }) } }
+    return
+  }
+
+  $running = Get-RunningTrayPid
+  if ($running -gt 0) {
+    if ($Json) { Write-Json @{ ok = $true; running = $true; pid = $running } }
+    else { Write-Info "tray already running (pid $running)" }
+    return
+  }
+
+  $scriptPath = $PSCommandPath
+  if (-not $scriptPath) { $scriptPath = Join-Path $LauncherDir 'dsh.ps1' }
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -Command tray-loop -TrayInterval $TrayInterval"
+  $psi.WorkingDirectory = $LauncherDir
+  # UseShellExecute detaches it: no inherited handles, so closing this console
+  # does not take the tray with it.
+  $psi.UseShellExecute = $true
+  $psi.WindowStyle = 'Hidden'
+  $psi.CreateNoWindow = $true
+
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $psi
+  [void]$proc.Start()
+
+  # The tray writes its own pid file once its message loop is up, so wait for that
+  # rather than inventing a pid record here: a parent-written record outlives a
+  # crashed child and would then claim a tray exists when none does.
+  $deadline = (Get-Date).AddSeconds(15)
+  while ((Get-Date) -lt $deadline) {
+    if ($proc.HasExited) { break }
+    if (Test-Path $stateFile) {
+      try {
+        if ([int]((Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json).pid) -eq $proc.Id) { break }
+      } catch { }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+
+  if ($proc.HasExited) {
+    if ($Json) { Write-Json @{ ok = $false; running = $false; error = "tray exited immediately (code $($proc.ExitCode))" } }
+    else { Write-Err "tray exited immediately (code $($proc.ExitCode))" }
+    return
+  }
+
+  if ($Json) {
+    Write-Json @{ ok = $true; running = $true; pid = $proc.Id }
+    return
+  }
+
+  Write-Ok "tray started (pid $($proc.Id), polling every $TrayInterval s)"
+  Write-Info 'right-click the tray icon for 打开面板 / 全部启动 / 全部停止'
+  Write-Info 'notifications appear when an instance changes state'
+  Write-Info 'stop it with: dsh.ps1 -Command tray-stop'
+}
+
 function Invoke-Doctor {
   Write-Head 'this machine'
   Write-Info "powershell : $($PSVersionTable.PSVersion)"
@@ -1760,16 +2025,30 @@ function Invoke-Menu {
 # --------------------------------------------------------------------------
 
 function Write-Json($Obj) {
-  <# Serialize with matching depth and no BOM. ConvertTo-Json in PS 5.1 escapes
-     non-ASCII, which is harmless because the consumer parses JSON rather than
-     reading bytes. #>
-  $Obj | ConvertTo-Json -Depth 8 -Compress
+  <# Serialize with matching depth and no BOM, and never let a dead stdout abort
+     the caller. Detached processes are started with UseShellExecute so they do
+     not inherit console handles; if the originating console has already exited,
+     writing the result throws, and $ErrorActionPreference='Stop' would turn that
+     into a crash after the work had in fact succeeded. #>
+  try {
+    $Obj | ConvertTo-Json -Depth 8 -Compress | Write-Output
+  } catch {
+    try { Write-Log "Write-Json failed (stdout closed?): $($_.Exception.Message)" } catch { }
+  }
 }
 
 try {
   switch ($Command) {
     'menu'    { Invoke-Menu }
     'app'     { if ($PSBoundParameters.ContainsKey('Stop') -and [bool]$Stop) { Stop-App } else { Invoke-App } }
+    # `tray` starts or toggles, `tray-start` is the explicit form for scripted
+    # callers, and `tray-stop` exists because a trailing -Stop switch would be
+    # collected into the positional target list instead of reaching this switch.
+    'tray'       { Invoke-Tray -Stop:($PSBoundParameters.ContainsKey('Stop') -and [bool]$Stop) }
+    'tray-start' { Invoke-Tray }
+    'tray-stop'  { Invoke-Tray -Stop }
+    # Internal: the detached process that owns the tray's message loop.
+    'tray-loop'  { Start-TrayLoop -IntervalSeconds $TrayInterval }
     'status'  { $rows = @(Get-AllStatus)
                 if ($Json) { Write-Json $rows } else { Write-StatusTable $rows } }
     'start'   { if ($Json) { Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp) }
