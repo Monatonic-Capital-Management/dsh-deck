@@ -1,15 +1,32 @@
 # `dsh web` lifecycle & API surface — evidence report
 
+> **Context.** Written while building dsh-deck, to answer questions the CLI help
+> does not: is there a stop command, what exactly does the startup URL do, what
+> does `--host` accept, and is there a service helper. Kept because those answers
+> still hold and because the method is reusable.
+>
+> **One finding has since been superseded.** This report concludes there is no
+> `?token=` URL and no authentication. That is true of the version installed
+> here, **`0.1.1-rc.2`** — but **`0.1.5-rc.1` and later do print a one-time token
+> URL and answer `401` until it is redeemed**, returning a signed cookie bound to
+> the request authority. Verified directly against 0.1.5-rc.1 on two servers; see
+> [architecture.md](architecture.md).
+>
+> That change of auth model between two releases is precisely why dsh-deck
+> detects version drift: a local and a remote instance can differ in behaviour in
+> a way that stays invisible until a request fails.
+
 Package investigated: `@deepseek-ai/dsh@0.1.1-rc.2`, installed at
 `C:\Users\<you>\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\` (`package.json:4`, `:14-16` → `bin.dsh = lib/bin.js`).
 All paths below are relative to that root unless stated otherwise. The bundle is **not** minified — `lib/*.js` is
 readable, per-module output with `//#region` markers, so line numbers are exact.
 
-> **Headline correction.** This build has **no `?token=` URL, no cookie, and no 401 anywhere.** The startup URL is
-> plain `http://127.0.0.1:<port>`, `/` answers **200 without any credential**, and the access-control layer is a
-> **Host-header "browser-trust fence" that answers 403** (not 401) — explicitly documented in-source as *not* an
-> authentication layer. The 401/303/signed-cookie behaviour in the task brief does not exist in the installed code,
-> and I could not find it in any dependency. Details and the positive evidence for each claim are in Q2/Q3.
+> **Headline correction (for this build).** This build has **no `?token=` URL, no
+> cookie, and no 401 anywhere.** The startup URL is plain
+> `http://127.0.0.1:<port>`, `/` answers **200 without any credential**, and the
+> access-control layer is a **Host-header "browser-trust fence" that answers
+> 403** (not 401) — documented in-source as *not* an authentication layer. As
+> noted above, this does not hold for 0.1.5+.
 
 ---
 
