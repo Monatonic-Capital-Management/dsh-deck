@@ -45,7 +45,7 @@ No `npm install` step, and the app backend has **zero dependencies**.
 ## Quick start
 
 ```powershell
-git clone https://github.com/Monotonic-Capital-Management/dsh-deck.git
+git clone https://github.com/Monatonic-Capital-Management/dsh-deck.git
 cd dsh-deck
 .\dsh.ps1 -Command app
 ```
