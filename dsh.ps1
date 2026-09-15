@@ -187,7 +187,10 @@ function Invoke-B64([string]$Script, [string]$SshHostName, [int]$TimeoutSec = 30
   # the duration of the call and keep stderr as ordinary text.
   $prevEap = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=10 $SshHostName "echo $b64 | base64 -d | bash" 2>&1 }
+  # accept-new matches what Test-SshReachable used to do: this is the only ssh
+  # call on the status path now, so a host whose key is not in known_hosts yet
+  # must still be reachable on the first probe rather than reported as down.
+  try { $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new $SshHostName "echo $b64 | base64 -d | bash" 2>&1 }
   finally { $ErrorActionPreference = $prevEap }
   return ($out | Out-String)
 }
@@ -202,24 +205,70 @@ function Test-SshReachable([string]$SshHostName, [int]$TimeoutSec = 8) {
   return (($out | Out-String) -match 'REACHABLE')
 }
 
+function Get-NetstatListeners {
+  <# TCP listeners with their owning pid, from one netstat call (~200 ms).
+     Only used where the pid itself is needed; the plain "is anything on this
+     port" question is answered by Test-PortListening without a child process.
+
+     The state word is deliberately not matched: it is localised on some Windows
+     builds. A listening row is recognised by its FOREIGN address being port 0
+     (0.0.0.0:0 or [::]:0), which no established connection can have. #>
+  $rows = @()
+  # Native stderr is a terminating error under $ErrorActionPreference='Stop'
+  # (same rule as Invoke-B64), and this call treats all output as data.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = & netstat.exe -ano -p tcp 2>&1 } finally { $ErrorActionPreference = $prevEap }
+  foreach ($line in $out) {
+    if ($line -notmatch '^\s*TCP\s+(\S+):(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$') { continue }
+    # Copy the captures out before the next -match: -match and -notmatch both
+    # overwrite $Matches, so reading $Matches[1] after testing the foreign address
+    # silently yields nulls.
+    $addr = $Matches[1]; $portValue = [int]$Matches[2]; $foreign = $Matches[3]; $ownerPid = [int]$Matches[5]
+    if ($foreign -notmatch ':0$') { continue }
+    $rows += [pscustomobject]@{ Address = $addr; Port = $portValue; Pid = $ownerPid }
+  }
+  return $rows
+}
+
 function Get-ListeningPid([int]$PortValue) {
   <# Returns the pid listening on the loopback address of $PortValue.
      Deliberately ignores listeners bound to other local addresses: this machine
      has Termius on 127.0.0.124:3080 as well as dsh on 127.0.0.1:3080, and
      "first listener wins" picks the wrong one. #>
-  try {
-    $all = @(Get-NetTCPConnection -State Listen -LocalPort $PortValue -ErrorAction SilentlyContinue)
-    if ($all.Count -eq 0) { return 0 }
-    $loop = $all | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
-    if ($loop) { return [int]$loop.OwningProcess }
-    $any = $all | Where-Object { $_.LocalAddress -eq '::1' } | Select-Object -First 1
-    if ($any) { return [int]$any.OwningProcess }
-    return 0
-  } catch { }
+  $mine = @(Get-NetstatListeners | Where-Object { $_.Port -eq $PortValue })
+  if ($mine.Count -eq 0) { return 0 }
+  $loop = $mine | Where-Object { $_.Address -eq '127.0.0.1' } | Select-Object -First 1
+  if ($loop) { return [int]$loop.Pid }
+  $any = $mine | Where-Object { $_.Address -eq '[::1]' } | Select-Object -First 1
+  if ($any) { return [int]$any.Pid }
   return 0
 }
 
-function Test-PortListening([int]$PortValue) { return ((Get-ListeningPid $PortValue) -gt 0) }
+function Test-PortListening([int]$PortValue) {
+  <# Is a loopback listener on this port? Asked through the IP helper API: ~1 ms
+     and no child process.
+
+     Get-NetTCPConnection answered the same question in ~2.4 s per call on a
+     normal Windows box (it is a CIM query). The start path polls this every
+     300 ms while dsh boots, and Find-FreePort calls it once per candidate port,
+     so the panel kept showing "starting" for seconds after dsh was already
+     serving, and searching for a free port could take minutes. Same address rule
+     as Get-ListeningPid: 127.0.0.1 or ::1 counts, a wildcard or any other local
+     address does not. #>
+  try {
+    $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    foreach ($ep in $listeners) {
+      if ([int]$ep.Port -ne $PortValue) { continue }
+      $addr = $ep.Address.ToString()
+      if ($addr -eq '127.0.0.1' -or $addr -eq '::1') { return $true }
+    }
+    return $false
+  } catch {
+    # Fall back to the pid lookup if the IP helper API is ever unavailable.
+    return ((Get-ListeningPid $PortValue) -gt 0)
+  }
+}
 
 function Get-ProcessNameSafe([int]$ProcId) {
   if ($ProcId -le 0) { return '' }
@@ -249,12 +298,31 @@ function Find-FreePort([int]$Start) {
 
 function Find-DshLocal {
   <# Locate the dsh entry point on this machine. Prefers the node script path so
-     the server can be spawned without a console window. #>
-  $candidates = @()
+     the server can be spawned without a console window.
+
+     The npm prefix is worked out from the filesystem before asking npm itself:
+     `npm root -g` starts a node process (~0.7 s) and this function runs on every
+     status refresh, through Get-LocalDshVersion. A prefix= line in .npmrc wins
+     over the default, exactly as npm resolves it; `npm root -g` remains the
+     fallback for anything neither of those covers (env vars, fnm, pnpm, ...). #>
+  $prefixes = @()
+  $npmrc = Join-Path $HomeDir '.npmrc'
+  if (Test-Path $npmrc) {
+    foreach ($line in @(Get-Content $npmrc -ErrorAction SilentlyContinue)) {
+      if ($line -match '^\s*prefix\s*=\s*(.+?)\s*$') { $prefixes += $Matches[1].Trim('"') }
+    }
+  }
+  $prefixes += (Join-Path $env:APPDATA 'npm')
+  foreach ($prefix in $prefixes) {
+    $candidate = Join-Path $prefix 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+    if (Test-Path $candidate) { return $candidate }
+  }
+
   $npmRoot = (npm root -g 2>$null | Select-Object -First 1)
-  if ($npmRoot) { $candidates += (Join-Path $npmRoot '@deepseek-ai\dsh\lib\bin.js') }
-  $candidates += (Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh\lib\bin.js')
-  foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+  if ($npmRoot) {
+    $candidate = Join-Path $npmRoot '@deepseek-ai\dsh\lib\bin.js'
+    if (Test-Path $candidate) { return $candidate }
+  }
   $cmd = Get-Command dsh -ErrorAction SilentlyContinue
   if ($cmd) { return $cmd.Source }
   return $null
@@ -279,13 +347,22 @@ function Get-LocalUrl([string]$InstanceName, [int]$PortValue) {
 
      Note the local build (0.1.1-rc.2) never prints a token and does not fence
      `/` at all, while the remote build (0.1.5-rc.1) does both. Reading the URL
-     out of the log keeps this function correct for either. #>
-  $log = Join-Path $LogDir "$InstanceName.server.log"
-  if (Test-Path $log) {
+     out of the log keeps this function correct for either.
+
+     Only a URL for the port being asked about counts. The log can still hold a
+     URL from an earlier run on a different port (an instance started with
+     -LocalPort, then re-adopted), and handing that to the browser opens a dead
+     page. The rotated log is searched as well: the run that is still serving
+     this port may be the one whose output was rotated away. #>
+  foreach ($file in @("$InstanceName.server.log", "$InstanceName.server.log.1")) {
+    $log = Join-Path $LogDir $file
+    if (-not (Test-Path $log)) { continue }
     $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
-    if ($text) {
-      $m = [regex]::Matches($text, 'dsh web:\s+(http://[^\s()]+)')
-      if ($m.Count -gt 0) { return $m[$m.Count - 1].Groups[1].Value }
+    if (-not $text) { continue }
+    $m = [regex]::Matches($text, 'dsh web:\s+(http://[^\s()]+)')
+    for ($i = $m.Count - 1; $i -ge 0; $i--) {
+      $url = $m[$i].Groups[1].Value
+      if ($url -match ":$PortValue/") { return $url }
     }
   }
   return "http://127.0.0.1:$PortValue"
@@ -1121,17 +1198,20 @@ if [ -f `$HOME/.dsh/remote-web.url ]; then echo "URL=`$(cat `$HOME/.dsh/remote-w
 
 function Get-RemoteStatus($Inst) {
   $sshHost = $Inst.sshHost
-  if (-not (Test-SshReachable $sshHost)) {
+  <# One ssh session, not two. The probe script's first line is SSH_USER, so a
+     host that answered is proven reachable by the probe itself; the separate
+     Test-SshReachable round trip only added ~1.4 s to every refresh. #>
+  $out = Invoke-B64 (Get-RemoteProbeScript $Inst) $sshHost
+  $f = @{}
+  foreach ($line in ($out -split "`r?`n")) {
+    if ($line -match '^([A-Z_]+)=(.*)$') { $f[$Matches[1]] = $Matches[2] }
+  }
+  if (-not $f.ContainsKey('SSH_USER')) {
     return [pscustomobject]@{
       Name = $Inst.name; Kind = 'remote'; Port = [int](Get-InstProp $Inst 'localPort' 3099)
       State = 'unreachable'; Detail = "连不上 $sshHost（可能需要 VPN）"; Http = 0; Url = ''
       SshHost = $sshHost; DshInstalled = $false; SshReady = $false
     }
-  }
-  $out = Invoke-B64 (Get-RemoteProbeScript $Inst) $sshHost
-  $f = @{}
-  foreach ($line in ($out -split "`r?`n")) {
-    if ($line -match '^([A-Z_]+)=(.*)$') { $f[$Matches[1]] = $Matches[2] }
   }
 
   # Tunnel state, from our own records. The live port comes from state, because
