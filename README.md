@@ -1,4 +1,4 @@
-# dsh-deck
+﻿# dsh-deck
 
 A desktop control panel for **every** [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`) you run — the one on this machine and the ones on your servers.
@@ -93,6 +93,7 @@ dsh.ps1 -Command check                  compare versions against npm's latest
 dsh.ps1 -Command upgrade                upgrade everything to the latest
 dsh.ps1 -Command upgrade -DryRun        show what would change, change nothing
 dsh.ps1 -Command balance                remaining DeepSeek account credit
+dsh.ps1 -Command url                    current browser URL, re-probed now
 dsh.ps1 -Command tray                   tray icon + state-change notifications
 dsh.ps1 -Command tray-stop              stop the tray
 dsh.ps1 -Command menu                   terminal control panel

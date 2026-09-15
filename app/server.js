@@ -203,8 +203,28 @@ function asArray(value) {
   return [];
 }
 
+/**
+ * The configured instance list.
+ *
+ * Cached, because it is static: hosts.json only changes when someone adds or
+ * edits an instance, yet every panel poll was re-reading and re-parsing it
+ * through a fresh PowerShell process -- measured at roughly a second per poll,
+ * about 40% of the refresh. Anything that can change the list invalidates the
+ * cache explicitly via invalidateConfig().
+ *
+ * A throw is deliberately NOT cached: a transient failure would otherwise
+ * poison the panel until the backend restarted.
+ */
+let configCache = null;
+
 async function loadInstances() {
-  return asArray(await psJson(show('list'), 30000));
+  if (configCache) return configCache;
+  configCache = asArray(await psJson(show('list'), 30000));
+  return configCache;
+}
+
+function invalidateConfig() {
+  configCache = null;
 }
 
 async function assertKnownInstance(name) {
@@ -238,6 +258,11 @@ function mapInstance(r, c) {
     enabled: cfg.enabled !== false,
     remotePort: cfg.remotePort || r.RemotePort || null,
     localPort: cfg.localPort || null,
+    // Why a host is unreachable, classified by the launcher from the ssh error.
+    // The panel shows the hint and a matching next step; without it a card said
+    // only "unreachable", which tells the reader nothing they can act on.
+    failCode: r.FailCode || '',
+    hint: r.Hint || '',
   };
 }
 
@@ -285,6 +310,28 @@ async function readBody(req) {
 // ---------------------------------------------------------------- routes
 
 const routes = {
+  'GET /api/instances/:name/url': async (ctx) => {
+    // A freshly probed URL for one instance.
+    //
+    // The panel's cached card URL can be up to a poll old, and a remote service
+    // restart reissues its one-time token, so opening the cached URL yields a 401
+    // page in the browser. Rather than guess, re-probe on demand and hand back
+    // whatever is current now. The caller compares against what it held, so a
+    // stale link is reported rather than silently opening something different
+    // from what was on screen.
+    await assertKnownInstance(ctx.params.name);
+    // '-Target' keeps the probe to this instance only, so opening one card does
+    // not pay for an ssh handshake to every other host. A single-instance reply
+    // is an object rather than an array, hence the unwrap.
+    const raw = await psJson(show('url', ctx.params.name), 300000);
+    const row = (Array.isArray(raw) ? raw[0] : raw) || null;
+    const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name);
+    return {
+      ok: Boolean(row && row.Url),
+      instance: row ? mapInstance(row, cfg) : null,
+    };
+  },
+
   'GET /api/instances': async (ctx) => {
     const probe = ctx.url.searchParams.get('probe') !== '0';
     const rows = asArray(await psJson(show('status', null, probe ? ['-Probe'] : ['-NoProbe']), 300000));
@@ -355,6 +402,8 @@ const routes = {
     }
     if (b.port) args.push('-Port', String(parseInt(b.port, 10) || 3080));
     const r = await psRun(args, 60000);
+    // The list changed: drop the cache so the next read sees the new instance.
+    invalidateConfig();
     const insts = await loadInstances();
     return { ok: r.ok, raw: (r.out || '').trim(), instances: insts };
   },
@@ -553,6 +602,13 @@ server.listen(0, HOST, () => {
   // Best effort: harmless when stdout is a pipe, and wrapped so a detached
   // process with no stdout cannot die here.
   try { process.stdout.write(`DSH_APP_READY ${JSON.stringify({ port: PORT, token: TOKEN, url: publicUrl })}\n`); } catch (_) {}
+
+  // Warm the config cache now, while nobody is waiting. Populating it lazily
+  // would make whichever request arrived first pay ~1s, and the panel's very
+  // first paint is exactly that request.
+  loadInstances()
+    .then((n) => trace(`config cache warmed (${n.length} instance(s))`))
+    .catch((e) => trace(`config cache warm-up failed (will retry on demand): ${e.message}`));
 });
 
 server.on('error', (e) => {

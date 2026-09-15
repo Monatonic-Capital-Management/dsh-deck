@@ -264,6 +264,26 @@
   }
   .update-row button { padding: 4px 10px; font-size: 11.5px; }
 
+  /* Unreachable-host explanation: the classified cause plus a next step. Uses
+     the bad colour rather than amber -- the instance is not working at all. */
+  .hint-row {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 14px; padding: 8px 10px;
+    background: rgba(255,95,109,.07);
+    border: 1px solid rgba(255,95,109,.28);
+    border-radius: 8px;
+  }
+  .hint-row .h-ico {
+    width: 15px; height: 15px; flex-shrink: 0; border-radius: 50%;
+    background: rgba(255,95,109,.22); color: #ffb3b8;
+    font-size: 11px; font-weight: 700; line-height: 15px; text-align: center;
+  }
+  .hint-row .h-txt {
+    flex: 1; min-width: 0; font-size: 11.5px; color: #ffc9cd;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .hint-row button { padding: 4px 10px; font-size: 11.5px; flex-shrink: 0; }
+
   .actions { display: flex; gap: 8px; }
   .actions .grow { flex: 1; justify-content: center; }
 
@@ -675,10 +695,47 @@ function card(it) {
         '<div class="badge">' + esc(label) + "</div>" +
       "</div>" +
       (it.detail ? '<div class="meta"><span class="chip">' + esc(it.detail) + "</span></div>" : "") +
+      (it.state === "unreachable" && it.hint ? hintRow(it) : "") +
       (upNow && it.url ? urlRow(it.url) : "") +
       (it.updateAvailable ? updateRow(it) : "") +
       '<div class="actions">' + actions + "</div>" +
     "</div>";
+}
+
+/* The classified failure plus a concrete next step.
+   A card that said only "unreachable" told the reader nothing they could act on;
+   the launcher already knows whether this is a VPN problem or a rejected key, so
+   the panel says which and offers the command that settles it.
+
+   Every builder takes the host and returns the final command. An earlier version
+   had the dns case return a string containing a literal "{host}" placeholder,
+   which copied an unusable command -- the substitution has to happen here. */
+const FAIL_STEP = {
+  timeout: { label: "检查连通性",   cmd: (h) => "ping -n 2 " + h },
+  dns:     { label: "查看解析结果", cmd: (h) => "ssh -G " + h + " | findstr hostname" },
+  auth:    { label: "详细认证日志", cmd: (h) => "ssh -v " + h },
+  hostkey: { label: "更新主机指纹", cmd: (h) => "ssh-keygen -R " + h },
+  refused: { label: "查看 sshd",    cmd: (h) => "ssh " + h + " \"systemctl status ssh\"" },
+};
+
+function hintRow(it) {
+  const step = FAIL_STEP[it.failCode];
+  const host = it.sshHost || it.name;
+  const cmd = step ? step.cmd(host) : "";
+  return '<div class="hint-row">' +
+      '<span class="h-ico">!</span>' +
+      '<span class="h-txt">' + esc(it.hint) + "</span>" +
+      (cmd ? '<button class="ghost" title="复制：' + esc(cmd) + '" ' +
+             'onclick="copyCmd(this.dataset.cmd)" data-cmd="' + esc(cmd) + '">' +
+             esc(step.label) + "</button>" : "") +
+    "</div>";
+}
+
+function copyCmd(cmd) {
+  navigator.clipboard.writeText(cmd).then(
+    () => toast("已复制：" + cmd, "ok"),
+    () => toast("复制失败，命令是：" + cmd, "warn")
+  );
 }
 
 /* An update notice, shown only when the registry has something newer. Kept as a
@@ -786,7 +843,26 @@ async function act(kind, name) {
   let applied = false;
   try {
     if (kind === "open") {
-      const it = INSTANCES.find(i => i.name === name);
+      let it = INSTANCES.find(i => i.name === name);
+      /* Re-probe before opening rather than trusting the card's cached URL. A
+         remote service restart reissues its one-time token, and the panel's URL
+         can be a poll old, so the cached link would land on a 401 page in the
+         browser with nothing on the panel to explain it. One probe per click is
+         cheap next to sending the user to a dead page. */
+      try {
+        const fresh = await api("/api/instances/" + encodeURIComponent(name) + "/url");
+        if (fresh && fresh.instance && fresh.instance.url) {
+          const changed = it && it.url && it.url !== fresh.instance.url;
+          it = Object.assign({}, it, fresh.instance);
+          // Keep the card in step with what was actually opened.
+          const ix = INSTANCES.findIndex(x => x.name === name);
+          if (ix >= 0) INSTANCES[ix] = it;
+          if (changed) toast("链接已更新（" + name + " 的令牌换过了）", "warn");
+        }
+      } catch (e) {
+        // Probing failed; fall back to the cached URL rather than blocking the open.
+      }
+
       if (it && it.url) {
         /* Open dsh in its OWN window instead of navigating this one: the panel
            is the app's home, and losing it on every launch would be hostile.
@@ -796,7 +872,7 @@ async function act(kind, name) {
         if (!w) toast("浏览器拦截了新窗口，请允许弹出窗口", "warn");
         else toast("已打开 " + name, "ok");
       } else {
-        toast("该实例没有可用地址", "warn");
+        toast("该实例没有可用地址" + (it && it.hint ? "：" + it.hint : ""), "warn");
       }
       BUSY.delete(name); render();
       return;

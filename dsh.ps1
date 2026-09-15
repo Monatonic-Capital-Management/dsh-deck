@@ -60,7 +60,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','balance','doctor')]
+  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','balance','url','doctor')]
   [string]$Command = 'menu',
 
   [Parameter(Position = 1)]
@@ -1358,6 +1358,29 @@ function Invoke-Balance([switch]$Refresh) {
   Write-Info "查询于 $(([datetime]$b.checkedAt).ToString('HH:mm:ss'))，缓存 5 分钟；-Refresh 强制刷新"
 }
 
+function Invoke-Url([string[]]$Names) {
+  <# The current browser URL for one or more instances, re-probed now.
+
+     Exists because a cached URL goes stale: a remote service restart reissues its
+     one-time token, so a link the panel holds can point at a 401 page. This
+     answers "what should I open right now" without the caller reconstructing log
+     paths or reading the launcher's own state files. #>
+  $insts = @(Get-Instances $Names $Config)
+  if ($insts.Count -eq 0) { Write-Err 'no instances selected'; return }
+  $rows = @(Get-AllStatus -NoProbeHttp -Names @($insts | ForEach-Object { $_.name }))
+  if ($Json) {
+    if ($rows.Count -eq 1) { Write-Json $rows[0] } else { Write-Json $rows }
+    return
+  }
+  foreach ($r in $rows) {
+    if ($r.Url) { Write-C ("  {0,-16} {1}" -f $r.Name, $r.Url) 'DarkCyan' }
+    else {
+      Write-Warn2 ("{0,-16} 没有可用地址（{1}）" -f $r.Name, $r.State)
+      if ($r.PSObject.Properties['Hint'] -and $r.Hint) { Write-Info "  $($r.Hint)" }
+    }
+  }
+}
+
 function Get-RemoteProbeScript($Inst) {
   $rport = [int](Get-InstProp $Inst 'remotePort' 3080)
   @"
@@ -1445,9 +1468,17 @@ function Get-RemoteStatus($Inst, [string]$ProbeOutput) {
     if ($line -match '^([A-Z_]+)=(.*)$') { $f[$Matches[1]] = $Matches[2] }
   }
   if (-not $f.ContainsKey('SSH_USER')) {
+    # Explain the failure using the ssh error the probe already produced, rather
+    # than a second probe or a generic "unreachable". "Needs a VPN" and "your key
+    # was rejected" require completely different actions from the reader.
+    $cls = Get-SshFailureClass $out
     return [pscustomobject]@{
       Name = $Inst.name; Kind = 'remote'; Port = [int](Get-InstProp $Inst 'localPort' 3099)
-      State = 'unreachable'; Detail = "连不上 $sshHost（可能需要 VPN）"; Http = 0; Url = ''
+      State = 'unreachable'
+      Detail = "连不上 $sshHost · $($cls.Hint)"
+      FailCode = $cls.Code
+      Hint = $cls.Hint
+      Http = 0; Url = ''
       SshHost = $sshHost; DshInstalled = $false; SshReady = $false
     }
   }
@@ -1538,34 +1569,44 @@ function Get-RemoteStatus($Inst, [string]$ProbeOutput) {
   }
 }
 
+function Get-SshFailureClass([string]$SshOutput) {
+  <# Classify an ssh failure from output we ALREADY have.
+
+     Split out from Get-RemoteDiagnosis so status can explain an unreachable host
+     without paying for another ssh attempt. The advice is identical either way --
+     what matters to the reader is "needs a VPN" versus "your key was rejected"
+     versus "wrong hostname", and all three are visible in the error text. #>
+  $t = ([string]$SshOutput).ToLowerInvariant()
+  if ($t -match 'could not resolve hostname') {
+    return [pscustomobject]@{ Code = 'dns'; Hint = '主机名无法解析：检查 ssh config 里的 HostName，或 DNS' }
+  }
+  if ($t -match 'connection refused') {
+    return [pscustomobject]@{ Code = 'refused'; Hint = '端口拒绝连接：sshd 没在监听，或端口写错了' }
+  }
+  if ($t -match 'permission denied|no supported authentication') {
+    return [pscustomobject]@{ Code = 'auth'; Hint = '认证失败：密钥没配好，或 ssh-agent 里没有对应私钥' }
+  }
+  if ($t -match 'host key verification failed') {
+    return [pscustomobject]@{ Code = 'hostkey'; Hint = '主机指纹变了：先手动 ssh 一次确认' }
+  }
+  if ($t -match 'timed out|timeout|unreachable|no route|connection closed') {
+    return [pscustomobject]@{ Code = 'timeout'; Hint = '网络不通：大概率需要连 VPN，或安全组没放行' }
+  }
+  $last = (([string]$SshOutput) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+  return [pscustomobject]@{ Code = 'unknown'; Hint = ([string]$last).Trim() }
+}
+
 function Get-RemoteDiagnosis([string]$SshHostName, [int]$Port = 0) {
-  <# Classify an unreachable host instead of just saying "unreachable".
-     The distinction that matters most is "needs a VPN" versus "credentials
-     rejected" versus "host down", because they need completely different
-     actions from the person reading it. #>
+  <# Classify an unreachable host, actively probing.
+     Used where no ssh output exists yet; status prefers Get-SshFailureClass so a
+     refresh does not double its ssh handshakes. #>
   $args = @('-n', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8')
   if ($Port -gt 0) { $args += @('-p', "$Port") }
   $out = (& ssh @args $SshHostName "echo DIAG_OK" 2>&1 | Out-String).Trim()
   if ($out -match 'DIAG_OK') {
     return [pscustomobject]@{ Code = 'ok'; Hint = '' }
   }
-  $t = $out.ToLowerInvariant()
-  if ($t -match 'could not resolve hostname') {
-    return [pscustomobject]@{ Code = 'dns'; Hint = "主机名无法解析：检查 ssh config 里的 HostName，或 DNS" }
-  }
-  if ($t -match 'connection refused') {
-    return [pscustomobject]@{ Code = 'refused'; Hint = "端口拒绝连接：sshd 没在监听，或端口写错了" }
-  }
-  if ($t -match 'permission denied|no supported authentication') {
-    return [pscustomobject]@{ Code = 'auth'; Hint = "认证失败：密钥没配好，或 ssh-agent 里没有对应私钥" }
-  }
-  if ($t -match 'host key verification failed') {
-    return [pscustomobject]@{ Code = 'hostkey'; Hint = "主机指纹变了：先手动 ssh 一次确认" }
-  }
-  if ($t -match 'timed out|timeout|unreachable|no route') {
-    return [pscustomobject]@{ Code = 'timeout'; Hint = "网络不通：大概率需要连 VPN，或安全组没放行" }
-  }
-  return [pscustomobject]@{ Code = 'unknown'; Hint = $out.Split("`n")[-1].Trim() }
+  return Get-SshFailureClass $out
 }
 
 function Compare-Version([string]$A, [string]$B) {
@@ -2893,6 +2934,7 @@ try {
     'check'   { Invoke-Check }
     'upgrade' { Invoke-Upgrade $Target -DryRun:([bool]$DryRun) }
     'balance' { Invoke-Balance -Refresh:([bool]$Refresh) }
+    'url'     { Invoke-Url $Target }
     'doctor'  { Invoke-Doctor }
   }
 } catch {
