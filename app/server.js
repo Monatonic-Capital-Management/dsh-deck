@@ -176,8 +176,24 @@ async function psMutate(args, timeoutMs, name) {
 const show = (cmd, name, extra) =>
   ['-Command', cmd].concat(name ? ['-Target', name] : []).concat(extra || []);
 
+/**
+ * The launcher's -Json output is an array for list/status, but a single-element
+ * array can still arrive as a bare object (and a crashed command arrives as
+ * `{ error }`). Coercing here keeps a malformed reply from turning into
+ * "cfg.map is not a function" and blanking the whole panel: an error document
+ * surfaces as its message, anything else becomes a one-element list.
+ */
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object') {
+    if (value.error) throw new Error(String(value.error));
+    return [value];
+  }
+  return [];
+}
+
 async function loadInstances() {
-  return psJson(show('list'), 30000);
+  return asArray(await psJson(show('list'), 30000));
 }
 
 async function assertKnownInstance(name) {
@@ -236,7 +252,7 @@ async function readBody(req) {
 const routes = {
   'GET /api/instances': async (ctx) => {
     const probe = ctx.url.searchParams.get('probe') !== '0';
-    const rows = await psJson(show('status', null, probe ? ['-Probe'] : ['-NoProbe']), 300000);
+    const rows = asArray(await psJson(show('status', null, probe ? ['-Probe'] : ['-NoProbe']), 300000));
     const cfg = await loadInstances();
     const byName = new Map(cfg.map((c) => [c.name, c]));
     return rows.map((r) => {
