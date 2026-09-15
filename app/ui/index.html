@@ -224,6 +224,21 @@
   }
   .url-row button { padding: 3px 7px; font-size: 11px; }
 
+  /* Update notice. Amber so it reads as "attention" rather than "broken": the
+     instance is working fine, it is simply not the newest release. */
+  .update-row {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 14px; padding: 8px 10px;
+    background: color-mix(in srgb, var(--warn) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-radius: 8px;
+  }
+  .update-row .u-txt {
+    flex: 1; min-width: 0; font-size: 11.5px; color: #ffd7a1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .update-row button { padding: 4px 10px; font-size: 11.5px; }
+
   .actions { display: flex; gap: 8px; }
   .actions .grow { flex: 1; justify-content: center; }
 
@@ -484,6 +499,14 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M3 12h18"/></svg>
           环境自检
         </button>
+        <button id="btn-check" style="justify-content:center">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+          检查版本更新
+        </button>
+        <button id="btn-upgrade-all" class="danger" style="justify-content:center">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+          全部升级到最新
+        </button>
       </div>
       <div id="doctor-out" class="logbox" style="display:none"></div>
     </div>
@@ -621,8 +644,49 @@ function card(it) {
       "</div>" +
       (it.detail ? '<div class="meta"><span class="chip">' + esc(it.detail) + "</span></div>" : "") +
       (upNow && it.url ? urlRow(it.url) : "") +
+      (it.updateAvailable ? updateRow(it) : "") +
       '<div class="actions">' + actions + "</div>" +
     "</div>";
+}
+
+/* An update notice, shown only when the registry has something newer. Kept as a
+   notice plus a button rather than an automatic upgrade: applying one restarts
+   dsh and would end a session in progress. */
+function updateRow(it) {
+  return '<div class="update-row">' +
+      '<span class="u-txt">发现新版本 ' + esc(it.latestVersion || "") +
+      "（当前 " + esc(it.dshVersion || "?") + "）</span>" +
+      '<button class="ghost" title="先看看会做什么，不做任何改动" ' +
+        'onclick="upgrade(\'' + esc(it.name) + '\', true)">预览</button>' +
+      '<button class="primary" title="升级并重启该实例" ' +
+        'onclick="upgrade(\'' + esc(it.name) + '\', false)">升级</button>' +
+    "</div>";
+}
+
+async function upgrade(name, dry) {
+  const what = name === "(all)" ? "全部实例" : name;
+  if (!dry) {
+    const okGo = confirm(
+      "升级 " + what + " 会重启它的 dsh，进行中的会话会中断。\n\n确定继续？"
+    );
+    if (!okGo) return;
+  }
+  BUSY.add(name); render();
+  toast(dry ? "正在预览 " + what + " 的升级…" : "正在升级 " + what + "…（可能要一两分钟）");
+  try {
+    const r = await api(
+      "/api/upgrade?name=" + encodeURIComponent(name === "(all)" ? "" : name) + (dry ? "&dry=1" : ""),
+      { method: "POST" }
+    );
+    toast(dry ? "预览完成，结果见下方" : (r.ok ? what + " 升级完成" : what + " 升级未成功"), r.ok || dry ? "ok" : "bad");
+    const box = $("#detail-log");
+    if (box) box.textContent = (r.raw || "").trim() || "(no output)";
+  } catch (e) {
+    toast("升级失败：" + e.message, "bad");
+  } finally {
+    BUSY.delete(name);
+    await load();
+  }
 }
 
 function urlRow(url) {
@@ -893,6 +957,27 @@ $("#btn-doctor").addEventListener("click", async (e) => {
   } catch (err) {
     box.textContent = "自检失败：" + err.message;
   }
+});
+
+$("#btn-check").addEventListener("click", async () => {
+  const box = $("#doctor-out");
+  box.style.display = "block"; box.textContent = "正在查询 npm registry…";
+  try {
+    const r = await api("/api/versions");
+    const rows = r.instances || [];
+    const latest = rows.length ? (rows[0].Latest || "") : "";
+    box.textContent = "npm latest: " + latest + "\n\n" + rows.map((x) =>
+      "  " + String(x.Name).padEnd(16) + String(x.Current).padEnd(14) +
+      (x.UpdateAvailable ? "可升级" : "已是最新")
+    ).join("\n");
+  } catch (err) {
+    box.textContent = "查询失败：" + err.message;
+  }
+});
+
+$("#btn-upgrade-all").addEventListener("click", async () => {
+  closeOverlay("#ov-more");
+  await upgrade("(all)", false);
 });
 
 /* Poll while the window is visible so state stays truthful, but back off when

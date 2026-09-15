@@ -188,6 +188,45 @@ convincing illusion.
 **Rule:** a mutating endpoint must reject a missing action; never default to the
 one that changes state.
 
+## 16. npm's exit code 0 does not mean the install works
+
+Upgrading local dsh from `0.1.1-rc.2` to `0.1.5-rc.1` reported success, and
+`npm ls -g` agreed: `@deepseek-ai/dsh@0.1.5-rc.1`. Then:
+
+```
+Error: Cannot find module './snippet'
+  requireStack: [.../@deepseek-ai/dsh/node_modules/js-yaml/lib/loader.js]
+```
+
+`js-yaml` was missing `package.json` and six of its ten `lib/` files. On Windows a
+running dsh holds native `.node`/`.dll` files open (`sharp`, `koffi`), so npm
+cannot replace them and leaves a **half-extracted tree** while still recording the
+new version. A retry with `--force` re-extracted it correctly.
+
+The lesson is the same one as #5, in a different costume: **verify the thing
+works, not that the installer said so.** For local dsh the check is "does
+`dsh --version` print" — which the first version of `Upgrade-LocalDsh` did not
+do, even though `Upgrade-RemoteDsh` already did. Inconsistency between a pair of
+functions is a bug waiting to happen.
+
+## 17. PowerShell 5.1 turns native stderr into a fatal error
+
+With `$ErrorActionPreference = 'Stop'`, any stderr output from a native command
+becomes a terminating error. npm prints deprecation notices on stderr as a matter
+of course:
+
+```
+npm warn deprecated node-domexception@1.0.0: ...
+```
+
+So a completely successful `npm install -g` aborted the upgrade mid-function, and
+the failure looked like an npm problem rather than a PowerShell one.
+
+**Fix:** set `$ErrorActionPreference = 'Continue'` for the duration of the native
+call and restore it afterwards. There is no per-invocation flag for this; the
+preference is inherited by the child. The same trait is why `taskkill` needed
+wrapping (see #14) — it writes "process not found" to stderr.
+
 ## The pattern
 
 The majority of these produce a **success report followed by nothing working**.

@@ -390,6 +390,32 @@ const routes = {
     };
   },
 
+  'GET /api/versions': async () => {
+    // Read-only. Answers "is anything out of date?" without touching anything.
+    return { instances: await psJson(show('check'), 180000) };
+  },
+
+  'POST /api/upgrade': async (ctx) => {
+    // Upgrading restarts dsh on the target, which ends any session in flight, so
+    // this is only ever reached by an explicit click -- never by a poll, and
+    // never by starting an instance.
+    const name = ctx.url.searchParams.get('name') || '';
+    const dryRun = ctx.url.searchParams.get('dry') === '1';
+    const args = show('upgrade', name || null, dryRun ? ['-DryRun'] : []);
+    const r = await psRun(args, 900000);
+    // A slow npm install can outlive the child's stdout, so re-read status to
+    // report what actually happened rather than trusting the command's own word.
+    let after = null;
+    try { after = await psJson(show('check'), 180000); } catch (_) { }
+    return {
+      ok: r.code === 0,
+      dryRun,
+      name: name || '(all)',
+      versions: after && after.instances ? after.instances : after,
+      raw: (r.out || '').trim(),
+    };
+  },
+
   'GET /api/doctor': async () => {
     const r = await psRun(show('doctor'), 300000);
     return { text: (r.out || '').replace(/\r/g, '') };

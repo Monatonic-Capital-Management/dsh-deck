@@ -64,13 +64,19 @@ actually start work. Highest ratio of value to effort on this list.
 `0.1.5-rc.1`, and dsh changed its auth model between those versions. The
 difference was invisible until something broke in a confusing way.
 
-**What:** `dsh-deck upgrade --all` with a target version, a preview of what would
-change, and a per-host result. Plus `"dshVersion": "0.1.5-rc.1"` in config to pin,
-and a warning when a host drifts from the pin.
+**Status: shipped in v0.2.** `check` compares every instance against npm's
+`latest`, `upgrade` applies it (with `-DryRun`), and an instance may pin a
+version. Drift and update availability surface on the instance cards.
 
-**Why:** version drift across a fleet is the single most likely source of
-"works on my machine" confusion for this exact tool. Drift *detection* shipped in
-v0.1; acting on it is the natural completion.
+**Deliberately still manual.** Applying an upgrade restarts dsh and ends any
+session in flight, so an automatic upgrade on launch would be a hostile default:
+you would open the panel and lose work. The pipeline is automatic; the trigger is
+a decision.
+
+**Remaining work:** a scheduled check that notifies without upgrading, and a
+`--next` channel opt-in for people who want release candidates ahead of
+`latest`.
+
 
 ### P1 — Tray icon and state-change notifications
 

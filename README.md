@@ -87,6 +87,9 @@ dsh.ps1 -Command install -Target prod   provision and deploy only
 dsh.ps1 -Command add -SshHost prod      register a host from ~/.ssh/config
 dsh.ps1 -Command list                   show configured instances
 dsh.ps1 -Command doctor                 diagnose this machine and every host
+dsh.ps1 -Command check                  compare versions against npm's latest
+dsh.ps1 -Command upgrade                upgrade everything to the latest
+dsh.ps1 -Command upgrade -DryRun        show what would change, change nothing
 dsh.ps1 -Command tray                   tray icon + state-change notifications
 dsh.ps1 -Command tray-stop              stop the tray
 dsh.ps1 -Command menu                   terminal control panel
@@ -165,6 +168,43 @@ Two findings that cost real debugging time, both now handled automatically:
 
 Set `"autoInstall": false` on an instance to forbid the tool from touching that
 host's software.
+
+## Versions and upgrades
+
+dsh changes its behaviour between releases in ways that are invisible from the
+outside, so the tool tells you when instances disagree:
+
+```powershell
+.\dsh.ps1 -Command check
+```
+
+```
+INSTANCE         CURRENT        LATEST         STATUS
+local            0.1.1-rc.2     0.1.5-rc.1     可升级
+prod             0.1.5-rc.1     0.1.5-rc.1     已是最新
+```
+
+The panel shows the same as a notice on any card that is behind, with 预览 and
+升级 buttons. `check` is read-only; nothing is upgraded unless you ask.
+
+```powershell
+.\dsh.ps1 -Command upgrade -DryRun          # what would change
+.\dsh.ps1 -Command upgrade                  # everything
+.\dsh.ps1 -Command upgrade -Target prod     # one instance
+```
+
+**Upgrading restarts dsh and interrupts any session in flight**, which is why it
+is never automatic — not on panel launch, not on a poll. Pin a version per
+instance when you want to stop chasing releases:
+
+```json
+{ "name": "prod", "profile": "prod", "dshVersion": "0.1.5-rc.1" }
+```
+
+Remote upgrade order matters and is enforced: check Node is new enough, install
+the target, **prove the binary runs**, then restart the service and confirm it
+listens. A failed install is caught before the service is touched, so a botched
+upgrade cannot leave a service that will not start.
 
 ## Security posture
 

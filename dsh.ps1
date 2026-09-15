@@ -60,7 +60,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','doctor')]
+  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','doctor')]
   [string]$Command = 'menu',
 
   [Parameter(Position = 1)]
@@ -90,7 +90,9 @@ param(
 
   [string]$SshConfigPath,  # override the ssh config used for host discovery
 
-  [int]$TrayInterval = 20  # seconds between tray state polls
+  [int]$TrayInterval = 20, # seconds between tray state polls
+
+  [switch]$DryRun          # upgrade: report what would change, change nothing
 )
 
 Set-StrictMode -Version Latest
@@ -522,10 +524,21 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
   $url = ''
   if ($state -eq 'up' -or $state -eq 'up-external') { $url = Get-LocalUrl $Inst.name $port }
 
+  # Same update flag the remote rows carry, from the cached registry lookup.
+  $localVersion = Get-LocalDshVersion
+  $latestVersion = Get-LatestDshVersion
+  $updateAvailable = $false
+  if ($localVersion -and $latestVersion) {
+    $updateAvailable = (Compare-Version $latestVersion $localVersion) -gt 0
+  }
+
   return [pscustomobject]@{
     Name = $Inst.name; Kind = 'local'; Port = $port
     State = $state; Detail = $detail; Http = $httpCode
     Url = $url
+    DshVersion = $localVersion
+    LatestVersion = $latestVersion
+    UpdateAvailable = $updateAvailable
   }
 }
 
@@ -650,6 +663,326 @@ function Get-LocalDshVersion {
   return $v
 }
 
+# --------------------------------------------------------------------------
+# Versions and upgrades
+# --------------------------------------------------------------------------
+
+function Get-LatestDshVersion([switch]$Refresh) {
+  <# The version `npm install -g @deepseek-ai/dsh` would install. Cached to disk
+     for a few hours because the panel asks for it on every status refresh and the
+     npm registry should not be hit every 20 seconds. #>
+  $cacheFile = Join-Path $StateDir 'latest-version.json'
+  if (-not $Refresh -and (Test-Path $cacheFile)) {
+    try {
+      $c = Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      $age = (Get-Date) - [datetime]$c.checkedAt
+      if ($age.TotalHours -lt 6 -and $c.version) { return $c.version }
+    } catch { }
+  }
+  $v = ''
+  try {
+    $r = Invoke-WebRequest -Uri 'https://registry.npmjs.org/@deepseek-ai/dsh' -UseBasicParsing -TimeoutSec 20
+    $j = $r.Content | ConvertFrom-Json
+    $v = [string]$j.'dist-tags'.latest
+  } catch { }
+  if ($v) {
+    try {
+      [pscustomobject]@{ version = $v; checkedAt = (Get-Date).ToString('o') } |
+        ConvertTo-Json | Set-Content -Path $cacheFile -Encoding UTF8
+    } catch { }
+  } elseif (Test-Path $cacheFile) {
+    # Offline: fall back to whatever was last known rather than reporting nothing.
+    try { $v = [string]((Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json).version) } catch { }
+  }
+  return $v
+}
+
+function Get-DesiredDshVersion($Inst) {
+  <# The version an instance should run.
+
+     Resolution order, most specific first:
+       1. the instance's own "dshVersion"
+       2. the instance's project "autoUpdate.version"
+       3. when autoUpdate is enabled, whatever npm's `latest` currently is
+     A pin that resolves to a plain pin means "do not chase releases"; leaving it
+     unset with autoUpdate off means "do not check at all". #>
+  $instPin = ''
+  if ($Inst -and $Inst.PSObject.Properties['dshVersion'] -and $Inst.dshVersion) { $instPin = [string]$Inst.dshVersion }
+  return $instPin
+}
+
+function Get-UpdateStatus($Inst, [string]$LocalOrRemoteVersion) {
+  <# Compares a running version against the newest published one and classifies
+     the gap. Deliberately does NOT act: upgrading restarts dsh and would drop any
+     session in flight, so it stays a decision the person makes, not a side effect
+     of launching the tool. #>
+  $latest = Get-LatestDshVersion
+  $pin = Get-DesiredDshVersion $Inst
+  $target = if ($pin) { $pin } else { $latest }
+  $current = [string]$LocalOrRemoteVersion
+  $result = [ordered]@{
+    current = $current
+    latest = $latest
+    pinned = $pin
+    target = $target
+    updateAvailable = $false
+    reason = ''
+  }
+  if (-not $current) { $result.reason = 'unknown-current'; return [pscustomobject]$result }
+  if (-not $target) { $result.reason = 'unknown-latest'; return [pscustomobject]$result }
+  if ($target -eq $current) { $result.reason = 'current'; return [pscustomobject]$result }
+  $cmp = Compare-Version $target $current
+  if ($cmp -gt 0) {
+    $result.updateAvailable = $true
+    $result.reason = if ($pin) { 'behind-pin' } else { 'behind-latest' }
+  } else {
+    $result.reason = if ($pin) { 'ahead-of-pin' } else { 'ahead-of-latest' }
+  }
+  return [pscustomobject]$result
+}
+
+function Upgrade-LocalDsh([string]$Version, [switch]$DryRun) {
+  <# Upgrade dsh on this machine.
+
+     Warns rather than upgrading silently when an instance is currently served by
+     this dsh: replacing it would disturb a running session. #>
+  $npm = Get-Command npm -ErrorAction SilentlyContinue
+  if (-not $npm) { Write-Err 'npm not found on PATH; cannot upgrade the local dsh'; return $false }
+  $current = Get-LocalDshVersion
+  $target = if ($Version) { $Version } else { Get-LatestDshVersion }
+  if (-not $target) { Write-Err 'could not determine the target version'; return $false }
+  if ($current -eq $target) {
+    Write-Ok "local dsh is already $current"
+    return $true
+  }
+
+  $spec = "@deepseek-ai/dsh@$target"
+  if ($DryRun) {
+    Write-Info "[dry-run] would run: npm install -g $spec"
+    Write-Info "[dry-run] current $current -> $target"
+    return $true
+  }
+
+  $bg = Get-LocalStatus ([pscustomobject]@{ name = 'local'; port = 3080 })
+  Write-Info "upgrading local dsh $current -> $target"
+  if ($bg.State -eq 'up' -or $bg.State -eq 'up-external') {
+    Write-Warn2 'a local dsh server is running; it keeps the old code until restarted'
+    Write-Warn2 'on Windows its native DLLs stay locked, so a repair pass may be needed'
+  }
+  if (-not (Invoke-NpmGlobal $spec)) {
+    # A locked native dependency (sharp/koffi ship .node/.dll files that a running
+    # dsh holds open) can produce a half-extracted tree: npm reports the new
+    # version while a dependency is missing files. That is not a warning, it is a
+    # broken install, and it is repaired by forcing a re-extract.
+    Write-Warn2 'first attempt did not leave a working install; retrying with --force'
+    if (-not (Invoke-NpmGlobal $spec -Force)) {
+      Write-Err 'could not install a working dsh'
+      return $false
+    }
+  }
+  $script:LocalDshVersion = ''      # invalidate the cache
+  $after = Get-LocalDshVersion
+  Write-Ok "local dsh upgraded to $after"
+  Write-Info 'restart the local instance to use it: dsh.ps1 -Command restart -Target local'
+  return $true
+}
+
+function Invoke-NpmGlobal([string]$Spec, [switch]$Force) {
+  <# Run `npm install -g` and decide success by whether dsh RUNS afterwards, not
+     by npm's exit code.
+
+     Two traps, both hit for real on this project:
+       1. npm prints deprecation notices on stderr, and with
+          $ErrorActionPreference='Stop' PowerShell 5.1 turns native stderr into a
+          terminating error -- so a perfectly successful install aborted the
+          upgrade. ErrorActionPreference is set to Continue for the duration (its
+          value is inherited by native commands, so there is no per-call flag).
+       2. An exit code of 0 does NOT mean a usable install. npm can register the
+          new version while leaving a dependency directory incomplete, because a
+          file was locked by a running process. Only executing the binary proves
+          otherwise, so that is the check. #>
+  $args = @('install', '-g', $Spec, '--no-fund', '--no-audit')
+  if ($Force) { $args += '--force' }
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & npm @args 2>&1 | Out-String
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  $script:LocalDshVersion = ''
+  $ver = Get-LocalDshVersion
+  if ($ver) { return $true }
+  $tail = ($out.Trim() -split "`r?`n" | Select-Object -Last 6) -join "`n"
+  if ($tail) { Write-C $tail 'DarkGray' }
+  return $false
+}
+
+function Upgrade-RemoteDsh($Inst, [string]$Version, [switch]$DryRun) {
+  <# Upgrade dsh on a remote host in place.
+
+     Order matters and mirrors provisioning: make sure Node is new enough, install
+     the target, then PROVE the binary runs before touching the service -- because
+     a failed upgrade that is not caught leaves a service that cannot start. Only
+     then restart and confirm it is listening again. #>
+  $name = $Inst.name
+  $sshHost = $Inst.sshHost
+  if (-not (Test-SshReachable $sshHost)) {
+    $d = Get-RemoteDiagnosis $sshHost
+    Write-Err "$name`: cannot reach $sshHost [$($d.Code)]"
+    if ($d.Hint) { Write-Info $d.Hint }
+    return $false
+  }
+
+  $facts = Get-RemoteFacts $sshHost
+  $current = "$(if ($facts.ContainsKey('DSH_V')) { $facts['DSH_V'] })".Trim()
+  $target = if ($Version) { $Version } else { Get-LatestDshVersion }
+  if (-not $target) { Write-Err "$name`: could not determine the target version"; return $false }
+
+  if ($current -eq $target) {
+    Write-Ok "$name`: already at $current"
+    return $true
+  }
+
+  if ($DryRun) {
+    Write-Info "[dry-run] $name`: $current -> $target"
+    Write-Info "[dry-run] would check node >= 22.19.0, then npm install -g @deepseek-ai/dsh@$target,"
+    Write-Info "[dry-run] verify it runs, restart dsh-web.service, and confirm it listens"
+    return $true
+  }
+
+  # Node gate first: upgrading a package that cannot run is worse than not
+  # upgrading it, because it replaces a working install with a broken one.
+  $minNode = '22.19.0'
+  $nodeV = "$(if ($facts.ContainsKey('NODE_V')) { $facts['NODE_V'] })".Trim()
+  $needsNode = $true
+  if ($nodeV -and (Compare-Version $nodeV $minNode) -ge 0) { $needsNode = $false }
+  if ($needsNode) {
+    $hasLocalNode = (Invoke-B64 'if [ -x "$HOME/.local/node/bin/node" ]; then "$HOME/.local/node/bin/node" -v; fi' $sshHost).Trim()
+    if ($hasLocalNode -and (Compare-Version $hasLocalNode $minNode) -ge 0) {
+      $needsNode = $false
+    }
+  }
+  if ($needsNode) {
+    Write-Warn2 "$name`: node $nodeV is older than $minNode; installing a suitable node first"
+    if (-not (Install-RemoteDsh $sshHost -Quiet)) {
+      Write-Err "$name`: could not prepare node; aborting before changing dsh"
+      return $false
+    }
+  }
+
+  $prefix = if ($facts['NPM_PREFIX'] -and $facts['NPM_PREFIX'] -ne 'none') { $facts['NPM_PREFIX'] } else { '$HOME/.local' }
+  if ($prefix -eq '/usr' -or $prefix -eq '/usr/local') { $prefix = '$HOME/.local' }
+
+  Write-Info "$name`: upgrading dsh $current -> $target"
+  $upgrade = @'
+set -e
+export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH"
+if [ -x "$HOME/.local/node/bin/npm" ]; then NPM="$HOME/.local/node/bin/npm"; else NPM="$(command -v npm)"; fi
+"$NPM" config set prefix "__PREFIX__" >/dev/null 2>&1 || true
+"$NPM" install -g --no-fund --no-audit @deepseek-ai/dsh@__TARGET__ 2>&1 | tail -n 8
+echo "----"
+for c in "$HOME/.local/bin/dsh" "$HOME/.npm-global/bin/dsh" "$HOME/.local/node/bin/dsh"; do
+  if [ -x "$c" ]; then v="$("$c" --version 2>/dev/null | head -1)"; echo "DSH_NOW=$v"; exit 0; fi
+done
+echo "DSH_NOW="
+'@
+  $upgrade = $upgrade.Replace('__PREFIX__', $prefix).Replace('__TARGET__', $target)
+  $res = Invoke-B64 $upgrade $sshHost
+
+  $nowVer = ''
+  if ($res -match 'DSH_NOW=(\S+)') { $nowVer = $Matches[1] }
+  if ($nowVer -ne $target) {
+    Write-Err "$name`: upgrade failed, dsh reports '$nowVer' instead of '$target'"
+    Write-C (($res.Trim() -split "`r?`n" | Select-Object -Last 8) -join "`n") 'DarkGray'
+    Write-Info 'the previous installation may still be intact; check before restarting'
+    return $false
+  }
+  Write-Ok "$name`: dsh now $nowVer"
+
+  # Restart so the running server actually uses the new version.
+  $r = Invoke-B64 'systemctl --user restart dsh-web.service 2>&1; sleep 3; systemctl --user is-active dsh-web.service 2>&1' $sshHost
+  if ($r -notmatch 'active') {
+    Write-Err "$name`: service did not come back after the upgrade: $($r.Trim())"
+    Write-Info "inspect with: ssh $sshHost journalctl --user -u dsh-web -n 50 --no-pager"
+    return $false
+  }
+
+  # A restart replaces the token URL, so the tunnel's browser URL is stale until
+  # the next start; the tunnel itself survives.
+  $rp = [int]$Inst.remotePort
+  $deadline = (Get-Date).AddSeconds(60)
+  $listening = $false
+  while ((Get-Date) -lt $deadline) {
+    if ((Invoke-B64 "ss -ltn 2>/dev/null | grep -q '127.0.0.1:$rp' && echo YES || echo NO" $sshHost) -match 'YES') {
+      $listening = $true; break
+    }
+    Start-Sleep -Seconds 1
+  }
+  if (-not $listening) { Write-Err "$name`: service restarted but is not listening on $rp"; return $false }
+  Write-Ok "$name`: restarted and listening on 127.0.0.1:$rp"
+  Write-Info "$name`: the auth URL was reissued; click 启动 to pick up the fresh one"
+  return $true
+}
+
+function Invoke-Check {
+  <# Read-only version report. Safe to run any time, and the fastest way to answer
+     "is anything out of date?". #>
+  $latest = Get-LatestDshVersion -Refresh
+  $local = Get-LocalDshVersion
+  $rows = @()
+  $rows += [pscustomobject]@{
+    Name = 'local'; Kind = 'local'; Current = $local; Latest = $latest
+    UpdateAvailable = [bool]($latest -and $local -and (Compare-Version $latest $local) -gt 0)
+  }
+  foreach ($i in @(Get-Instances $null)) {
+    if ($i.kind -ne 'remote') { continue }
+    if (-not (Test-SshReachable $i.sshHost)) {
+      $rows += [pscustomobject]@{ Name = $i.name; Kind = 'remote'; Current = '(unreachable)'; Latest = $latest; UpdateAvailable = $false }
+      continue
+    }
+    $f = Get-RemoteFacts $i.sshHost
+    $cur = "$(if ($f.ContainsKey('DSH_V')) { $f['DSH_V'] })".Trim()
+    $rows += [pscustomobject]@{
+      Name = $i.name; Kind = 'remote'; Current = $cur; Latest = $latest
+      UpdateAvailable = [bool]($latest -and $cur -and (Compare-Version $latest $cur) -gt 0)
+    }
+  }
+  if ($Json) { Write-Json $rows; return }
+  Write-Head "dsh versions (npm latest: $latest)"
+  $fmt = "  {0,-16} {1,-14} {2,-14} {3}"
+  Write-C ($fmt -f 'INSTANCE', 'CURRENT', 'LATEST', 'STATUS') 'Cyan'
+  foreach ($r in $rows) {
+    $status = if ($r.UpdateAvailable) { '可升级' } else { '已是最新' }
+    $color = if ($r.UpdateAvailable) { 'Yellow' } else { 'Green' }
+    Write-C ($fmt -f $r.Name, $r.Current, $r.Latest, $status) $color
+  }
+  Write-Host ''
+  if (@($rows | Where-Object { $_.UpdateAvailable }).Count -gt 0) {
+    Write-Info 'upgrade with: dsh.ps1 -Command upgrade            (all)'
+    Write-Info '              dsh.ps1 -Command upgrade -Target prod  (one)'
+    Write-Info 'add -DryRun to see what would change without changing it'
+  }
+}
+
+function Invoke-Upgrade([string[]]$Names, [switch]$DryRun) {
+  $insts = @(Get-Instances $Names)
+  $target = Get-LatestDshVersion -Refresh
+  if (-not $target) { Write-Err 'could not determine the latest published version'; return }
+  if (-not $DryRun) {
+    Write-Warn2 "upgrading restarts dsh on each instance; any session in flight will be interrupted"
+  }
+  Write-Head "upgrade to $target"
+  # local first: it is the one that is usually furthest behind, and its failure is
+  # visible immediately.
+  foreach ($i in @($insts | Where-Object { $_.kind -eq 'local' })) {
+    Upgrade-LocalDsh -Version $target -DryRun:$DryRun | Out-Null
+  }
+  foreach ($i in @($insts | Where-Object { $_.kind -eq 'remote' })) {
+    Upgrade-RemoteDsh $i -Version $target -DryRun:$DryRun | Out-Null
+  }
+}
+
 function Get-RemoteProbeScript($Inst) {
   $rport = [int]$Inst.remotePort
   @"
@@ -740,6 +1073,16 @@ function Get-RemoteStatus($Inst) {
     $detail += " · 版本不一致(本地 $localVersion / 远程 $dshVersion)"
   }
 
+  # Update availability comes from the cached registry lookup, so this adds no
+  # network call to a status refresh. It is reported as a flag only: upgrading
+  # restarts dsh and would drop a session in flight, so the decision stays with
+  # the person rather than becoming a side effect of opening the panel.
+  $latestVersion = Get-LatestDshVersion
+  $updateAvailable = $false
+  if ($dshVersion -and $dshVersion -ne 'none' -and $latestVersion) {
+    $updateAvailable = (Compare-Version $latestVersion $dshVersion) -gt 0
+  }
+
   $remoteUrl = "$(if ($f.ContainsKey('URL')) { $f['URL'] })".Trim()
   $url = ''
   if ($state -eq 'up') {
@@ -757,6 +1100,8 @@ function Get-RemoteStatus($Inst) {
     RemoteUrl = $remoteUrl; RemotePort = [int]$Inst.remotePort
     DshInstalled = ($dshPath -ne 'none' -and $dshPath -ne '')
     DshVersion = $dshVersion
+    LatestVersion = $latestVersion
+    UpdateAvailable = $updateAvailable
     VersionDrift = $drift
     SshReady = $true
     Linger = "$(if ($f.ContainsKey('LINGER')) { $f['LINGER'] })".Trim()
@@ -2065,6 +2410,8 @@ try {
                 if ($Json) { Write-Json $insts } else { Invoke-List } }
     'install' { if ($Json) { Invoke-Install $Target -Quiet; Write-Json @{ ok = $true } }
                 else { Invoke-Install $Target } }
+    'check'   { Invoke-Check }
+    'upgrade' { Invoke-Upgrade $Target -DryRun:([bool]$DryRun) }
     'doctor'  { Invoke-Doctor }
   }
 } catch {
