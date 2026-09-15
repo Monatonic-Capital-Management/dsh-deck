@@ -1,4 +1,4 @@
-﻿name: checks
+name: checks
 
 on:
   push:
@@ -95,6 +95,24 @@ jobs:
         # track the real rendering logic instead of a copy of it. Runs on every
         # push and needs no Windows.
         run: node tools/check-ui.js
+
+      - name: Machine-readable output stays machine-readable
+        shell: pwsh
+        run: |
+          # CI parsed dsh.ps1 but never executed it, so a `-Json` command that
+          # printed a human-readable line to stdout went unnoticed. That is not
+          # hypothetical: Write-Host writes to the host output, which is exactly
+          # what a caller captures, so "[warn] unknown instance 'x'" ended up in
+          # front of the payload and broke every consumer that parses it. One
+          # assertion over a harmless command (list reads a config and touches
+          # no network) keeps that class of bug out.
+          $raw = & ./dsh.ps1 -Command list -Json -Config ./.dshproj.example.json 2>$null
+          $text = ($raw | Out-String).Trim()
+          if (-not $text) { throw "list -Json produced no output" }
+          if ($text -notmatch '^\[') { throw "stdout does not start with a JSON array: $text" }
+          $parsed = $text | ConvertFrom-Json
+          if ($parsed.Count -lt 1) { throw "expected at least one instance, got $($parsed.Count)" }
+          Write-Host "ok  list -Json parsed $($parsed.Count) instance(s) with no chatter on stdout"
 
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a

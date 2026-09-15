@@ -1,0 +1,41 @@
+#!/bin/sh
+# Refuse to commit a .ps1 file that is missing its UTF-8 BOM or does not parse.
+#
+# Windows PowerShell 5.1 reads a BOM-less file as ANSI: every Chinese string in
+# dsh.ps1 becomes mojibake and the file usually stops parsing altogether, so the
+# launcher dies with "Unexpected token" until someone runs tools/fix-bom.ps1.
+# Editing tools that write UTF-8 without a BOM trigger this, and it has happened
+# repeatedly. CI does gate the BOM, but only after the fact - and its parse step
+# runs under pwsh 7 on Linux, which accepts exactly the files 5.1 rejects.
+#
+# Install once with: powershell -File tools/install-hooks.ps1
+# Bypass in an emergency: git commit --no-verify
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -i '\.ps1$')
+[ -z "$staged" ] && exit 0
+
+ps=powershell
+command -v powershell >/dev/null 2>&1 || ps=pwsh
+command -v "$ps" >/dev/null 2>&1 || {
+  echo "pre-commit: no PowerShell on PATH, skipping the .ps1 gate" >&2
+  exit 0
+}
+
+# -Command with a here-string is fragile across quoting layers, so hand the work
+# to fix-bom.ps1, which already knows the rules, and let its exit code decide.
+"$ps" -NoProfile -ExecutionPolicy Bypass -File tools/fix-bom.ps1 -Quiet
+status=$?
+
+if [ $status -ne 0 ]; then
+  echo "" >&2
+  echo "pre-commit: a staged .ps1 file does not parse under Windows PowerShell." >&2
+  echo "            Run 'powershell -File tools/fix-bom.ps1' to see the detail." >&2
+  exit 1
+fi
+
+# Re-stage anything fix-bom.ps1 rewrote, otherwise the BOM repair stays in the
+# working tree and the commit still carries the broken blob.
+for f in $staged; do
+  if [ -f "$f" ]; then git add -- "$f"; fi
+done
+exit 0

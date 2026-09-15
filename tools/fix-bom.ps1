@@ -28,7 +28,26 @@ foreach ($f in $files) {
   if (-not $Quiet) { Write-Host "  added BOM: $($f.FullName.Replace($root, '.'))" }
 }
 
-if (-not $Quiet) {
-  Write-Host ("  {0} file(s) checked, {1} fixed" -f $files.Count, $fixed)
+# Adding the BOM is only half the job: a file can be correctly encoded and still
+# be broken. This runs under Windows PowerShell 5.1 - the interpreter that
+# actually executes dsh.ps1 - so its parser is the authority. CI cannot cover
+# this: it parses under pwsh 7 on Linux, which reads BOM-less UTF-8 as UTF-8 and
+# therefore accepts files that 5.1 rejects outright.
+$broken = @()
+foreach ($f in $files) {
+  $errors = $null
+  $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+  if ($errors -and $errors.Count -gt 0) {
+    $broken += $f
+    Write-Host "  PARSE ERROR: $($f.FullName.Replace($root, '.'))" -ForegroundColor Red
+    $errors | Select-Object -First 3 | ForEach-Object {
+      Write-Host ("    line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) -ForegroundColor Red
+    }
+  }
 }
+
+if (-not $Quiet) {
+  Write-Host ("  {0} file(s) checked, {1} re-encoded, {2} unparseable" -f $files.Count, $fixed, $broken.Count)
+}
+if ($broken.Count -gt 0) { exit 1 }
 exit 0

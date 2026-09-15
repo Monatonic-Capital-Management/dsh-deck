@@ -100,6 +100,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# True while an -Json command is running. The console helpers below consult it
+# before writing anything human-readable, because Write-Host output reaches the
+# same host stream the caller captures: a stray "[warn] unknown instance" ahead
+# of the payload breaks every consumer that parses the result. Set as early as
+# possible, and never re-initialised further down - a later `= $false` would
+# silently disable the guard.
+$script:JsonMode = [bool]$Json
+
 # This script is UTF-8 (with BOM). Windows PowerShell 5.1 otherwise encodes its
 # own console output using the legacy ANSI code page, which turns every Chinese
 # string into mojibake the moment stdout is redirected to a file or a pipe. The
@@ -153,9 +161,29 @@ function Write-Head([string]$Text) {
 }
 
 function Write-Ok([string]$Text)   { Write-C "  [ok]   $Text" 'Green' }
-function Write-Warn2([string]$Text){ Write-C "  [warn] $Text" 'Yellow' }
+
+# Under -Json the payload owns stdout and nothing else may appear there: the
+# caller parses that stream, and a stray "[warn] port 3100 is held by ..." in
+# front of the JSON is a parse failure, not a warning. Note that Write-Host
+# does reach that stream - it writes to the host output, which is exactly what
+# a captured stdout is - so "it is only a host message" is not a defence.
+#
+# The fix is to move the line, not to drop it. stderr is captured separately by
+# callers (the app backend keeps stdout and stderr in distinct buffers), so the
+# diagnostic stays available in the log while the machine-readable stream stays
+# clean. Dropping it outright would have hidden real problems such as "port was
+# taken, started on another one instead".
+function Write-Diag([string]$Text, [string]$Color = 'Gray') {
+  if (-not $script:JsonMode) { Write-C $Text $Color; return }
+  # WriteLine, not Write-Error: these are notes, not terminating conditions, and
+  # a PowerShell error record would be wrapped in a RemoteException by the
+  # caller's shell and drown the message in noise.
+  try { [Console]::Error.WriteLine($Text) } catch { }
+}
+
+function Write-Warn2([string]$Text){ Write-Diag "  [warn] $Text" 'Yellow' }
 function Write-Err([string]$Text)  { Write-C "  [fail] $Text" 'Red' }
-function Write-Info([string]$Text) { Write-C "  [info] $Text" 'Gray' }
+function Write-Info([string]$Text) { Write-Diag "  [info] $Text" 'Gray' }
 
 function Write-Log([string]$Message) {
   $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
@@ -588,9 +616,22 @@ function Get-Instances([string[]]$Names, [string]$ConfigPath) {
   }
   $sel = @()
   foreach ($n in $Names) {
-    $hit = @($all | Where-Object { $_.name -eq $n })
-    if ($hit.Count -eq 0) { Write-Warn2 "unknown instance '$n' (see: dsh.ps1 list)" ; continue }
-    $sel += $hit
+    # Accept "a,b" as well as "a","b". The parameter is [string[]], which makes
+    # a comma list look supported, but PowerShell only splits on commas in
+    # *unquoted* argument position - a quoted 'local,DuckServer' arrives as one
+    # element and used to match nothing and quietly return an empty table.
+    foreach ($piece in ([string]$n -split ',')) {
+      $name = $piece.Trim()
+      if (-not $name) { continue }
+      $hit = @($all | Where-Object { $_.name -eq $name })
+      if ($hit.Count -eq 0) {
+        # Reaches stdout normally and stderr under -Json, so the caller can tell
+        # an unknown name from "configured but not running" either way.
+        Write-Warn2 "unknown instance '$name' (see: dsh.ps1 list)"
+        continue
+      }
+      $sel += $hit
+    }
   }
   return @($sel)
 }
@@ -2912,7 +2953,10 @@ try {
     'tray-stop'  { Invoke-Tray -Stop }
     # Internal: the detached process that owns the tray's message loop.
     'tray-loop'  { Start-TrayLoop -IntervalSeconds $TrayInterval }
-    'status'  { $rows = @(Get-AllStatus)
+    # -Target narrows the report to the named instances. Without it a `status`
+    # probes every remote host, which costs one ssh round trip each; asking about
+    # one host should not pay for the other five.
+    'status'  { $rows = @(Get-AllStatus -Names $Target)
                 if ($Json) { Write-Json $rows } else { Write-StatusTable $rows } }
     # A mutation answers for the instances it acted on, not for the whole farm:
     # the panel reads the row it asked about, and refreshing every remote host
