@@ -739,6 +739,29 @@ function esc(s) {
 /* The status line is driven directly from load(); no separate setter. */
 
 /* ---------------------------------------------------------------- actions */
+/* Update one card from a mutation reply.
+
+   A start/stop/restart already answers with the fresh state of the instance it
+   acted on, so the card can show the result the moment the call returns instead
+   of waiting for the next 20 s poll (and paying for another full status
+   refresh). Merge rather than replace: the reply carries what the launcher just
+   measured, while the card keeps whatever the last full refresh knew. */
+function applyInstance(inst) {
+  if (!inst || !inst.name) return false;
+  const idx = INSTANCES.findIndex(i => i.name === inst.name);
+  if (idx < 0) return false;
+  INSTANCES[idx] = Object.assign({}, INSTANCES[idx], inst);
+  render();
+  const up = INSTANCES.filter(i => isUp(i.state)).length;
+  const dot = document.querySelector(".sb-dot");
+  if (dot) dot.className = "sb-dot" + (up ? "" : " idle");
+  const text = $("#sb-text");
+  if (text) text.textContent = up + " / " + INSTANCES.length + " 个实例运行中";
+  const stamp = $("#sb-updated");
+  if (stamp) stamp.textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  return true;
+}
+
 async function load(probe) {
   const dot = document.querySelector(".sb-dot");
   dot.className = "sb-dot busy";
@@ -760,6 +783,7 @@ async function load(probe) {
 
 async function act(kind, name) {
   BUSY.add(name); render();
+  let applied = false;
   try {
     if (kind === "open") {
       const it = INSTANCES.find(i => i.name === name);
@@ -785,22 +809,27 @@ async function act(kind, name) {
       toast("正在启动 " + name + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/start", { method: "POST" });
       const ok = r.state && isUp(r.state.State);
+      applied = applyInstance(r.instance);
       toast(ok ? name + " 已就绪" : name + " 启动失败", ok ? "ok" : "bad");
     } else if (kind === "stop") {
       toast("正在停止 " + name + "…");
-      await api("/api/instances/" + encodeURIComponent(name) + "/stop", { method: "POST" });
+      const r = await api("/api/instances/" + encodeURIComponent(name) + "/stop", { method: "POST" });
+      applied = applyInstance(r.instance);
       toast(name + " 已停止", "ok");
     } else if (kind === "restart") {
       toast("正在重启 " + name + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/restart", { method: "POST" });
       const ok = r.state && isUp(r.state.State);
+      applied = applyInstance(r.instance);
       toast(ok ? name + " 已重启" : name + " 重启失败", ok ? "ok" : "bad");
     }
   } catch (e) {
     toast(name + " 操作失败：" + e.message, "bad");
   } finally {
     BUSY.delete(name);
-    await load();
+    // The reply already carried this instance's state; only fall back to a full
+    // refresh when there was nothing to apply (install, or an unknown shape).
+    if (applied) render(); else await load();
   }
 }
 
@@ -810,18 +839,21 @@ async function actAll(kind) {
   const btn = kind === "stop" ? $("#btn-stop-all") : $("#btn-start-all");
   btn.classList.add("spin"); btn.disabled = true;
   toast("正在" + (kind === "stop" ? "停止" : "启动") + " " + targets.length + " 个实例…");
-  let ok = 0;
+  let ok = 0, applied = 0;
   for (const it of targets) {
     BUSY.add(it.name); render();
     try {
-      await api("/api/instances/" + encodeURIComponent(it.name) + "/" + kind, { method: "POST" });
+      const r = await api("/api/instances/" + encodeURIComponent(it.name) + "/" + kind, { method: "POST" });
+      if (applyInstance(r.instance)) applied++;
       ok++;
     } catch (e) { toast(it.name + "：" + e.message, "bad"); }
     BUSY.delete(it.name); render();
   }
   btn.classList.remove("spin"); btn.disabled = false;
   toast(ok + " / " + targets.length + " 个实例已" + (kind === "stop" ? "停止" : "启动"), "ok");
-  await load();
+  // Each call above answered with its own instance's state; a full refresh is
+  // only needed for the rows that did not come back.
+  if (applied < targets.length) await load();
 }
 
 function copyUrl(url) {

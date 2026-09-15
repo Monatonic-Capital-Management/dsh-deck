@@ -166,12 +166,8 @@ function Write-Log([string]$Message) {
 # Small utilities
 # --------------------------------------------------------------------------
 
-function Invoke-B64([string]$Script, [string]$SshHostName, [int]$TimeoutSec = 30) {
-  <# Run a bash script on a remote host. The script is base64-encoded so that
-     nothing between here and the remote bash can reinterpret its bytes: nested
-     quoting through PowerShell -> ssh -> bash mangles anything else.
-     The payload is ASCII by construction, so the encoding of our own pipe into
-     ssh cannot corrupt it regardless of the console code page.
+function Get-B64Payload([string]$Script) {
+  <# The bytes of a remote script, as the base64 payload every ssh call sends.
 
      Line endings are forced to LF before encoding. .gitattributes asks for CRLF
      in .ps1 files (right for PowerShell), so every here-string in this file
@@ -180,8 +176,20 @@ function Invoke-B64([string]$Script, [string]$SshHostName, [int]$TimeoutSec = 30
      The deploy path already normalised its own payload; the probe path did not,
      which made every remote instance report "服务器上还没有安装 dsh" no matter
      what was actually installed. Normalising here fixes every caller at once. #>
-  $Script = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
-  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
+  $normalized = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
+  return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalized))
+}
+
+function Invoke-B64([string]$Script, [string]$SshHostName, [int]$TimeoutSec = 30) {
+  <# Run a bash script on a remote host. The script is base64-encoded so that
+     nothing between here and the remote bash can reinterpret its bytes: nested
+     quoting through PowerShell -> ssh -> bash mangles anything else.
+     The payload is ASCII by construction, so the encoding of our own pipe into
+     ssh cannot corrupt it regardless of the console code page.
+
+     Line-ending normalisation lives in Get-B64Payload, which the batched probe
+     path shares. #>
+  $b64 = Get-B64Payload $Script
   # ssh reports failures ("Connection refused", "Permission denied") on stderr,
   # and under $ErrorActionPreference='Stop' a native command's stderr line is a
   # TERMINATING error: one unreachable host aborted the entire command, so the
@@ -355,7 +363,21 @@ function Get-LocalUrl([string]$InstanceName, [int]$PortValue) {
      URL from an earlier run on a different port (an instance started with
      -LocalPort, then re-adopted), and handing that to the browser opens a dead
      page. The rotated log is searched as well: the run that is still serving
-     this port may be the one whose output was rotated away. #>
+     this port may be the one whose output was rotated away.
+
+     Falls back to the plain port URL when the log has no line for it yet; the
+     start path polls the log-only variant so it can record the real link the
+     moment dsh prints it. #>
+  $logged = Get-LocalUrlFromLog $InstanceName $PortValue
+  if ($logged) { return $logged }
+  return "http://127.0.0.1:$PortValue"
+}
+
+function Get-LocalUrlFromLog([string]$InstanceName, [int]$PortValue) {
+  <# The ready line dsh printed for exactly this port, or '' when there is none.
+
+     See Get-LocalUrl for why only a line matching this port counts, and why the
+     rotated log is searched too. #>
   foreach ($file in @("$InstanceName.server.log", "$InstanceName.server.log.1")) {
     $log = Join-Path $LogDir $file
     if (-not (Test-Path $log)) { continue }
@@ -367,7 +389,7 @@ function Get-LocalUrl([string]$InstanceName, [int]$PortValue) {
       if ($url -match ":$PortValue/") { return $url }
     }
   }
-  return "http://127.0.0.1:$PortValue"
+  return ''
 }
 
 # --------------------------------------------------------------------------
@@ -801,9 +823,17 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
     return 0
   }
 
-  # Give dsh a moment to print its URL, then record state.
-  Start-Sleep -Seconds 2
-  $url = Get-LocalUrl $name $port
+  # dsh prints its ready line as it starts answering, so poll for that line
+  # instead of sleeping a flat two seconds -- the link (and its one-time token)
+  # is normally in the log the moment the port answers. A build that never prints
+  # one still falls back to the plain URL after the bounded wait.
+  $url = ''
+  $urlDeadline = (Get-Date).AddSeconds(3)
+  while (-not $url -and (Get-Date) -lt $urlDeadline) {
+    $url = Get-LocalUrlFromLog $name $port
+    if (-not $url) { Start-Sleep -Milliseconds 100 }
+  }
+  if (-not $url) { $url = "http://127.0.0.1:$port" }
   Set-State $name ([pscustomobject]@{
     serverPid = $proc.Id; port = $port; url = $url; updatedAt = (Get-Date).ToString('o')
   })
@@ -1330,12 +1360,63 @@ if [ -f `$HOME/.dsh/remote-web.url ]; then echo "URL=`$(cat `$HOME/.dsh/remote-w
 "@
 }
 
-function Get-RemoteStatus($Inst) {
+function Get-RemoteProbeOutputs([object[]]$Insts) {
+  <# Run one ssh probe per remote host with all of them in flight at once.
+
+     The probes are independent, and each one costs about as long as its ssh
+     handshake (~0.8 s here): probing four hosts in a row spent ~3.7 s of every
+     status refresh waiting on handshakes that could overlap. Runspaces keep the
+     probes inside this process -- an extra PowerShell per host would cost more
+     than the wait it removes -- and a host that cannot be reached still answers
+     with its ssh error text, which the caller already turns into an
+     "unreachable" row. Output is keyed by instance name. #>
+  $results = @{}
+  $list = @($Insts)
+  if ($list.Count -eq 0) { return $results }
+  $pool = [RunspaceFactory]::CreateRunspacePool(1, [Math]::Min(8, $list.Count))
+  $jobs = @()
+  try {
+    $pool.Open()
+    foreach ($i in $list) {
+      $payload = Get-B64Payload (Get-RemoteProbeScript $i)
+      $shell = [PowerShell]::Create()
+      $shell.RunspacePool = $pool
+      # The script block must stand alone: it runs in a fresh runspace and
+      # cannot see this file's functions. Same ssh contract as Invoke-B64.
+      $null = $shell.AddScript({
+        param($sshHost, $b64)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new $sshHost "echo $b64 | base64 -d | bash" 2>&1 }
+        finally { $ErrorActionPreference = $prev }
+        ($out | Out-String)
+      }).AddArgument($i.sshHost).AddArgument($payload)
+      $jobs += [pscustomobject]@{ Name = [string]$i.name; Shell = $shell; Handle = $shell.BeginInvoke() }
+    }
+    foreach ($j in $jobs) {
+      $text = ''
+      try { $text = [string](@($j.Shell.EndInvoke($j.Handle)) -join '') } catch { $text = '' }
+      $results[$j.Name] = $text
+    }
+  } finally {
+    foreach ($j in $jobs) { try { $j.Shell.Dispose() } catch { } }
+    try { $pool.Close() } catch { }
+    try { $pool.Dispose() } catch { }
+  }
+  return $results
+}
+
+function Get-RemoteStatus($Inst, [string]$ProbeOutput) {
   $sshHost = $Inst.sshHost
   <# One ssh session, not two. The probe script's first line is SSH_USER, so a
      host that answered is proven reachable by the probe itself; the separate
-     Test-SshReachable round trip only added ~1.4 s to every refresh. #>
-  $out = Invoke-B64 (Get-RemoteProbeScript $Inst) $sshHost
+     Test-SshReachable round trip only added ~1.4 s to every refresh.
+
+     A caller that already ran the probes together passes the output in, so the
+     status loop can keep one ssh handshake per host without running them one
+     after another. #>
+  if ($PSBoundParameters.ContainsKey('ProbeOutput')) { $out = $ProbeOutput }
+  else { $out = Invoke-B64 (Get-RemoteProbeScript $Inst) $sshHost }
   $f = @{}
   foreach ($line in ($out -split "`r?`n")) {
     if ($line -match '^([A-Z_]+)=(.*)$') { $f[$Matches[1]] = $Matches[2] }
@@ -2029,9 +2110,30 @@ function Open-Instance([string]$Url, [switch]$AsAppWindow) {
 # Status rendering
 # --------------------------------------------------------------------------
 
-function Get-AllStatus([switch]$NoProbeHttp) {
+function Get-AllStatus([switch]$NoProbeHttp, [string[]]$Names) {
+  <# -Names limits the refresh to the instances a mutation just touched.
+
+     The panel asks "what is the state of the thing I restarted", and answering
+     that for every configured instance meant paying an ssh probe per remote host
+     on every start/stop/restart: ~3.7 s of the ~13 s a local restart used to
+     take. The full panel refresh still calls this with no -Names. #>
   $insts = @(Get-HostsConfig $Config).instances
+  if ($Names -and @($Names).Count -gt 0) {
+    # Profile-expanded entries carry the connection fields; disabled entries are
+    # kept so a mutation against one still reports its own row.
+    $wanted = @{}
+    foreach ($n in @($Names)) { $wanted[[string]$n] = $true }
+    $enabled = @(Get-Instances $Names $Config)
+    $off = @($insts | Where-Object { $wanted.ContainsKey([string]$_.name) -and (Get-ConfigProp $_ 'enabled') -eq $false })
+    $insts = @($enabled) + @($off)
+  }
   $rows = @()
+  # Remote probes are independent and each costs an ssh handshake, so run the set
+  # together and hand every row its own output. A single remote keeps the plain
+  # path: one probe has nothing to overlap with.
+  $probeOutputs = @{}
+  $remotes = @($insts | Where-Object { (Get-InstProp $_ 'kind' 'local') -eq 'remote' -and (Test-InstFlag $_ 'enabled' $true) })
+  if ($remotes.Count -gt 1) { $probeOutputs = Get-RemoteProbeOutputs $remotes }
   foreach ($i in $insts) {
     if (-not (Test-InstFlag $i 'enabled' $true)) {
       $rows += [pscustomobject]@{
@@ -2045,7 +2147,11 @@ function Get-AllStatus([switch]$NoProbeHttp) {
     # "无法读取实例状态" for every instance, including the healthy ones. Turn it
     # into a row for this instance alone and keep collecting the rest.
     try {
-      if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { $rows += Get-RemoteStatus $i }
+      if ((Get-InstProp $i 'kind' 'local') -eq 'remote') {
+        $key = [string]$i.name
+        if ($probeOutputs.ContainsKey($key)) { $rows += Get-RemoteStatus $i -ProbeOutput $probeOutputs[$key] }
+        else { $rows += Get-RemoteStatus $i }
+      }
       else { $rows += Get-LocalStatus $i -NoProbeHttp:$NoProbeHttp }
     } catch {
       $portValue = 0
@@ -2744,11 +2850,14 @@ try {
     'tray-loop'  { Start-TrayLoop -IntervalSeconds $TrayInterval }
     'status'  { $rows = @(Get-AllStatus)
                 if ($Json) { Write-Json $rows } else { Write-StatusTable $rows } }
-    'start'   { if ($Json) { Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp) }
+    # A mutation answers for the instances it acted on, not for the whole farm:
+    # the panel reads the row it asked about, and refreshing every remote host
+    # here used to add one ssh probe each to every start/stop/restart.
+    'start'   { if ($Json) { Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp -Names $Target) }
                 else { Invoke-Start $Target } }
-    'stop'    { if ($Json) { Invoke-Stop $Target; Write-Json @(Get-AllStatus -NoProbeHttp) }
+    'stop'    { if ($Json) { Invoke-Stop $Target; Write-Json @(Get-AllStatus -NoProbeHttp -Names $Target) }
                 else { Invoke-Stop $Target } }
-    'restart' { if ($Json) { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp) }
+    'restart' { if ($Json) { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp -Names $Target) }
                 else { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target } }
     'open'    { Invoke-Open $Target }
     'logs'    { Invoke-Logs $Target $Lines }

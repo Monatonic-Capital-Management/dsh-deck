@@ -78,12 +78,21 @@ function psRun(args, timeoutMs = 300000) {
     const child = spawn(
       'powershell',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', PS1].concat(args),
-      { cwd: LAUNCHER_DIR, windowsHide: true }
+      // No stdin: nothing the launcher runs reads it, and an extra inherited
+      // pipe is one more handle a detached child can keep open.
+      { cwd: LAUNCHER_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
     );
     let out = '';
     let err = '';
     let settled = false;
-    const timer = setTimeout(() => {
+    let timer = null;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ ok: code === 0, code, out, err });
+    };
+    timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       try { child.kill(); } catch (_) {}
@@ -93,16 +102,18 @@ function psRun(args, timeoutMs = 300000) {
     child.stderr.on('data', (d) => { err += d.toString('utf8'); });
     child.on('error', (e) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ ok: false, code: -1, out, err: String(e.message) });
+      err = String(e.message);
+      finish(-1);
     });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ ok: code === 0, code, out, err });
-    });
+    // A command that starts dsh leaves the detached dsh process holding a
+    // duplicate of this child's stdout pipe, so 'close' never fires while that
+    // instance runs: start/restart looked like they hung for the whole life of
+    // the instance even though the launcher had finished and printed its JSON.
+    // The reply is written before the child exits, so its exit plus a moment for
+    // the pipes to drain is the end of the command; 'close' still wins if it
+    // arrives first.
+    child.on('exit', (code) => { setTimeout(() => finish(code), 400); });
+    child.on('close', (code) => finish(code));
   });
 }
 
@@ -206,6 +217,30 @@ async function assertKnownInstance(name) {
   return insts;
 }
 
+/**
+ * One panel-shaped instance object out of a launcher status row plus its config
+ * entry. GET /api/instances and the mutation replies share this, so a card can
+ * be updated from the reply a start/stop/restart already carries instead of
+ * paying for another full status refresh.
+ */
+function mapInstance(r, c) {
+  const cfg = c || {};
+  return {
+    name: r.Name,
+    kind: r.Kind,
+    state: r.State,
+    port: r.Port,
+    detail: r.Detail,
+    url: r.Url,
+    http: r.Http,
+    sshHost: cfg.sshHost || r.SshHost || '',
+    description: cfg.description || '',
+    enabled: cfg.enabled !== false,
+    remotePort: cfg.remotePort || r.RemotePort || null,
+    localPort: cfg.localPort || null,
+  };
+}
+
 // ---------------------------------------------------------------- http glue
 
 function send(res, status, body, headers) {
@@ -255,23 +290,7 @@ const routes = {
     const rows = asArray(await psJson(show('status', null, probe ? ['-Probe'] : ['-NoProbe']), 300000));
     const cfg = await loadInstances();
     const byName = new Map(cfg.map((c) => [c.name, c]));
-    return rows.map((r) => {
-      const c = byName.get(r.Name) || {};
-      return {
-        name: r.Name,
-        kind: r.Kind,
-        state: r.State,
-        port: r.Port,
-        detail: r.Detail,
-        url: r.Url,
-        http: r.Http,
-        sshHost: c.sshHost || '',
-        description: c.description || '',
-        enabled: c.enabled !== false,
-        remotePort: c.remotePort || null,
-        localPort: c.localPort || null,
-      };
-    });
+    return rows.map((r) => mapInstance(r, byName.get(r.Name)));
   },
 
   'GET /api/instances/:name/logs': async (ctx) => {
@@ -289,29 +308,32 @@ const routes = {
   },
 
   'POST /api/instances/:name/start': async (ctx) => {
-    await assertKnownInstance(ctx.params.name);
+    const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('start', ctx.params.name, ['-NoOpen']), 300000, ctx.params.name);
     return {
       ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
+      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
     };
   },
 
   'POST /api/instances/:name/stop': async (ctx) => {
-    await assertKnownInstance(ctx.params.name);
+    const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('stop', ctx.params.name), 180000, ctx.params.name);
     return {
       ok: Boolean(r.state && r.state.State === 'down'),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
+      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
     };
   },
 
   'POST /api/instances/:name/restart': async (ctx) => {
-    await assertKnownInstance(ctx.params.name);
+    const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('restart', ctx.params.name), 420000, ctx.params.name);
     return {
       ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
+      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
     };
   },
 
