@@ -227,6 +227,69 @@ call and restore it afterwards. There is no per-invocation flag for this; the
 preference is inherited by the child. The same trait is why `taskkill` needed
 wrapping (see #14) — it writes "process not found" to stderr.
 
+## 18. A switch can be declared, documented, and completely inert
+
+`-NoProbe` was in `param()`, documented as "status only: skip the HTTP liveness
+probe, much faster", listed in the README, and passed by two in-repo callers
+(the panel's fast path and `tools/check-panel.ps1`). It did nothing:
+
+```powershell
+'status' { $rows = @(Get-AllStatus -Names $Target) }   # -NoProbeHttp never passed
+```
+
+`$NoProbe` appeared exactly once in the whole file — its own declaration. Measured
+before and after the fix: 513 ms / `Http: 401` versus 509 ms / `Http: 401`. The
+flag was advertised, relied upon, and had no effect. `-Follow` was the same shape
+(`logs -Follow` printed the last N lines and exited), and `-Probe` still is
+harmless-but-inert because probing is already the default.
+
+The same root cause had a second victim: `-SshConfigPath` was read through
+`$PSBoundParameters` **inside a function that declared no parameters**, so the
+guard could never be true and the override was silently ignored — the identical
+bug the file had already fixed for `-Config` (see #13). `doctor -SshConfigPath
+C:\definitely-not-here` happily reported the default path.
+
+**Fix:** thread overrides through as explicit arguments, and let a caller supply
+the verdict instead of assuming it. `Invoke-Install` now returns whether anything
+was installed, because the `-Json` branch used to answer `{"ok":true}` with exit
+0 after printing `[fail] no remote instances selected`.
+
+**Guard:** `tools/check-ui.js` now reads `dsh.ps1` as text and fails when a verb
+is in the `ValidateSet` but not the dispatch `switch` (the switch has no
+`default`, so a mismatch is a silent no-op command), or when any `param()`
+variable is never read after its declaration. Both checks were mutation-tested:
+reverting the `-NoProbe` forwarding and adding an unread parameter each fail the
+suite. A parse check cannot see any of this — an inert switch is valid PowerShell.
+
+## 19. `Write-Host` reaches the stdout a caller captures
+
+The panel parses `dsh.ps1 -Json` output, and `[warn]`/`[info]` lines kept
+appearing in front of the payload. The instinct is "`Write-Host` writes to the
+host, not to stdout, so it cannot be in a redirect" — that is wrong. Under
+`powershell -File ... > file` the host output lands in the file:
+
+```powershell
+powershell -NoProfile -Command "Write-Host 'noise'; Write-Output '{\"a\":1}'" > t.txt
+# t.txt contains BOTH lines
+```
+
+Every consumer that parses stdout therefore had to be defensive. `app/server.js`
+scans for the first bracket position precisely because of this (see #3).
+
+**Fix:** a `Write-Diag` helper routes `[warn]`/`[info]`/`[fail]` to stderr when
+`$Json` is set, so the payload owns stdout alone. Do not "fix" this by deleting
+the message: a dropped line hides real conditions such as "port was taken,
+started on another one instead". Moving it keeps the diagnostic (the backend
+captures stdout and stderr in separate buffers) while keeping the parsed stream
+clean. The first attempt suppressed warnings outright and left `[fail]` on
+stdout, which is worse than either extreme.
+
+**Related trap:** an edit tool that rewrites a `.ps1` file without a BOM breaks
+the launcher outright (#1). Since CI parses under pwsh 7 on Linux — which reads
+BOM-less UTF-8 as UTF-8, so it accepts exactly the files Windows PowerShell 5.1
+rejects — the local `pre-commit` hook is the only gate that catches it. Install
+it with `tools/install-hooks.ps1`.
+
 ## The pattern
 
 The majority of these produce a **success report followed by nothing working**.

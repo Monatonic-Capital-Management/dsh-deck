@@ -1,4 +1,4 @@
-﻿// Exercise the panel's failure-hint command builders.
+// Exercise the panel's failure-hint command builders.
 //
 // These produce the exact text a user copies to a terminal, so a broken one is
 // worse than no button: it costs a round trip and looks authoritative. Extracted
@@ -99,6 +99,183 @@ if (!blockSrc || !escSrc || !isUpSrc || !stateSrc) {
     const got = offers(obj);
     if (got === want) { console.log(`  PASS  ${label}`); pass++; }
     else { console.log(`  FAIL  ${label} (got ${got}, want ${want})`); fail++; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Launcher surface checks, read from dsh.ps1 as text.
+//
+// These cover the class of bug that parameters and verbs kept falling into: a
+// switch declared in param() and advertised by Get-Help's syntax line, but
+// never actually read by any code. -NoProbe was documented as "much faster,
+// skip the HTTP liveness probe", two callers relied on it, and it changed
+// nothing; -Follow was advertised and did nothing. Both are invisible to a
+// parse check and to any test that only exercises the happy path, because
+// neither is a syntax error - they are silent no-ops.
+//
+// Text inspection rather than PowerShell AST: CI runs this on Linux where no
+// PowerShell is installed, and a regex over the source is enough for both
+// questions ("is this name read anywhere else?" and "do these two lists
+// agree?").
+// ---------------------------------------------------------------------------
+{
+  const ps1 = fs.readFileSync(path.join(__dirname, '..', 'dsh.ps1'), 'utf8');
+
+  // (1) Every dispatcher verb must have a matching switch clause.
+  const vsRaw = ps1.match(/\[ValidateSet\(([^)]*)\)\]/);
+  const verbs = vsRaw
+    ? vsRaw[1].replace(/['"\s]/g, '').split(',').filter(Boolean)
+    : [];
+  const switchRaw = ps1.match(/switch \(\$Command\) \{([\s\S]*?)\n\}\s*catch/);
+  const clauses = switchRaw ? [...switchRaw[1].matchAll(/'([a-z][a-z-]*)'\s*\{/g)].map(m => m[1]) : [];
+  const orphanVerbs = verbs.filter(v => !clauses.includes(v));
+  const orphanClauses = clauses.filter(c => !verbs.includes(c));
+  if (!verbs.length || !clauses.length) {
+    console.log('  FAIL  could not read the command dispatch from dsh.ps1');
+    fail++;
+  } else if (orphanVerbs.length || orphanClauses.length) {
+    // The switch has no default clause and the script ends in `exit 0`, so a
+    // mismatch is a silent no-op command rather than an error.
+    console.log(`  FAIL  ValidateSet/switch disagree:`
+      + (orphanVerbs.length ? ` dispatched but no clause: ${orphanVerbs.join(', ')}` : '')
+      + (orphanClauses.length ? ` clause but not dispatchable: ${orphanClauses.join(', ')}` : ''));
+    fail++;
+  } else {
+    console.log(`  PASS  all ${verbs.length} commands are both valid and dispatched`);
+    pass++;
+  }
+
+  // (2) Every param() variable must be read somewhere beyond its declaration.
+  const paramBlock = ps1.match(/^param\(([\s\S]*?)^\)/m);
+  if (!paramBlock) {
+    console.log('  FAIL  could not locate the param() block in dsh.ps1');
+    fail++;
+  } else {
+    // Intentionally accepted-but-unread, with the reason. Keep this list short
+    // and justified: each entry is a promise the help text is not keeping.
+    const allowedUnread = new Set(['Probe']);
+    const decls = [...paramBlock[1].matchAll(/\[[^\]]+\]\s*\$(\w+)/g)].map(m => m[1]);
+    const body = ps1.slice(paramBlock.index + paramBlock[0].length);
+    const unread = decls.filter((name) => {
+      if (allowedUnread.has(name)) return false;
+      // A read is a use that is not the declaration: strip the [Type]$Name
+      // shape first so the declaration itself cannot satisfy the test.
+      const uses = body.match(new RegExp(`\\$${name}\\b`, 'g')) || [];
+      return uses.filter(u => u).length === 0;
+    });
+    if (unread.length) {
+      console.log(`  FAIL  declared in param() but never read (dead switch): ${unread.join(', ')}`);
+      fail++;
+    } else {
+      console.log(`  PASS  every declared parameter is read (${decls.length} checked)`);
+      pass++;
+    }
+  }
+
+  // (3) -NoProbe specifically must reach the status probe. Asserting the wiring
+  //     rather than just "the name appears somewhere" is the whole point: the
+  //     original defect had $NoProbe present in param() and absent from every
+  //     call path.
+  if (/-Command status/.test(ps1) === false && !/switch \(\$Command\)/.test(ps1)) {
+    console.log('  FAIL  could not find the command dispatch to check -NoProbe wiring');
+    fail++;
+  } else if (/Get-AllStatus -NoProbeHttp:\$NoProbe/.test(ps1)) {
+    console.log('  PASS  -NoProbe is forwarded to the status probe');
+    pass++;
+  } else {
+    console.log('  FAIL  -NoProbe does not reach Get-AllStatus (status would always probe)');
+    fail++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Instance filtering.
+//
+// instanceMatches() is pure, so it is extracted and tested directly rather than
+// through a DOM. The filter input lives outside #list on purpose: render()
+// replaces the list wholesale on every poll, so an input inside it would lose
+// focus and caret position every 20 seconds. That structural choice is asserted
+// too, because it is invisible in a screenshot and easy to undo by accident.
+// ---------------------------------------------------------------------------
+{
+  const isUpSrc = html.match(/const isUp = [^\n]+/);
+  const fnStart = html.indexOf('function instanceMatches(');
+  const fnEnd = html.indexOf('function filteredInstances(');
+  const fnSrc = (fnStart >= 0 && fnEnd > fnStart) ? html.slice(fnStart, fnEnd) : '';
+  if (!fnSrc || !isUpSrc) {
+    console.log('  FAIL  could not extract instanceMatches from index.html');
+    fail++;
+  } else {
+    const { instanceMatches } = new Function(
+      isUpSrc[0] + '\n' + fnSrc + '\nreturn { instanceMatches };')();
+
+    const inst = (over) => ({
+      name: 'Trade_Main', sshHost: 'Trade_Main', description: 'trade box',
+      kind: 'remote', state: 'up', ...over,
+    });
+
+    const cases3 = [
+      ['empty query matches everything',    inst(), '', false, true],
+      ['name match',                        inst(), 'trade', false, true],
+      ['case-insensitive',                  inst(), 'TRADE', false, true],
+      ['sshHost match',                     inst({ name: 'x', sshHost: 'DuckServer' }), 'duck', false, true],
+      ['description match',                 inst(), 'box', false, true],
+      ['non-match',                         inst(), 'zzz', false, false],
+      ['comma needles both present',        inst(), 'trade,main', false, true],
+      ['space needles both present',        inst(), 'trade main', false, true],
+      ['one needle missing -> no match',    inst(), 'trade,zzz', false, false],
+      ['downOnly hides a running instance', inst(), '', true, false],
+      ['downOnly keeps a down instance',    inst({ state: 'down' }), '', true, true],
+      ['downOnly + matching query',         inst({ state: 'down' }), 'trade', true, true],
+      ['whitespace-only query is no filter', inst(), '   ', false, true],
+    ];
+    for (const [label, obj, q, down, want] of cases3) {
+      const got = instanceMatches(obj, q, down);
+      if (got === want) { console.log(`  PASS  filter: ${label}`); pass++; }
+      else { console.log(`  FAIL  filter: ${label} (got ${got}, want ${want})`); fail++; }
+    }
+
+    // The input must not live inside #list, or it cannot keep focus.
+    const listOpen = html.indexOf('<div id="list">');
+    const filterPos = html.indexOf('id="flt-q"');
+    if (listOpen < 0 || filterPos < 0) {
+      console.log('  FAIL  could not locate the filter input and #list in index.html');
+      fail++;
+    } else if (filterPos > listOpen) {
+      console.log('  FAIL  the filter input is inside #list; it would lose focus on every poll');
+      fail++;
+    } else {
+      console.log('  PASS  filter input is outside #list (survives re-render)');
+      pass++;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The inline <script> must at least parse.
+//
+// CI checks app/server.js with `node --check` but never looked at the panel's
+// own script, so a stray bracket in the shipped UI would only surface as a
+// blank page in a browser. vm.Script compiles without executing, which is what
+// is wanted here: running it needs a DOM.
+// ---------------------------------------------------------------------------
+{
+  const vm = require('vm');
+  const open = html.indexOf('<script>');
+  const close = html.lastIndexOf('</script>');
+  if (open < 0 || close <= open) {
+    console.log('  FAIL  could not find the inline <script> in index.html');
+    fail++;
+  } else {
+    const js = html.slice(open + '<script>'.length, close);
+    try {
+      new vm.Script(js, { filename: 'app/ui/index.html <script>' });
+      console.log('  PASS  inline panel script parses');
+      pass++;
+    } catch (e) {
+      console.log(`  FAIL  inline panel script has a syntax error: ${e.message}`);
+      fail++;
+    }
   }
 }
 

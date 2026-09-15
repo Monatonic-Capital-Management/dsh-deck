@@ -1,4 +1,4 @@
-﻿# dsh-deck
+# dsh-deck
 
 A desktop control panel for **every** [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`) you run — the one on this machine and the ones on your servers.
@@ -58,7 +58,7 @@ cd dsh-deck
 That opens the panel with a single `local` instance. To add a server:
 
 ```powershell
-# register a host from your ~/.ssh/config (picks a free tunnel port)
+# register a host by its ssh alias or user@host (picks a free tunnel port)
 .\dsh.ps1 -Command add -SshHost prod
 
 # install + start it; this provisions Node/dsh/systemd if the host needs them
@@ -85,8 +85,9 @@ dsh.ps1 -Command stop                   stop everything (servers + tunnels)
 dsh.ps1 -Command restart -Target prod
 dsh.ps1 -Command open                   open whatever is already running
 dsh.ps1 -Command logs -Target prod      remote journal / local server log
+dsh.ps1 -Command logs -Target prod -Follow   stream it until Ctrl-C
 dsh.ps1 -Command install -Target prod   provision and deploy only
-dsh.ps1 -Command add -SshHost prod      register a host from ~/.ssh/config
+dsh.ps1 -Command add -SshHost prod      register a host by ssh alias
 dsh.ps1 -Command list                   show configured instances
 dsh.ps1 -Command doctor                 diagnose this machine and every host
 dsh.ps1 -Command check                  compare versions against npm's latest
@@ -100,7 +101,11 @@ dsh.ps1 -Command menu                   terminal control panel
 ```
 
 Useful switches: `-NoOpen`, `-AppWindow`, `-Json`, `-NoProbe`, `-LocalPort 3097`,
-`-Lines 200`, `-Config <path>`, `-Refresh`.
+`-Lines 200`, `-Follow`, `-Config <path>`, `-Refresh`, `-SshConfigPath <path>`.
+
+`-Target` takes instance names, and accepts a comma-separated list as well as
+separate arguments (`-Target local,DuckServer`). `status -Target <name>` probes
+only that instance, and `-NoProbe` skips the HTTP liveness check entirely.
 
 > Use **named** parameters. `$Target` does not accept remaining arguments, so
 > trailing switches would otherwise be swallowed into the target list.

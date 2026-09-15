@@ -30,31 +30,47 @@
       server is started with CREATE_NO_WINDOW.
 
 .PARAMETER Command
-  menu     interactive control panel (default)
+  app      start the desktop panel (backend + chromeless window) - the usual entry
+  menu     interactive control panel in the terminal (default)
   status   show every instance and its health
   start    start an instance (server + tunnel, then optionally open browser)
   stop     stop an instance (kills local server and/or tunnel + remote service)
   restart  stop then start
   open     open the browser at an already-running instance
-  logs     tail or print an instance's log
-  add      register a new host by reading your ~/.ssh/config
+  logs     print an instance's log, or stream it with -Follow
+  add      register an instance in the config (does not read your ~/.ssh/config)
   list     list configured instances
   install  deploy the remote systemd service to a host
+  upgrade  check for and install a newer dsh (-DryRun to preview)
+  check    report which instances have an update available
+  balance  show the DeepSeek account balance
+  url      print an instance's current authenticated URL
   doctor   diagnose the environment and every configured host
+  tray  tray-start  tray-stop
+           notification-area icon; alerts when an instance changes state
+  tray-loop  internal: the detached process that owns the tray's message loop
+             (there is no `help` verb - an invalid Command lists every valid one)
 
 .PARAMETER Target
   One or more instance names (or "local"). Defaults to every enabled instance.
+  Accepts a comma-separated list as well as separate arguments.
 
 .EXAMPLE
-  .\dsh.ps1                       # interactive control panel
+  .\dsh.ps1 app                   # open the desktop panel
+.EXAMPLE
+  .\dsh.ps1                       # interactive control panel in the terminal
 .EXAMPLE
   .\dsh.ps1 status
+.EXAMPLE
+  .\dsh.ps1 status -Target DuckServer -NoProbe   # one host, no HTTP probe
 .EXAMPLE
   .\dsh.ps1 start Research_Prod
 .EXAMPLE
   .\dsh.ps1 start -NoOpen         # bring everything up, do not touch the browser
 .EXAMPLE
   .\dsh.ps1 install DuckServer    # deploy the remote service to a new host
+.EXAMPLE
+  .\dsh.ps1 logs -Target local -Follow           # stream a log until Ctrl-C
 #>
 
 [CmdletBinding()]
@@ -70,14 +86,18 @@ param(
   [switch]$AppWindow,
   [int]$LocalPort,
   [int]$Lines = 40,
-  [switch]$Follow,
+  [switch]$Follow,      # logs: stream instead of printing once (Ctrl-C to stop)
   [string]$SshHost,
   [string]$Name,
   [int]$Port,
 
   [switch]$Json,        # emit machine-readable JSON (used by the desktop app)
-  [switch]$NoProbe,     # status only: skip the HTTP liveness probe, much faster
-  [switch]$Probe,       # status only: force the probe (default is probe on)
+  [switch]$NoProbe,     # status: skip the HTTP liveness probe (see -Probe below)
+  # Accepted for compatibility and deliberately inert: probing is what status
+  # does by default, so there is nothing to force. It is listed here rather than
+  # removed because callers pass it, and PowerShell rejects an undeclared named
+  # parameter outright. tools/check-ui.js allows this one name to go unread.
+  [switch]$Probe,
 
   # Config file to use instead of the discovered one. Also settable through
   # $DSH_LAUNCHER_CONFIG, which is how you keep several configurations around.
@@ -182,7 +202,10 @@ function Write-Diag([string]$Text, [string]$Color = 'Gray') {
 }
 
 function Write-Warn2([string]$Text){ Write-Diag "  [warn] $Text" 'Yellow' }
-function Write-Err([string]$Text)  { Write-C "  [fail] $Text" 'Red' }
+# Errors follow the same rule as warnings: under -Json the payload owns stdout,
+# and "[fail] no remote instances selected" printed ahead of the JSON is what
+# made a failed install look parseable but wrong. stderr keeps it visible.
+function Write-Err([string]$Text)  { Write-Diag "  [fail] $Text" 'Red' }
 function Write-Info([string]$Text) { Write-Diag "  [info] $Text" 'Gray' }
 
 function Write-Log([string]$Message) {
@@ -447,18 +470,6 @@ function Get-HomeDir {
   return $LauncherDir
 }
 
-function Get-Param([string]$Name) {
-  <# Read an optional script parameter safely. Under Set-StrictMode -Version
-     Latest, referencing an unbound parameter of the script scope throws
-     "cannot be retrieved because it has not been set", so every optional read
-     goes through $PSBoundParameters rather than touching the variable. #>
-  if ($PSBoundParameters.ContainsKey($Name)) {
-    $v = $PSBoundParameters[$Name]
-    if ($v) { return [string]$v }
-  }
-  return ''
-}
-
 function Resolve-ConfigPath([string]$Explicit) {
   <# The config path is passed IN rather than read from a script variable.
 
@@ -479,9 +490,18 @@ function Resolve-ConfigPath([string]$Explicit) {
   return (Join-Path $HomeDir '.dsh-launcher\hosts.json')
 }
 
-function Get-SshConfigPath {
-  <# honours -SshConfigPath, then $DSH_SSH_CONFIG, then the user's ~/.ssh/config #>
-  if ($PSBoundParameters.ContainsKey('SshConfigPath') -and $SshConfigPath) { return [string]$SshConfigPath }
+function Get-SshConfigPath([string]$Override) {
+  <# honours -SshConfigPath, then $DSH_SSH_CONFIG, then the user's ~/.ssh/config.
+
+     The override is an explicit argument rather than a read of the script-scope
+     $SshConfigPath, because a function's $PSBoundParameters reflects *its own*
+     parameters: the earlier version tested $PSBoundParameters.ContainsKey(
+     'SshConfigPath') inside a function that declares nothing, so the condition
+     could never be true and `doctor -SshConfigPath <path>` silently read the
+     default file instead. This is the same bug that was already fixed once for
+     -Config (see Resolve-ConfigPath), and it is why an override must be
+     threaded through rather than discovered. #>
+  if ($Override) { return [string]$Override }
   if ($env:DSH_SSH_CONFIG) { return $env:DSH_SSH_CONFIG }
   return (Join-Path $HomeDir '.ssh\config')
 }
@@ -2353,27 +2373,63 @@ function Invoke-Open([string[]]$Names) {
   }
 }
 
-function Invoke-Logs([string[]]$Names, [int]$Tail) {
+function Invoke-Logs([string[]]$Names, [int]$Tail, [switch]$Follow) {
+  <# -Follow streams instead of printing once. The switch existed from the first
+     release but nothing ever read it, so `logs -Follow` printed the last N lines
+     and exited - a flag that lies in Get-Help's syntax line is worse than a
+     missing one. Get-Content -Wait blocks until interrupted, which is the
+     behaviour a tail needs; the remote path delegates to journalctl -f. #>
   $insts = @(if ($Names -and @($Names).Count -gt 0) { Get-Instances $Names $Config } else { Get-Instances $null $Config })
+  if ($Follow -and @($insts).Count -gt 1) {
+    # Interleaving several live streams into one console is unreadable, and each
+    # remote one holds an ssh session open. Make the caller choose.
+    Write-Err '-Follow works on one instance at a time; narrow it with -Target'
+    return
+  }
   foreach ($i in $insts) {
     if ((Get-InstProp $i 'kind' 'local') -eq 'remote') {
       Write-Head "logs $($i.name) (remote systemd journal)"
-      $r = Invoke-B64 "journalctl --user -u dsh-web -n $Tail --no-pager 2>&1 | tail -n $Tail" $i.sshHost
-      Write-C ($r.TrimEnd()) 'DarkGray'
+      if ($Follow) {
+        Write-Info 'streaming; press Ctrl-C to stop'
+        # No pipe to `tail` here: a pipe would buffer and defeat the streaming.
+        Invoke-B64 "journalctl --user -u dsh-web -n $Tail -f --no-pager 2>&1" $i.sshHost |
+          ForEach-Object { Write-C $_ 'DarkGray' }
+      } else {
+        $r = Invoke-B64 "journalctl --user -u dsh-web -n $Tail --no-pager 2>&1 | tail -n $Tail" $i.sshHost
+        Write-C ($r.TrimEnd()) 'DarkGray'
+      }
     } else {
       $log = Join-Path $LogDir "$($i.name).server.log"
       Write-Head "logs $($i.name) ($log)"
-      if (Test-Path $log) { Get-Content $log -Tail $Tail | ForEach-Object { Write-C "  $_" 'DarkGray' } }
-      else { Write-Info 'no log yet' }
+      if (Test-Path $log) {
+        if ($Follow) {
+          Write-Info 'streaming; press Ctrl-C to stop'
+          Get-Content $log -Tail $Tail -Wait | ForEach-Object { Write-C "  $_" 'DarkGray' }
+        } else {
+          Get-Content $log -Tail $Tail | ForEach-Object { Write-C "  $_" 'DarkGray' }
+        }
+      } else { Write-Info 'no log yet' }
     }
   }
 }
 
 function Invoke-Add([switch]$Quiet) {
-  if (-not $SshHost) { Write-Err 'usage: dsh.ps1 add -SshHost <ssh-alias-or-user@host> [-Name x] [-Port 3080]'; return }
+  <# Returns $true when an instance was actually written to the config.
+
+     Each bail-out used to `return` bare, which under -Json still answered with
+     the unchanged list and exit 0, so a caller could not tell "added" from
+     "usage error" or "already exists". The backend surfaces this as r.ok, and
+     the panel's add form reads it. #>
+  if (-not $SshHost) {
+    Write-Err 'usage: dsh.ps1 add -SshHost <ssh-alias-or-user@host> [-Name x] [-Port 3080]'
+    return $false
+  }
   $cfg = Get-HostsConfig $Config
   $n = if ($Name) { $Name } else { $SshHost }
-  if (@($cfg.instances) | Where-Object { $_.name -eq $n }) { Write-Err "instance '$n' already exists"; return }
+  if (@($cfg.instances) | Where-Object { $_.name -eq $n }) {
+    Write-Err "instance '$n' already exists"
+    return $false
+  }
   $free = Find-FreePort 3099
   $rp = if ($Port) { $Port } else { 3080 }
   $new = [pscustomobject]@{
@@ -2386,6 +2442,7 @@ function Invoke-Add([switch]$Quiet) {
     Write-Ok "added '$n' (tunnel 127.0.0.1:$free -> $SshHost`:127.0.0.1:$rp)"
     Write-Info "next: dsh.ps1 install $n"
   }
+  return $true
 }
 
 function Invoke-List {
@@ -2404,12 +2461,23 @@ function Invoke-List {
 }
 
 function Invoke-Install([string[]]$Names, [switch]$Quiet) {
+  <# Returns $true only when every requested instance was installed.
+
+     The -Json caller used to answer {"ok":true} unconditionally, so a run that
+     printed "[fail] no remote instances selected" and did nothing still told
+     the panel the deploy had succeeded. The verdict has to come from here,
+     because only this function knows whether any work happened. #>
   $insts = @(Get-Instances $Names $Config) | Where-Object { $_.kind -eq 'remote' }
-  if (-not $insts -or @($insts).Count -eq 0) { Write-Err 'no remote instances selected'; return }
+  if (-not $insts -or @($insts).Count -eq 0) { Write-Err 'no remote instances selected'; return $false }
+  $allOk = $true
   foreach ($i in $insts) {
     if (-not $Quiet) { Write-Head "install $($i.name) -> $($i.sshHost)" }
-    Install-RemoteService $i -Quiet:$Quiet | Out-Null
+    # Install-RemoteService reports failure by returning a falsy value rather
+    # than throwing, so it has to be inspected instead of discarded.
+    $res = Install-RemoteService $i -Quiet:$Quiet
+    if (-not $res) { $allOk = $false }
   }
+  return $allOk
 }
 
 function Invoke-App([switch]$Quiet) {
@@ -2831,7 +2899,7 @@ function Invoke-Tray([switch]$Stop) {
   Write-Info 'stop it with: dsh.ps1 -Command tray-stop'
 }
 
-function Invoke-Doctor {
+function Invoke-Doctor([string]$SshConfigOverride) {
   Write-Head 'this machine'
   Write-Info "powershell : $($PSVersionTable.PSVersion)"
   $node = Get-NodeExe
@@ -2840,7 +2908,7 @@ function Invoke-Doctor {
   if ($bin) { Write-Ok "dsh        : $bin" } else { Write-Err 'dsh        : NOT FOUND (npm i -g @deepseek-ai/dsh)' }
   Write-Info "DSH_HOME   : $DshHome"
   Write-Info "launcher   : $LauncherDir"
-  $sshCfg = Get-SshConfigPath
+  $sshCfg = Get-SshConfigPath $SshConfigOverride
   if (Test-Path $sshCfg) { Write-Ok "ssh config : $sshCfg" } else { Write-Warn2 "ssh config : not found at $sshCfg" }
 
   Write-Head 'configured instances'
@@ -2848,7 +2916,7 @@ function Invoke-Doctor {
   Write-StatusTable $rows
 
   Write-Head 'ssh config hosts not yet configured here'
-  $sshCfg = Get-SshConfigPath
+  $sshCfg = Get-SshConfigPath $SshConfigOverride
   if (Test-Path $sshCfg) {
     $known = @($rows | Select-Object -ExpandProperty Name)
     $cfgHosts = @()
@@ -2956,7 +3024,14 @@ try {
     # -Target narrows the report to the named instances. Without it a `status`
     # probes every remote host, which costs one ssh round trip each; asking about
     # one host should not pay for the other five.
-    'status'  { $rows = @(Get-AllStatus -Names $Target)
+    #
+    # -NoProbe reaches Get-AllStatus as -NoProbeHttp. It used to be declared and
+    # documented but never forwarded, so `status -NoProbe` still probed and cost
+    # the same as a full status - which two in-repo callers relied on being
+    # cheap (the panel's fast path and tools/check-panel.ps1). -Probe is
+    # deliberately absent: probing is already the default, so the flag has
+    # nothing to switch on.
+    'status'  { $rows = @(Get-AllStatus -NoProbeHttp:$NoProbe -Names $Target)
                 if ($Json) { Write-Json $rows } else { Write-StatusTable $rows } }
     # A mutation answers for the instances it acted on, not for the whole farm:
     # the panel reads the row it asked about, and refreshing every remote host
@@ -2968,18 +3043,30 @@ try {
     'restart' { if ($Json) { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target -Quiet; Write-Json @(Get-AllStatus -NoProbeHttp -Names $Target) }
                 else { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target } }
     'open'    { Invoke-Open $Target }
-    'logs'    { Invoke-Logs $Target $Lines }
-    'add'     { if ($Json) { Invoke-Add -Quiet; Write-Json @((Get-HostsConfig $Config).instances) }
-                else { Invoke-Add } }
+    'logs'    { Invoke-Logs $Target $Lines -Follow:([bool]$Follow) }
+    # The list is returned either way, but a failed add now exits non-zero so
+    # the caller can tell it apart from a successful one. The response shape is
+    # deliberately unchanged: the panel's add form reads the list.
+    'add'     { if ($Json) {
+                  $ok = [bool](Invoke-Add -Quiet)
+                  Write-Json @((Get-HostsConfig $Config).instances)
+                  if (-not $ok) { exit 1 }
+                } else { [void](Invoke-Add) } }
     'list'    { $insts = @((Get-HostsConfig $Config).instances)
                 if ($Json) { Write-Json $insts } else { Invoke-List } }
-    'install' { if ($Json) { Invoke-Install $Target -Quiet; Write-Json @{ ok = $true } }
-                else { Invoke-Install $Target } }
+    # ok reflects what actually happened, not that the command was invoked: a
+    # failed or empty deploy used to answer {"ok":true} with exit 0. The
+    # non-Json path discards the verdict because it already printed the detail.
+    'install' { if ($Json) {
+                  $ok = [bool](Invoke-Install $Target -Quiet)
+                  Write-Json @{ ok = $ok }
+                  if (-not $ok) { exit 1 }
+                } else { [void](Invoke-Install $Target) } }
     'check'   { Invoke-Check }
     'upgrade' { Invoke-Upgrade $Target -DryRun:([bool]$DryRun) }
     'balance' { Invoke-Balance -Refresh:([bool]$Refresh) }
     'url'     { Invoke-Url $Target }
-    'doctor'  { Invoke-Doctor }
+    'doctor'  { Invoke-Doctor -SshConfigOverride $SshConfigPath }
   }
 } catch {
   if ($Json) {

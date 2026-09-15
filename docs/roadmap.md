@@ -44,6 +44,28 @@ Items 6, 7 and 9 were not in the original brief. Each came from a real failure
 encountered while building — which is itself the strongest signal that they
 belong on the list.
 
+## Shipped since v0.1 — contract repairs
+
+Not features. These are cases where the tool said one thing and did another, and
+the cost was a user trusting an answer that was wrong. Recorded here because the
+distinction matters: a launcher's whole value is that its report is believable.
+
+| Defect | What the user saw | Fix |
+| --- | --- | --- |
+| `-NoProbe` declared, documented, and inert | A "fast path" that took exactly as long as the slow one | Forwarded to the probe (`status` now honours it) |
+| `-SshConfigPath` read through the wrong scope | `doctor -SshConfigPath <path>` silently read the default file | Threaded through as an explicit argument |
+| `install -Json` answered `{"ok":true}` unconditionally | A failed deploy reported as success, exit 0 | `Invoke-Install` returns its verdict; failure exits 1 |
+| `add -Json` returned the unchanged list on failure | "Added" and "not added" looked identical to a script | Non-zero exit distinguishes them |
+| `status` ignored `-Target` | Asking about one host probed all six | `-Target` narrows the probe |
+| A quoted `'a,b'` target matched nothing | An empty table with no explanation | Comma lists are split and trimmed |
+| `[warn]`/`[info]` polluted `-Json` stdout | Any strict JSON consumer failed to parse | Diagnostics go to stderr in that mode |
+| `-Follow` advertised, unimplemented | `logs -Follow` printed and exited | It streams until Ctrl-C |
+
+The last four were found by reading the command surface against the docs rather
+than by running it; the first four by running it. Both halves are now covered by
+`tools/check-ui.js`, which fails the build when a `ValidateSet` verb has no
+dispatch clause or a `param()` variable is never read.
+
 ## Next — the features I would build, in order
 
 ### P0 — Session continuity ("reconnect where I left off")
@@ -87,7 +109,9 @@ window; a long remote start finishes with nobody watching.
 state transitions ("prod went down", "gpu is ready"). The icon must reflect the
 worst state across instances so it is useful while minimised.
 
-**Tray already exists as a stub** in this repo; notifications are the missing half.
+**Status: shipped.** `tray` / `tray-start` / `tray-stop` draw a notification-area
+icon reflecting the worst state across instances, offer 打开面板 / 全部启动 /
+全部停止, and raise a toast when an instance changes state.
 
 ### P1 — Port and workdir intelligence
 
