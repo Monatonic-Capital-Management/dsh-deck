@@ -308,9 +308,15 @@ function Get-Param([string]$Name) {
   return ''
 }
 
-function Resolve-ConfigPath {
-  $explicit = Get-Param 'Config'
-  if ($explicit) { return $explicit }
+function Resolve-ConfigPath([string]$Explicit) {
+  <# The config path is passed IN rather than read from a script variable.
+
+     Reading it here via $PSBoundParameters worked in theory and not in practice:
+     a function's $PSBoundParameters reflects that function's own parameters, and
+     depending on how the script is invoked the script-level ones are not visible,
+     so `-Config` was silently ignored and hosts.json always won. An explicit
+     argument cannot be ambiguous. #>
+  if ($Explicit) { return $Explicit }
   if ($env:DSH_LAUNCHER_CONFIG) { return $env:DSH_LAUNCHER_CONFIG }
   foreach ($c in @(
     (Join-Path $LauncherDir 'hosts.json'),
@@ -324,8 +330,7 @@ function Resolve-ConfigPath {
 
 function Get-SshConfigPath {
   <# honours -SshConfigPath, then $DSH_SSH_CONFIG, then the user's ~/.ssh/config #>
-  $explicit = Get-Param 'SshConfigPath'
-  if ($explicit) { return $explicit }
+  if ($PSBoundParameters.ContainsKey('SshConfigPath') -and $SshConfigPath) { return [string]$SshConfigPath }
   if ($env:DSH_SSH_CONFIG) { return $env:DSH_SSH_CONFIG }
   return (Join-Path $HomeDir '.ssh\config')
 }
@@ -348,11 +353,14 @@ function Get-DefaultHosts {
   }
 }
 
-function Get-HostsConfig {
-  $path = Resolve-ConfigPath
+function Get-HostsConfig([string]$ConfigPath) {
+  <# $ConfigPath is threaded through every caller from the script's -Config
+     parameter. Passing it explicitly rather than reading a script variable is
+     what makes -Config actually work. #>
+  $path = Resolve-ConfigPath $ConfigPath
   if (-not (Test-Path $path)) {
     $cfg = Get-DefaultHosts
-    Save-HostsConfig $cfg
+    Save-HostsConfig $cfg -ConfigPath $Config -ConfigPath $path
     return $cfg
   }
   $raw = Get-Content $path -Raw -Encoding UTF8
@@ -362,8 +370,8 @@ function Get-HostsConfig {
   return $obj
 }
 
-function Save-HostsConfig($Cfg) {
-  $path = Resolve-ConfigPath
+function Save-HostsConfig($Cfg, [string]$ConfigPath) {
+  $path = Resolve-ConfigPath $ConfigPath
   $dir = Split-Path -Parent $path
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   $Cfg | ConvertTo-Json -Depth 8 | Set-Content -Path $path -Encoding UTF8
@@ -377,11 +385,27 @@ function Get-ConfigProp($Obj, [string]$Name) {
   return $null
 }
 
-function Get-Profiles {
+function Get-InstProp($Inst, [string]$Name, $Default = $null) {
+  <# Instance field with a default. Optional config fields must never be read
+     directly: `$Inst.workdir` on an instance that omits it is a hard error under
+     Set-StrictMode, which crashed a start the moment a config got terse. #>
+  $v = Get-ConfigProp $Inst $Name
+  if ($null -eq $v -or $v -eq '') { return $Default }
+  return $v
+}
+
+function Test-InstFlag($Inst, [string]$Name, [bool]$Default = $false) {
+  <# Boolean instance field with a default; same reasoning as Get-InstProp. #>
+  $v = Get-ConfigProp $Inst $Name
+  if ($null -eq $v) { return $Default }
+  return [bool]$v
+}
+
+function Get-Profiles([string]$ConfigPath) {
   <# Normalised profile lookup: profile -> merged connection defaults.
      Per-user overrides win over the shared profile so the same repo config
      serves everyone without editing committed files. #>
-  $cfg = Get-HostsConfig
+  $cfg = Get-HostsConfig $Config $ConfigPath
   $map = @{}
   $me = $env:USERNAME
   if (-not $me) { $me = $env:USER }
@@ -408,16 +432,16 @@ function Get-Profiles {
   return $map
 }
 
-function Get-Instances([string[]]$Names) {
+function Get-Instances([string[]]$Names, [string]$ConfigPath) {
   <# Callers wrap the result in @(), which turns zero-or-one results into a real
      array so .Count is always safe under Set-StrictMode -Version Latest.
      Do NOT return ,@(...) here: that nests the array one level deeper and makes
      `foreach` iterate over the collection itself instead of its instances. #>
-  $cfg = Get-HostsConfig
+  $cfg = Get-HostsConfig $Config $ConfigPath
   $all = @($cfg.instances)
 
   # Expand "profile" references into concrete connection fields.
-  $profiles = Get-Profiles
+  $profiles = Get-Profiles $ConfigPath
   $all = @($all | ForEach-Object {
     $i = $_
     $obj = [ordered]@{}
@@ -437,7 +461,7 @@ function Get-Instances([string[]]$Names) {
   })
 
   if (-not $Names -or @($Names).Count -eq 0) {
-    return @($all | Where-Object { $_.enabled -ne $false })
+    return @($all | Where-Object { (Get-ConfigProp $_ 'enabled') -ne $false })
   }
   $sel = @()
   foreach ($n in $Names) {
@@ -491,7 +515,8 @@ function Get-RecordedPid([string]$InstanceName, [string]$Kind) {
 # --------------------------------------------------------------------------
 
 function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
-  $port = [int]$Inst.port
+  $configuredPort = [int](Get-InstProp $Inst 'port' 3080)
+  $port = $configuredPort
   $ourPid  = Get-RecordedPid $Inst.name 'server'
 
   # Prefer the port we actually recorded. An adopted instance, or one started
@@ -542,29 +567,65 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
   }
 }
 
+function Test-DshServing([int]$Port) {
+  <# Is a dsh web server actually answering on this port?
+
+     A port being in LISTEN state is not enough to conclude "dsh is here". The
+     code has to answer HTTP, and dsh fences `/` in a version-dependent way, so a
+     definite answer is accepted and anything else (connection refused, a TLS
+     handshake, a stray service) is not. `401` means a modern dsh demanding its
+     token; `200` means an older one that does not; `303`/`302` means a token
+     query was already redeemed. #>
+  $code = Test-Http "http://127.0.0.1:$Port/"
+  return ($code -eq 200 -or $code -eq 401 -or $code -eq 303 -or $code -eq 302)
+}
+
 function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
   $name = $Inst.name
-  $port = [int]$Inst.port
-  if ($PortOverride -gt 0) { $port = $PortOverride }
+  $configuredPort = [int](Get-InstProp $Inst 'port' 3080)
+  $port = $configuredPort
+  $explicitPort = ($PortOverride -gt 0)
+  if ($explicitPort) { $port = $PortOverride }
   $log  = Join-Path $LogDir "$name.server.log"
 
-  # Reuse an instance already listening on this port only when no override asked
-  # for a different one: -LocalPort 3097 means "run a second instance there", not
-  # "adopt whatever is on 3080".
+  # ---------------------------------------------------------------- preflight
+  # Decide the port BEFORE spawning anything. This is the whole point: an earlier
+  # version only checked here and then still spawned on a taken port, so the new
+  # process died with EADDRINUSE while the wait loop saw the OTHER process
+  # listening and cheerfully reported success. The user was left with a failure
+  # message and no working instance.
   if (Test-PortListening $port) {
     $holding = Get-ListeningPid $port
     $holdingName = Get-ProcessNameSafe $holding
-    if ($holdingName -eq 'node') {
-      if (-not $Quiet) { Write-Info "$name is already served on port $port (pid $holding) - reusing it" }
-      # Adopt the running process so stop/status work consistently.
+
+    if ($holdingName -eq 'node' -and (Test-DshServing $port) -and -not $explicitPort) {
+      # A dsh this launcher did not start. Adopt it rather than fighting it: the
+      # user's own `npx @deepseek-ai/dsh web` is a legitimate dsh to use.
+      if (-not $Quiet) { Write-Info "$name is already served on port $port (pid $holding) - adopting it" }
       Set-State $name ([pscustomobject]@{
         serverPid = $holding; port = $port
-        url = (Get-LocalUrl $name $port); updatedAt = (Get-Date).ToString('o')
+        url = (Get-LocalUrl $name $port); adopted = $true
+        updatedAt = (Get-Date).ToString('o')
       })
       return $port
     }
-    Write-Err "$name cannot start: port $port is held by $holdingName (pid $holding). Use -LocalPort to pick another."
-    return 0
+
+    if ($explicitPort) {
+      # An explicit port is a request, so refuse rather than silently moving.
+      Write-Err "$name cannot start: port $port is held by $holdingName (pid $holding)"
+      Write-Info 'stop that process, or choose another port with -LocalPort'
+      return 0
+    }
+
+    # Move to a free port instead of failing. Say so plainly, because the URL the
+    # user sees will not match the configured port.
+    $free = Find-FreePort ($port + 1)
+    if ($free -eq $port) {
+      Write-Err "$name cannot start: port $port is held by $holdingName (pid $holding)"
+      return 0
+    }
+    Write-Warn2 "port $port is held by $holdingName (pid $holding); starting on $free instead"
+    $port = $free
   }
 
   $bin = Find-DshLocal
@@ -574,8 +635,14 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
 
   if (Test-Path $log) { Move-Item -Force $log "$log.1" -ErrorAction SilentlyContinue }
 
-  $workdir = if ($Inst.workdir) { $Inst.workdir } else { $env:USERPROFILE }
+  $workdir = Get-InstProp $Inst 'workdir' $env:USERPROFILE
   if (-not (Test-Path $workdir)) { $workdir = $env:USERPROFILE }
+
+  # Record the chosen port before starting, so status and stop agree with it even
+  # if this function is interrupted.
+  Set-State $name ([pscustomobject]@{
+    serverPid = 0; port = $port; updatedAt = (Get-Date).ToString('o')
+  })
 
   # CREATE_NO_WINDOW (0x08000000) keeps node from flashing a conhost window.
   $args = "`"$bin`" web --port $port --no-open"
@@ -584,17 +651,35 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
             -WindowStyle Hidden -PassThru
   Write-Log "started local $name pid $($proc.Id) on port $port"
 
-  # Wait for the listener, and for the URL line when this dsh version prints one.
+  # ------------------------------------------------------------------- confirm
+  # Success requires BOTH our process to be alive and the port to answer as dsh.
+  # Waiting on the port alone is what produced the false success above.
   $deadline = (Get-Date).AddSeconds(90)
   $up = $false
   while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) { break }
-    if (Test-PortListening $port) { $up = $true; break }
+    if ((Test-PortListening $port) -and (Test-DshServing $port)) { $up = $true; break }
     Start-Sleep -Milliseconds 300
   }
+
   if (-not $up) {
-    Write-Err "$name failed to start within 90s. Last log lines:"
-    if (Test-Path $log) { Get-Content $log -Tail 20 | ForEach-Object { Write-C "    $_" 'DarkGray' } }
+    if ($proc.HasExited) {
+      Write-Err "$name failed to start: the process exited with code $($proc.ExitCode)"
+    } else {
+      Write-Err "$name failed to start within 90s"
+    }
+    $errText = ''
+    if (Test-Path "$log.err") { $errText = (Get-Content "$log.err" -Raw -ErrorAction SilentlyContinue) }
+    if ($errText -and $errText.Trim()) {
+      Write-C (($errText.Trim() -split "`r?`n" | Select-Object -First 8) -join "`n") 'DarkGray'
+      if ($errText -match 'EADDRINUSE|address already in use') {
+        Write-Info "port $port was taken by another process; retry and the launcher will pick a free one"
+      }
+    } elseif (Test-Path $log) {
+      Get-Content $log -Tail 10 | ForEach-Object { Write-C "    $_" 'DarkGray' }
+    }
+    if (-not $proc.HasExited) { try { $null = & taskkill.exe /PID $proc.Id /T /F 2>&1 } catch { } }
+    Remove-State $name
     return 0
   }
 
@@ -604,7 +689,10 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
   Set-State $name ([pscustomobject]@{
     serverPid = $proc.Id; port = $port; url = $url; updatedAt = (Get-Date).ToString('o')
   })
-  if (-not $Quiet) { Write-Ok "$name up on port $port (pid $($proc.Id))" }
+  if (-not $Quiet) {
+    if ($port -ne $configuredPort) { Write-Ok "$name up on port $port (pid $($proc.Id)); configured port was busy" }
+    else { Write-Ok "$name up on port $port (pid $($proc.Id))" }
+  }
   return $port
 }
 
@@ -621,7 +709,8 @@ function Stop-LocalInstance($Inst, [switch]$Quiet) {
   } else {
     # Fall back to the configured port, or the port the instance was last seen
     # on (an adopted or -LocalPort-started instance may not match the config).
-    $port = [int]$Inst.port
+    $configuredPort = [int](Get-InstProp $Inst 'port' 3080)
+  $port = $configuredPort
     $st = Get-State $name
     if ($st -and $st.PSObject.Properties['port']) {
       $recordedPort = [int]$st.port
@@ -910,7 +999,7 @@ echo "DSH_NOW="
 
   # A restart replaces the token URL, so the tunnel's browser URL is stale until
   # the next start; the tunnel itself survives.
-  $rp = [int]$Inst.remotePort
+  $rp = [int](Get-InstProp $Inst 'remotePort' 3080)
   $deadline = (Get-Date).AddSeconds(60)
   $listening = $false
   while ((Get-Date) -lt $deadline) {
@@ -935,8 +1024,8 @@ function Invoke-Check {
     Name = 'local'; Kind = 'local'; Current = $local; Latest = $latest
     UpdateAvailable = [bool]($latest -and $local -and (Compare-Version $latest $local) -gt 0)
   }
-  foreach ($i in @(Get-Instances $null)) {
-    if ($i.kind -ne 'remote') { continue }
+  foreach ($i in @(Get-Instances $null $Config)) {
+    if ((Get-InstProp $i 'kind' 'local') -ne 'remote') { continue }
     if (-not (Test-SshReachable $i.sshHost)) {
       $rows += [pscustomobject]@{ Name = $i.name; Kind = 'remote'; Current = '(unreachable)'; Latest = $latest; UpdateAvailable = $false }
       continue
@@ -966,7 +1055,7 @@ function Invoke-Check {
 }
 
 function Invoke-Upgrade([string[]]$Names, [switch]$DryRun) {
-  $insts = @(Get-Instances $Names)
+  $insts = @(Get-Instances $Names $Config)
   $target = Get-LatestDshVersion -Refresh
   if (-not $target) { Write-Err 'could not determine the latest published version'; return }
   if (-not $DryRun) {
@@ -984,7 +1073,7 @@ function Invoke-Upgrade([string[]]$Names, [switch]$DryRun) {
 }
 
 function Get-RemoteProbeScript($Inst) {
-  $rport = [int]$Inst.remotePort
+  $rport = [int](Get-InstProp $Inst 'remotePort' 3080)
   @"
 set +e
 # Same PATH shape as the service: a locally installed node wins, so the reported
@@ -1012,7 +1101,7 @@ function Get-RemoteStatus($Inst) {
   $sshHost = $Inst.sshHost
   if (-not (Test-SshReachable $sshHost)) {
     return [pscustomobject]@{
-      Name = $Inst.name; Kind = 'remote'; Port = [int]$Inst.localPort
+      Name = $Inst.name; Kind = 'remote'; Port = [int](Get-InstProp $Inst 'localPort' 3099)
       State = 'unreachable'; Detail = "连不上 $sshHost（可能需要 VPN）"; Http = 0; Url = ''
       SshHost = $sshHost; DshInstalled = $false; SshReady = $false
     }
@@ -1026,7 +1115,7 @@ function Get-RemoteStatus($Inst) {
   # Tunnel state, from our own records. The live port comes from state, because
   # a tunnel that had to fall back from a busy port recorded the port it used.
   $tunPid = Get-RecordedPid $Inst.name 'tunnel'
-  $lp = [int]$Inst.localPort
+  $lp = [int](Get-InstProp $Inst 'localPort' 3099)
   $st = Get-State $Inst.name
   if ($st -and $st.PSObject.Properties['localPort']) {
     $recorded = [int]$st.localPort
@@ -1051,7 +1140,7 @@ function Get-RemoteStatus($Inst) {
 
   # Detail strings are shown verbatim in the desktop app, so they are written
   # for a person rather than as a dump of internal state.
-  $rp = [int]$Inst.remotePort
+  $rp = [int](Get-InstProp $Inst 'remotePort' 3080)
   $detail = ''
   switch ($state) {
     'up'          { $detail = "服务端运行中 · 隧道已连接 · $lp ↔ $rp" }
@@ -1087,7 +1176,7 @@ function Get-RemoteStatus($Inst) {
   $url = ''
   if ($state -eq 'up') {
     if ($remoteUrl -match '^https?://') {
-      $url = $remoteUrl -replace "127\.0\.0\.1:$([int]$Inst.remotePort)", "127.0.0.1:$lp"
+      $url = $remoteUrl -replace "127\.0\.0\.1:$([int](Get-InstProp $Inst 'remotePort' 3080))", "127.0.0.1:$lp"
     } else {
       $url = "http://127.0.0.1:$lp"
     }
@@ -1097,7 +1186,7 @@ function Get-RemoteStatus($Inst) {
     Name = $Inst.name; Kind = 'remote'; Port = $lp
     State = $state; Detail = $detail; Http = 0; Url = $url
     SshHost = $sshHost; TunnelPid = $tunPid
-    RemoteUrl = $remoteUrl; RemotePort = [int]$Inst.remotePort
+    RemoteUrl = $remoteUrl; RemotePort = [int](Get-InstProp $Inst 'remotePort' 3080)
     DshInstalled = ($dshPath -ne 'none' -and $dshPath -ne '')
     DshVersion = $dshVersion
     LatestVersion = $latestVersion
@@ -1374,7 +1463,7 @@ function Install-RemoteService($Inst, [switch]$Quiet) {
      the service survives logout, and start it. #>
   $sshHost = $Inst.sshHost
   $name = $Inst.name
-  $rport = [int]$Inst.remotePort
+  $rport = [int](Get-InstProp $Inst 'remotePort' 3080)
 
   if (-not (Test-SshReachable $sshHost)) { Write-Err "$name`: ssh $sshHost not reachable"; return $false }
   if (-not (Test-Path $RemoteScript)) { Write-Err "missing $RemoteScript"; return $false }
@@ -1449,8 +1538,8 @@ function Start-Tunnel($Inst, [switch]$Quiet) {
      The port is read back from state, not recomputed, so a tunnel that had to
      fall back from a busy port stays consistent across calls. #>
   $sshHost = $Inst.sshHost
-  $lp = [int]$Inst.localPort
-  $rp = [int]$Inst.remotePort
+  $lp = [int](Get-InstProp $Inst 'localPort' 3099)
+  $rp = [int](Get-InstProp $Inst 'remotePort' 3080)
 
   $st = Get-State $Inst.name
   $recordedPort = 0
@@ -1465,7 +1554,7 @@ function Start-Tunnel($Inst, [switch]$Quiet) {
 
   if (Test-PortListening $lp) {
     $lp = Find-FreePort ($lp + 1)
-    if (-not $Quiet) { Write-Warn2 "local port $($Inst.localPort) in use; tunnel using $lp instead" }
+    if (-not $Quiet) { Write-Warn2 "local port $(Get-InstProp $Inst 'localPort' 3099) in use; tunnel using $lp instead" }
     Set-StateField $Inst.name @{ localPort = $lp }
   }
 
@@ -1520,7 +1609,7 @@ function Stop-Tunnel($Inst, [switch]$Quiet, [switch]$RemoveState) {
 function Start-RemoteInstance($Inst, [switch]$Quiet) {
   $name = $Inst.name
   $sshHost = $Inst.sshHost
-  $rp = [int]$Inst.remotePort
+  $rp = [int](Get-InstProp $Inst 'remotePort' 3080)
 
   if (-not (Test-SshReachable $sshHost)) {
     $d = Get-RemoteDiagnosis $sshHost
@@ -1537,7 +1626,7 @@ function Start-RemoteInstance($Inst, [switch]$Quiet) {
   if (-not $remoteVer) {
     # Opt-out gate: an instance may declare "autoInstall": false to forbid the
     # tool from touching that host's software at all.
-    $autoOk = -not ($Inst.PSObject.Properties['autoInstall'] -and $Inst.autoInstall -eq $false)
+    $autoOk = Test-InstFlag $Inst 'autoInstall' $true
     if (-not $autoOk) {
       Write-Err "$name`: dsh on $sshHost is missing or not working, and autoInstall is false"
       Write-Info "install it manually: ssh $sshHost 'npm install -g @deepseek-ai/dsh'  (needs node >= 22.19.0)"
@@ -1705,17 +1794,17 @@ function Open-Instance([string]$Url, [switch]$AsAppWindow) {
 # --------------------------------------------------------------------------
 
 function Get-AllStatus([switch]$NoProbeHttp) {
-  $insts = @(Get-HostsConfig).instances
+  $insts = @(Get-HostsConfig $Config).instances
   $rows = @()
   foreach ($i in $insts) {
-    if ($i.enabled -eq $false) {
+    if (-not (Test-InstFlag $i 'enabled' $true)) {
       $rows += [pscustomobject]@{
         Name = $i.name; Kind = $i.kind; Port = 0
         State = 'disabled'; Detail = 'disabled in hosts.json'; Http = 0; Url = ''
       }
       continue
     }
-    if ($i.kind -eq 'remote') { $rows += Get-RemoteStatus $i }
+    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { $rows += Get-RemoteStatus $i }
     else { $rows += Get-LocalStatus $i -NoProbeHttp:$NoProbeHttp }
   }
   return $rows
@@ -1747,13 +1836,13 @@ function Write-StatusTable($Rows) {
 # --------------------------------------------------------------------------
 
 function Invoke-Start([string[]]$Names, [switch]$Quiet) {
-  $insts = @(Get-Instances $Names)
+  $insts = @(Get-Instances $Names $Config)
   if ($insts.Count -eq 0) { Write-Warn2 'no instances selected'; return }
   $urls = @()
   foreach ($i in $insts) {
-    if ($i.enabled -eq $false) { Write-Info "$($i.name) is disabled; skipping"; continue }
+    if (-not (Test-InstFlag $i 'enabled' $true)) { Write-Info "$($i.name) is disabled; skipping"; continue }
     Write-Head "start $($i.name)"
-    if ($i.kind -eq 'remote') {
+    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') {
       $u = Start-RemoteInstance $i -Quiet:$Quiet
       if ($u) { $urls += $u }
     } else {
@@ -1779,10 +1868,10 @@ function Invoke-Start([string[]]$Names, [switch]$Quiet) {
 }
 
 function Invoke-Stop([string[]]$Names) {
-  $insts = @(Get-Instances $Names)
+  $insts = @(Get-Instances $Names $Config)
   foreach ($i in $insts) {
     Write-Head "stop $($i.name)"
-    if ($i.kind -eq 'remote') { Stop-RemoteInstance $i } else { Stop-LocalInstance $i | Out-Null }
+    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { Stop-RemoteInstance $i } else { Stop-LocalInstance $i | Out-Null }
   }
 }
 
@@ -1799,9 +1888,9 @@ function Invoke-Open([string[]]$Names) {
 }
 
 function Invoke-Logs([string[]]$Names, [int]$Tail) {
-  $insts = @(if ($Names -and @($Names).Count -gt 0) { Get-Instances $Names } else { Get-Instances $null })
+  $insts = @(if ($Names -and @($Names).Count -gt 0) { Get-Instances $Names $Config } else { Get-Instances $null $Config })
   foreach ($i in $insts) {
-    if ($i.kind -eq 'remote') {
+    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') {
       Write-Head "logs $($i.name) (remote systemd journal)"
       $r = Invoke-B64 "journalctl --user -u dsh-web -n $Tail --no-pager 2>&1 | tail -n $Tail" $i.sshHost
       Write-C ($r.TrimEnd()) 'DarkGray'
@@ -1816,7 +1905,7 @@ function Invoke-Logs([string[]]$Names, [int]$Tail) {
 
 function Invoke-Add([switch]$Quiet) {
   if (-not $SshHost) { Write-Err 'usage: dsh.ps1 add -SshHost <ssh-alias-or-user@host> [-Name x] [-Port 3080]'; return }
-  $cfg = Get-HostsConfig
+  $cfg = Get-HostsConfig $Config
   $n = if ($Name) { $Name } else { $SshHost }
   if (@($cfg.instances) | Where-Object { $_.name -eq $n }) { Write-Err "instance '$n' already exists"; return }
   $free = Find-FreePort 3099
@@ -1826,7 +1915,7 @@ function Invoke-Add([switch]$Quiet) {
     remotePort = $rp; localPort = $free; description = "dsh web on $SshHost"
   }
   $cfg.instances = @($cfg.instances) + $new
-  Save-HostsConfig $cfg
+  Save-HostsConfig $cfg -ConfigPath $Config
   if (-not $Quiet) {
     Write-Ok "added '$n' (tunnel 127.0.0.1:$free -> $SshHost`:127.0.0.1:$rp)"
     Write-Info "next: dsh.ps1 install $n"
@@ -1834,22 +1923,22 @@ function Invoke-Add([switch]$Quiet) {
 }
 
 function Invoke-List {
-  $insts = @(Get-HostsConfig).instances
+  $insts = @(Get-HostsConfig $Config).instances
   $fmt = "{0,-18} {1,-8} {2,-7} {3,-26} {4}"
   Write-Host ''
   Write-C ($fmt -f 'INSTANCE', 'KIND', 'ENABLED', 'SSH HOST', 'DESCRIPTION') 'Cyan'
   Write-C ('  ' + ('-' * 92)) 'DarkGray'
   foreach ($i in $insts) {
-    $sh = if ($i.kind -eq 'remote') { $i.sshHost } else { '(this machine)' }
-    Write-C ($fmt -f $i.name, $i.kind, $i.enabled, $sh, $i.description) 'Gray'
+    $sh = if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { $i.sshHost } else { '(this machine)' }
+    Write-C ($fmt -f $i.name, (Get-InstProp $i 'kind' 'local'), (Test-InstFlag $i 'enabled' $true), $sh, $i.description) 'Gray'
   }
   Write-Host ''
-  Write-Info "config file: $(Resolve-ConfigPath)"
+  Write-Info "config file: $(Resolve-ConfigPath $Config)"
   Write-Host ''
 }
 
 function Invoke-Install([string[]]$Names, [switch]$Quiet) {
-  $insts = @(Get-Instances $Names) | Where-Object { $_.kind -eq 'remote' }
+  $insts = @(Get-Instances $Names $Config) | Where-Object { $_.kind -eq 'remote' }
   if (-not $insts -or @($insts).Count -eq 0) { Write-Err 'no remote instances selected'; return }
   foreach ($i in $insts) {
     if (-not $Quiet) { Write-Head "install $($i.name) -> $($i.sshHost)" }
@@ -2404,9 +2493,9 @@ try {
                 else { Invoke-Stop $Target; Start-Sleep -Milliseconds 500; Invoke-Start $Target } }
     'open'    { Invoke-Open $Target }
     'logs'    { Invoke-Logs $Target $Lines }
-    'add'     { if ($Json) { Invoke-Add -Quiet; Write-Json @((Get-HostsConfig).instances) }
+    'add'     { if ($Json) { Invoke-Add -Quiet; Write-Json @((Get-HostsConfig $Config).instances) }
                 else { Invoke-Add } }
-    'list'    { $insts = @((Get-HostsConfig).instances)
+    'list'    { $insts = @((Get-HostsConfig $Config).instances)
                 if ($Json) { Write-Json $insts } else { Invoke-List } }
     'install' { if ($Json) { Invoke-Install $Target -Quiet; Write-Json @{ ok = $true } }
                 else { Invoke-Install $Target } }
