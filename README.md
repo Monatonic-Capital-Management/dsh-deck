@@ -27,6 +27,8 @@ a working window. Adding a brand-new server auto-installs everything it needs.
   down", because those need different actions from you.
 - **Version drift detection.** Warns when a server's dsh differs from your local
   one — the mismatch that silently changes behaviour between releases.
+- **Account balance.** Remaining DeepSeek credit in the panel header, so running
+  out mid-task is not a surprise.
 - **Tray and notifications.** An optional tray icon shows the worst state across
   instances and notifies you when one changes, so a tunnel dying at 3am is not
   something you discover later.
@@ -90,13 +92,14 @@ dsh.ps1 -Command doctor                 diagnose this machine and every host
 dsh.ps1 -Command check                  compare versions against npm's latest
 dsh.ps1 -Command upgrade                upgrade everything to the latest
 dsh.ps1 -Command upgrade -DryRun        show what would change, change nothing
+dsh.ps1 -Command balance                remaining DeepSeek account credit
 dsh.ps1 -Command tray                   tray icon + state-change notifications
 dsh.ps1 -Command tray-stop              stop the tray
 dsh.ps1 -Command menu                   terminal control panel
 ```
 
 Useful switches: `-NoOpen`, `-AppWindow`, `-Json`, `-NoProbe`, `-LocalPort 3097`,
-`-Lines 200`, `-Config <path>`.
+`-Lines 200`, `-Config <path>`, `-Refresh`.
 
 > Use **named** parameters. `$Target` does not accept remaining arguments, so
 > trailing switches would otherwise be swallowed into the target list.
@@ -215,9 +218,39 @@ upgrade cannot leave a service that will not start.
   web page cannot drive the API through your browser.
 - **Instance names are validated** against the configured list, so nothing
   user-supplied reaches a command line.
-- dsh is **never** exposed beyond loopback. No stored credentials — config holds
-  references to keys, never key material.
-- No telemetry, no network calls except ssh to hosts you configured.
+- dsh is **never** exposed beyond loopback. Config holds references to keys, never
+  key material.
+- No telemetry. The only outbound calls are the ones you would expect from the
+  features you use: ssh to hosts you configured, `api.deepseek.com` for the
+  account balance, and `registry.npmjs.org` for version checks. All are cached,
+  and none happen unless the corresponding feature is used.
+
+## Account balance
+
+dsh has no balance command and no balance endpoint in its bundled code, but the
+DeepSeek platform does, so the panel shows your remaining credit in the header
+and you can query it directly:
+
+```powershell
+.\dsh.ps1 -Command balance
+.\dsh.ps1 -Command balance -Refresh     # bypass the 5-minute cache
+```
+
+```
+  DeepSeek 账户余额
+  CNY  ¥26.15
+       赠金 ¥0.00   充值 ¥26.15
+```
+
+The key is read from `$env:DEEPSEEK_API_KEY`, or from the store dsh already wrote
+at `$DSH_HOME/.credentials.yaml`. One detail worth knowing if you ever read that
+file yourself: it holds both a top-level `secret:` field and a `refs:` map.
+`secret` is dsh's own internal secret and returns `401` from the platform API —
+the platform key is under `refs/DEEPSEEK_API_KEY` and looks like `sk-...`.
+
+The badge stays hidden when there is no key, the key is rejected, or the network
+is down, rather than showing an error: a billing endpoint being unavailable is no
+reason for the control panel to look broken. The key is never logged or echoed.
 
 ## Project layout
 
