@@ -798,11 +798,34 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
   $up = $false
   while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) { break }
-    if ((Test-PortListening $port) -and (Test-DshServing $port)) { $up = $true; break }
+    if ((Test-PortListening $port) -and (Test-DshServing $port)) {
+      # Two starts can race for the same instance, and the port answers as soon
+      # as EITHER child binds it. Success means our own child owns the listener:
+      # a child that lost the race is about to exit with EADDRINUSE, and
+      # recording its pid leaves the instance reporting "up-external" with a
+      # pid that is already dead, so stop then refuses to touch it. netstat
+      # runs only once the port answers, not on every poll.
+      $holder = Get-ListeningPid $port
+      if ($holder -eq $proc.Id -or $holder -eq 0) { $up = $true; break }
+    }
     Start-Sleep -Milliseconds 300
   }
 
   if (-not $up) {
+    # A start that lost the race still leaves a healthy instance behind: adopt
+    # the process that owns the port rather than reporting a failure for an
+    # instance that is serving.
+    if ($proc.HasExited -and (Test-PortListening $port) -and (Test-DshServing $port)) {
+      $holder = Get-ListeningPid $port
+      if ($holder -gt 0 -and (Get-ProcessNameSafe $holder) -eq 'node') {
+        if (-not $Quiet) { Write-Warn2 "$name was started by another run; adopting pid $holder on port $port" }
+        Set-State $name ([pscustomobject]@{
+          serverPid = $holder; port = $port; url = (Get-LocalUrl $name $port); updatedAt = (Get-Date).ToString('o')
+        })
+        Write-Log "adopted local $name pid $holder on port $port (another start won the race)"
+        return $port
+      }
+    }
     if ($proc.HasExited) {
       Write-Err "$name failed to start: the process exited with code $($proc.ExitCode)"
     } else {
