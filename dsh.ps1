@@ -60,7 +60,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','doctor')]
+  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','balance','doctor')]
   [string]$Command = 'menu',
 
   [Parameter(Position = 1)]
@@ -92,7 +92,9 @@ param(
 
   [int]$TrayInterval = 20, # seconds between tray state polls
 
-  [switch]$DryRun          # upgrade: report what would change, change nothing
+  [switch]$DryRun,         # upgrade: report what would change, change nothing
+
+  [switch]$Refresh         # balance: ignore the cache and re-query
 )
 
 Set-StrictMode -Version Latest
@@ -737,6 +739,23 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
   $workdir = Get-InstProp $Inst 'workdir' $env:USERPROFILE
   if (-not (Test-Path $workdir)) { $workdir = $env:USERPROFILE }
 
+  # The panel backend keeps the environment it was started with, so a
+  # DEEPSEEK_API_KEY added to the user environment afterwards never reaches the
+  # dsh servers it spawns: dsh snapshots its launch environment, finds no key
+  # there, and the first agent run dies with MISSING_CREDENTIAL even though the
+  # variable is set "in the environment". Re-read the persisted user (then
+  # machine) value and fill only that gap -- a value this process already
+  # carries stays authoritative, and the key itself is never written to config,
+  # state, or logs.
+  if (-not $env:DEEPSEEK_API_KEY) {
+    $persistedKey = [Environment]::GetEnvironmentVariable('DEEPSEEK_API_KEY', 'User')
+    if (-not $persistedKey) { $persistedKey = [Environment]::GetEnvironmentVariable('DEEPSEEK_API_KEY', 'Machine') }
+    if ($persistedKey) {
+      $env:DEEPSEEK_API_KEY = $persistedKey
+      Write-Log "local ${name}: filled DEEPSEEK_API_KEY from the persisted user environment"
+    }
+  }
+
   # Record the chosen port before starting, so status and stop agree with it even
   # if this function is interrupted.
   Set-State $name ([pscustomobject]@{
@@ -1169,6 +1188,121 @@ function Invoke-Upgrade([string[]]$Names, [switch]$DryRun) {
   foreach ($i in @($insts | Where-Object { $_.kind -eq 'remote' })) {
     Upgrade-RemoteDsh $i -Version $target -DryRun:$DryRun | Out-Null
   }
+}
+
+# --------------------------------------------------------------------------
+# Account balance
+# --------------------------------------------------------------------------
+
+function Get-DshApiKey {
+  <# The DeepSeek platform API key, or '' when unavailable.
+
+     Sources, in order:
+       1. $env:DEEPSEEK_API_KEY            a key the user exported explicitly
+       2. $DSH_HOME/.credentials.yaml      dsh's own credential store
+
+     This reads a secret, so two rules apply: the value is never logged, echoed,
+     or placed in an error message, and only the one well-known field is
+     consulted rather than parsing arbitrary YAML.
+
+     Note the file's shape. It has a top-level `secret:` field AND a `refs:` map.
+     `secret` is dsh's own internal secret, and using it returns 401 from the
+     platform API; the platform key lives under refs/DEEPSEEK_API_KEY and looks
+     like `sk-...`. That distinction cost a debug cycle, hence the note. #>
+  if ($env:DEEPSEEK_API_KEY) { return [string]$env:DEEPSEEK_API_KEY }
+  $cred = Join-Path $DshHome '.credentials.yaml'
+  if (-not (Test-Path $cred)) { return '' }
+  try {
+    $raw = Get-Content $cred -Raw -Encoding UTF8
+    if ($raw -match 'DEEPSEEK_API_KEY:\s*["'']?([A-Za-z0-9_\-]{20,})') { return $Matches[1] }
+  } catch { }
+  return ''
+}
+
+function Get-AccountBalance([switch]$Refresh) {
+  <# Remaining platform credit.
+
+     Cached for a few minutes: without it the panel would hit a billing endpoint
+     on every 20-second poll, which is both rude and likely to be rate limited.
+
+     Every failure mode is returned as data rather than thrown -- no key, a
+     rejected key, no network. The panel must still render when the balance
+     cannot be fetched, because a billing endpoint being down is no reason for
+     the control panel to look broken. #>
+  $cacheFile = Join-Path $StateDir 'balance.json'
+  if (-not $Refresh -and (Test-Path $cacheFile)) {
+    try {
+      $c = Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      $age = (Get-Date) - [datetime]$c.checkedAt
+      if ($age.TotalMinutes -lt 5) { return $c }
+    } catch { }
+  }
+
+  $result = [ordered]@{
+    ok = $false; reason = ''; isAvailable = $false
+    balances = @(); checkedAt = (Get-Date).ToString('o')
+  }
+  $key = Get-DshApiKey
+  if (-not $key) {
+    $result.reason = 'no-key'
+  } else {
+    try {
+      $r = Invoke-WebRequest -Uri 'https://api.deepseek.com/user/balance' `
+             -Headers @{ Authorization = "Bearer $key" } -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+      $j = $r.Content | ConvertFrom-Json
+      $result.ok = $true
+      $result.isAvailable = [bool]$j.is_available
+      $list = @()
+      foreach ($b in @($j.balance_infos)) {
+        $list += [pscustomobject]@{
+          currency = [string]$b.currency
+          total    = [string]$b.total_balance
+          granted  = [string]$b.granted_balance
+          toppedUp = [string]$b.topped_up_balance
+        }
+      }
+      $result.balances = $list
+    } catch {
+      $code = 0; try { $code = [int]$_.Exception.Response.StatusCode.value__ } catch { }
+      if ($code -eq 401) { $result.reason = 'unauthorized' }
+      elseif ($code -eq 403) { $result.reason = 'forbidden' }
+      elseif ($code -gt 0) { $result.reason = "http-$code" }
+      else { $result.reason = 'network' }
+      # The response body is deliberately not included: it can echo request detail.
+    }
+  }
+
+  try {
+    [pscustomobject]$result | ConvertTo-Json -Depth 5 | Set-Content -Path $cacheFile -Encoding UTF8
+  } catch { }
+  return [pscustomobject]$result
+}
+
+function Invoke-Balance([switch]$Refresh) {
+  $b = Get-AccountBalance -Refresh:$Refresh
+  if ($Json) { Write-Json $b; return }
+
+  Write-Head 'DeepSeek 账户余额'
+  if (-not $b.ok) {
+    switch ($b.reason) {
+      'no-key'       { Write-Warn2 '没找到 API key'
+                       Write-Info '设置环境变量 DEEPSEEK_API_KEY，或让 dsh 登录一次写入 ~/.dsh/.credentials.yaml' }
+      'unauthorized' { Write-Err 'API key 被拒绝（401）'
+                       Write-Info 'key 可能已失效；重新登录 dsh，或换成有效的 DEEPSEEK_API_KEY' }
+      'forbidden'    { Write-Err 'API key 无权访问余额接口（403）' }
+      'network'      { Write-Warn2 '网络不通，无法查询余额' }
+      default        { Write-Err "查询失败：$($b.reason)" }
+    }
+    return
+  }
+  if (-not $b.isAvailable) { Write-Warn2 '账户当前不可用（is_available = false）—— 余额可能已耗尽' }
+  foreach ($x in @($b.balances)) {
+    $mark = if ($x.currency -eq 'CNY') { '¥' } elseif ($x.currency -eq 'USD') { '$' } else { '' }
+    Write-C ("  {0,-4} {1}{2}" -f $x.currency, $mark, $x.total) 'Cyan'
+    Write-C ("       赠金 {0}{1}   充值 {2}{3}" -f $mark, $x.granted, $mark, $x.toppedUp) 'DarkGray'
+  }
+  Write-Host ''
+  Write-Info "查询于 $(([datetime]$b.checkedAt).ToString('HH:mm:ss'))，缓存 5 分钟；-Refresh 强制刷新"
 }
 
 function Get-RemoteProbeScript($Inst) {
@@ -2626,6 +2760,7 @@ try {
                 else { Invoke-Install $Target } }
     'check'   { Invoke-Check }
     'upgrade' { Invoke-Upgrade $Target -DryRun:([bool]$DryRun) }
+    'balance' { Invoke-Balance -Refresh:([bool]$Refresh) }
     'doctor'  { Invoke-Doctor }
   }
 } catch {

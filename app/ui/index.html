@@ -122,6 +122,31 @@
   button.spin svg { animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* ------------------------------------------------------- balance badge */
+  .balance {
+    font-family: var(--mono);
+    font-size: 12.5px; font-weight: 600;
+    padding: 7px 11px; gap: 2px;
+    color: #9ff0c8;
+    border-color: rgba(47,212,143,.32);
+    background: rgba(47,212,143,.09);
+  }
+  .balance:hover { background: rgba(47,212,143,.16); border-color: rgba(47,212,143,.5); }
+  .balance .b-cur { opacity: .75; font-size: 11.5px; }
+  /* Below roughly a dollar/eight yuan the badge turns amber: enough to notice,
+     not so loud that it alarms. */
+  .balance.low {
+    color: #ffd7a1;
+    border-color: rgba(255,180,84,.42);
+    background: rgba(255,180,84,.1);
+  }
+  .balance.low:hover { background: rgba(255,180,84,.18); }
+  .balance.empty {
+    color: #ffb3b8;
+    border-color: rgba(255,95,109,.45);
+    background: rgba(255,95,109,.1);
+  }
+
   /* --------------------------------------------------------------- body */
   .content { flex: 1; overflow-y: auto; padding: 4px 22px 26px; }
   .content::-webkit-scrollbar { width: 10px; }
@@ -398,6 +423,13 @@
     </div>
 
     <div class="spacer"></div>
+
+    <!-- Remaining DeepSeek credit. Click for a fresh query. Hidden entirely when
+         there is no key or the lookup fails, because a billing endpoint being
+         unavailable should not make the panel look broken. -->
+    <button id="btn-balance" class="balance" hidden title="DeepSeek 账户余额（点击刷新）">
+      <span class="b-cur"></span><span class="b-amt"></span>
+    </button>
 
     <button id="btn-refresh" class="icon" title="刷新状态">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -936,6 +968,53 @@ async function toggleTray() {
 
 $("#btn-tray").addEventListener("click", toggleTray);
 
+/* ---------------------------------------------------------------- balance */
+/* Currency symbols for display; the API reports ISO codes. */
+const CUR = { CNY: "¥", USD: "$", EUR: "€", GBP: "£", JPY: "¥" };
+
+function paintBalance(b) {
+  const el = $("#btn-balance");
+  if (!b || !b.ok || !b.balances || !b.balances.length) {
+    el.hidden = true;
+    return;
+  }
+  // Prefer a currency with actual credit; otherwise the first reported one.
+  const withFunds = b.balances.find((x) => parseFloat(x.total) > 0);
+  const pick = withFunds || b.balances[0];
+  const sym = CUR[pick.currency] || (pick.currency + " ");
+  const amt = parseFloat(pick.total);
+  el.querySelector(".b-cur").textContent = sym;
+  el.querySelector(".b-amt").textContent = isNaN(amt) ? pick.total : amt.toFixed(2);
+  el.hidden = false;
+
+  const full = b.balances
+    .map((x) => (CUR[x.currency] || x.currency + " ") + x.total +
+                "（赠金 " + x.granted + " / 充值 " + x.toppedUp + "）")
+    .join("   ");
+  el.title = "DeepSeek 账户余额\n" + full +
+             "\n查询于 " + new Date(b.checkedAt).toLocaleTimeString("zh-CN", { hour12: false }) +
+             "\n点击刷新";
+
+  el.classList.toggle("empty", !b.isAvailable || amt <= 0);
+  el.classList.toggle("low", b.isAvailable && amt > 0 && amt < 10);
+}
+
+async function loadBalance(force) {
+  try {
+    paintBalance(await api("/api/balance" + (force ? "?refresh=1" : "")));
+  } catch (e) {
+    $("#btn-balance").hidden = true;   // stay quiet rather than showing an error
+  }
+}
+
+$("#btn-balance").addEventListener("click", async (e) => {
+  const b = e.currentTarget;
+  b.classList.add("spin");
+  await loadBalance(true);
+  b.classList.remove("spin");
+  toast("余额已刷新");
+});
+
 /* -------------------------------------------------------------- wiring up */
 $("#btn-refresh").addEventListener("click", async (e) => {
   const b = e.currentTarget; b.classList.add("spin");
@@ -991,6 +1070,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) load
 
 load().then(schedule);
 refreshTray();
+loadBalance(false);
 </script>
 </body>
 </html>

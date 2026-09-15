@@ -432,6 +432,13 @@ const routes = {
     };
   },
 
+  'GET /api/balance': async (ctx) => {
+    // Read-only. Cached for 5 minutes inside the launcher, so a 20s panel poll
+    // does not hammer a billing endpoint. ?refresh=1 forces a fresh query.
+    const refresh = ctx.url.searchParams.get('refresh') === '1';
+    return psJson(show('balance', null, refresh ? ['-Refresh'] : []), 60000);
+  },
+
   'GET /api/doctor': async () => {
     const r = await psRun(show('doctor'), 300000);
     return { text: (r.out || '').replace(/\r/g, '') };
