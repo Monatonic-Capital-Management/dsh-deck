@@ -37,7 +37,10 @@ if (-not (Test-Path $script)) { throw "cannot find dsh.ps1 at $script" }
 
 # powershell.exe is present on every supported Windows version, unlike pwsh.
 $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$icon = 'C:\Program Files\nodejs\node.exe'
+# The panel's own mark (a dolphin). Falls back to the node binary and then to
+# PowerShell, so the installer still works from a checkout without the asset.
+$icon = Join-Path $root 'app\icon\dsh-deck.ico'
+if (-not (Test-Path $icon)) { $icon = 'C:\Program Files\nodejs\node.exe' }
 if (-not (Test-Path $icon)) { $icon = $ps }
 
 $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Command app"

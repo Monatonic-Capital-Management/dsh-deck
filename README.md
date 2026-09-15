@@ -227,10 +227,13 @@ dsh.cmd                  PATH-friendly shim for the CLI
 app/
   server.js              panel backend (Node, no dependencies)
   ui/index.html          the interface (one self-contained file)
+  icon/dsh-deck.svg      the mark, as vector source
+  icon/dsh-deck.ico      what the shortcuts use (16-256 px)
 remote/
   dsh-web-service.sh     systemd wrapper deployed to servers
 tools/
   fix-bom.ps1            keeps .ps1 files readable by PowerShell 5.1
+  make-icon.ps1          renders the .ico from the .svg (needs Chrome or Edge)
   install-shortcut.ps1   creates the desktop shortcut
 docs/
   architecture.md        how the pieces fit, and why
