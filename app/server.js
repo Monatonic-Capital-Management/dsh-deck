@@ -254,19 +254,25 @@ function invalidateConfig() {
 const STATUS_TTL_MS = 45000;
 const STATUS_POLL_MS = 30000;
 
-let statusCache = { rows: null, at: 0, error: '' };
+let statusCache = { rows: null, at: 0, error: '', complete: false };
 let statusInFlight = null;
 
 function getStatus(force) {
   const age = Date.now() - statusCache.at;
-  if (!force && statusCache.rows && age < STATUS_TTL_MS) {
+  // `complete` matters as much as the age. A mutation can arrive before the
+  // first full probe has finished (the panel is interactive during those first
+  // seconds) and folds its own single row into the cache; without this flag that
+  // row would look like a fresh, authoritative view of the whole farm, and the
+  // panel would show one instance instead of five until the next poll. Only a
+  // real probe may declare the cache complete.
+  if (!force && statusCache.rows && statusCache.complete && age < STATUS_TTL_MS) {
     return Promise.resolve(statusCache.rows);
   }
   if (statusInFlight) return statusInFlight;
   statusInFlight = (async () => {
     try {
       const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
-      statusCache = { rows, at: Date.now(), error: '' };
+      statusCache = { rows, at: Date.now(), error: '', complete: true };
       trace(`status refreshed (${rows.length} instance(s))`);
       return rows;
     } catch (e) {
@@ -276,6 +282,7 @@ function getStatus(force) {
         rows: statusCache.rows,
         at: Date.now(),
         error: String(e && e.message ? e.message : e),
+        complete: statusCache.complete,
       };
       trace(`status refresh failed: ${statusCache.error}`);
       if (statusCache.rows) return statusCache.rows;
@@ -312,7 +319,15 @@ function applyStatusRows(rows) {
   for (const r of incoming) {
     if (r && r.Name) byName.set(r.Name, r);
   }
-  statusCache = { rows: [...byName.values()], at: Date.now(), error: '' };
+  // Preserve `complete`: folding in a mutation does not make a partial cache
+  // whole, so a cache that has only ever seen mutations keeps asking to be
+  // filled by a real probe (see getStatus).
+  statusCache = {
+    rows: [...byName.values()],
+    at: Date.now(),
+    error: '',
+    complete: statusCache.complete,
+  };
 }
 
 async function assertKnownInstance(name) {

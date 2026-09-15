@@ -96,6 +96,16 @@ jobs:
         # push and needs no Windows.
         run: node tools/check-ui.js
 
+      - name: Status cache guarantees
+        # Extracts getStatus/applyStatusRows from app/server.js and runs them
+        # against a stubbed probe, so single-flight, the TTL and mutation-folding
+        # are verified by counting probes rather than by timing a real ssh
+        # handshake. The live latency assertions in tools/check-panel.ps1 cannot
+        # run here (they need a running backend and reachable hosts), and they
+        # cannot prove deduplication at all without a destructive install, which
+        # is why this is a unit test on the extracted functions.
+        run: node tools/check-status-cache.js
+
       - name: Machine-readable output stays machine-readable
         shell: pwsh
         run: |

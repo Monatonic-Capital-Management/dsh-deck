@@ -74,10 +74,11 @@ async function main() {
   }
 
   const results = [];
-  const check = (label, got, want) => {
+  const check = (label, got, want, detail) => {
     const ok = JSON.stringify(got) === JSON.stringify(want);
     results.push({ label, ok, got, want });
-    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : ` (got ${JSON.stringify(got)}, want ${JSON.stringify(want)})`}`);
+    const extra = ok ? (detail ? `  ${detail}` : '') : ` (got ${JSON.stringify(got)}, want ${JSON.stringify(want)})`;
+    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label}${extra}`);
   };
 
   const cardCount = () => evalJs('document.querySelectorAll("#list .card").length');
@@ -174,6 +175,42 @@ async function main() {
   })()`);
   check('clicking open reports success rather than an error',
     /已打开/.test(String(clicked)), true);
+
+  // --- destructive-action confirmation ------------------------------------------
+  // Deploying to a remote host writes Node, dsh and a systemd unit onto someone
+  // else's machine. The button lives on a card that looks local enough to click
+  // casually, so the confirmation has to name the host and say which of the two
+  // things is about to happen.
+  //
+  // No instance in this fleet needs deploying (all five already have dsh), which
+  // is exactly why the button is absent - so this drives act('install', ...)
+  // directly with window.confirm stubbed to return FALSE. That both captures the
+  // dialog text and guarantees nothing is installed, so the check is safe to run
+  // against production hosts.
+  const confirmInfo = await evalJs(`(async () => {
+    const realConfirm = window.confirm;
+    const seen = [];
+    window.confirm = (msg) => { seen.push(String(msg)); return false; };
+    try {
+      await act('install', 'DuckServer');
+      await new Promise(r => setTimeout(r, 400));
+    } finally {
+      window.confirm = realConfirm;
+    }
+    return { calls: seen.length, text: seen[0] || '' };
+  })()`);
+  const ctext = String(confirmInfo.text);
+  console.log('  dialog text: ' + JSON.stringify(ctext.slice(0, 200)));
+  check('install asks for confirmation before touching a remote host',
+    confirmInfo.calls === 1, true, `confirm() called ${confirmInfo.calls}x`);
+  check('the confirmation names the host',
+    ctext.includes('DuckServer'), true);
+  check('the confirmation states it modifies that host',
+    /修改/.test(ctext), true);
+  check('the confirmation carries a plan from the probe',
+    ctext.length > 60, true, `${ctext.length} chars`);
+  check('declining leaves the instance untouched (no busy state stuck)',
+    await evalJs('BUSY.size'), 0);
 
   ws.close();
   const failed = results.filter((r) => !r.ok).length;
