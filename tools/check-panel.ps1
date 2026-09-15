@@ -4,6 +4,13 @@
 # classification. Read-only with respect to the user's instances: it probes, it
 # does not start or stop anything, and the unreachable fixtures are fake hosts
 # given to the launcher through a scratch -Config.
+#
+# NOT portable: unlike tools/check-ui.js (pure functions) this suite reads the
+# author's own hosts.json and asserts on instance names such as 'DuckServer'.
+# Run it as a reference for how to verify a deployment, not as a gate for a
+# fork; CI runs check-ui.js and the BOM/parse checks only. Unreachable fixtures
+# use TEST-NET-1 (192.0.2.0/24) and .invalid so they can never resolve to a
+# real host.
 $ErrorActionPreference = 'Continue'
 Set-Location '$PSScriptRoot\..'
 
@@ -80,10 +87,14 @@ Check 'unknown name -> error' ($bad -match 'unknown instance') $bad
 
 Write-Host ''
 Write-Host '=== 4. failure classification (fixtures, no real hosts touched) ==='
+# TEST-NET-1 (192.0.2.0/24, RFC 5737) is reserved for documentation and is
+# guaranteed unroutable, so this classifies as a timeout without naming anyone's
+# actual infrastructure. .invalid is likewise reserved (RFC 2606) and cannot
+# resolve, which is what exercises the dns branch.
 $cfg = Join-Path $env:TEMP 'uxcheck.json'
 @'
 { "version": 1, "instances": [
-  { "name": "fx-timeout", "kind": "remote", "enabled": true, "sshHost": "172.26.42.63", "remotePort": 3080, "localPort": 3196 },
+  { "name": "fx-timeout", "kind": "remote", "enabled": true, "sshHost": "192.0.2.10", "remotePort": 3080, "localPort": 3196 },
   { "name": "fx-dns", "kind": "remote", "enabled": true, "sshHost": "no-such-host-xyz.invalid", "remotePort": 3080, "localPort": 3195 }
 ] }
 '@ | Set-Content $cfg -Encoding UTF8
