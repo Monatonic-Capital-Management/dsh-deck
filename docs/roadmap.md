@@ -68,14 +68,34 @@ dispatch clause or a `param()` variable is never read.
 
 ## Next — the features I would build, in order
 
-### P0 — Session continuity ("reconnect where I left off")
+### P0 — Route to the right instance, into the right workspace
 
 **Pain:** you open dsh, work, close the window, and the next day you have lost
 your place and cannot remember which host that useful session was on.
 
-**What:** the panel shows each instance's recent sessions and workdir, with a
-one-click resume. dsh already persists sessions under `DSH_HOME/sessions`, so the
-data exists; it is simply invisible from the launcher.
+**Corrected after checking.** The original entry here said the launcher should
+show each instance's recent sessions with one-click resume, "because dsh already
+persists sessions under `DSH_HOME/sessions`". The persistence claim is true —
+`sessions/<workdir>/<session-id>/session.jsonl.zstd`, plus the newer
+`session.v3.jsonl.zstd` alongside it — but the conclusion was wrong. dsh's own
+web UI already ships 搜索会话, 新建会话, 添加工作区 and 选择工作区, and a
+workspace *is* a working directory. Building a second session browser would
+duplicate the better-informed one.
+
+**What is actually missing** is everything around that UI, which is exactly what
+a launcher owns:
+
+- *Which* instance. Five instances each with their own session list is the real
+  navigation problem, and only the launcher can see all five.
+- *Which* working directory. Every local session under a stale workdir starts in
+  the wrong place, and the encoded directory names (`--C-Users-you-Documents--`)
+  make it hard to tell which of them you actually use.
+- *Reopening the last one* you used on a given instance.
+
+**Not blocked on the private format.** These need only instance bookkeeping and,
+for the last one, whatever dsh documents for pointing a launch at a session —
+reading `session.jsonl.zstd` directly is deliberately out of scope, since the
+format is internal and would couple the launcher to it.
 
 **Why first:** it turns the launcher from a connection manager into the place you
 actually start work. Highest ratio of value to effort on this list.

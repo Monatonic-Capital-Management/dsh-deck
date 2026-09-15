@@ -290,6 +290,33 @@ BOM-less UTF-8 as UTF-8, so it accepts exactly the files Windows PowerShell 5.1
 rejects — the local `pre-commit` hook is the only gate that catches it. Install
 it with `tools/install-hooks.ps1`.
 
+## 20. A roadmap entry is a claim, and it can be wrong
+
+The top-priority item in `docs/roadmap.md` was "session continuity": show each
+instance's recent sessions in the panel and resume with one click, justified by
+"dsh already persists sessions under `DSH_HOME/sessions`, so the data exists; it
+is simply invisible from the launcher."
+
+The persistence half checked out — `sessions/<workdir>/<session-id>/session.jsonl.zstd`,
+with a newer `session.v3.jsonl.zstd` alongside. The conclusion did not. Opening
+dsh's own web UI showed 搜索会话, 新建会话, 添加工作区 and 选择工作区 already
+present, with a workspace being exactly a working directory. The feature was
+already shipped, better informed, by the thing being launched.
+
+Building it would have cost real effort to produce a worse duplicate, and the
+plan looked entirely reasonable on paper. What made the difference was five
+minutes of looking at the actual UI before writing code — the same discipline
+this file applies to everything else, applied to the plan itself.
+
+**Fix:** the entry was rewritten to name the part that is genuinely missing
+(*which* instance, *which* workdir, reopening the last one per instance) and to
+state explicitly that reading the session format directly is out of scope,
+because it is internal and coupling to it would break silently on a dsh update.
+
+**Rule:** before building a feature on top of a claim about another tool, verify
+the claim against that tool. "The data exists" does not imply "the capability is
+missing".
+
 ## The pattern
 
 The majority of these produce a **success report followed by nothing working**.
