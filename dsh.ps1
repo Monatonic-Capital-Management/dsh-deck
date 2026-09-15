@@ -169,14 +169,36 @@ function Invoke-B64([string]$Script, [string]$SshHostName, [int]$TimeoutSec = 30
      nothing between here and the remote bash can reinterpret its bytes: nested
      quoting through PowerShell -> ssh -> bash mangles anything else.
      The payload is ASCII by construction, so the encoding of our own pipe into
-     ssh cannot corrupt it regardless of the console code page. #>
+     ssh cannot corrupt it regardless of the console code page.
+
+     Line endings are forced to LF before encoding. .gitattributes asks for CRLF
+     in .ps1 files (right for PowerShell), so every here-string in this file
+     carries CRLF -- and bash rejects CRLF with errors like
+     "set: +e\r: invalid option" and "syntax error: unexpected end of file".
+     The deploy path already normalised its own payload; the probe path did not,
+     which made every remote instance report "服务器上还没有安装 dsh" no matter
+     what was actually installed. Normalising here fixes every caller at once. #>
+  $Script = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-  $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=10 $SshHostName "echo $b64 | base64 -d | bash" 2>&1
+  # ssh reports failures ("Connection refused", "Permission denied") on stderr,
+  # and under $ErrorActionPreference='Stop' a native command's stderr line is a
+  # TERMINATING error: one unreachable host aborted the entire command, so the
+  # panel showed a crash instead of marking that host unreachable. Continue for
+  # the duration of the call and keep stderr as ordinary text.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=10 $SshHostName "echo $b64 | base64 -d | bash" 2>&1 }
+  finally { $ErrorActionPreference = $prevEap }
   return ($out | Out-String)
 }
 
 function Test-SshReachable([string]$SshHostName, [int]$TimeoutSec = 8) {
-  $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=$TimeoutSec -o StrictHostKeyChecking=accept-new $SshHostName "echo REACHABLE" 2>&1
+  # Same stderr-is-not-fatal rule as Invoke-B64: an unreachable host must answer
+  # $false, not throw.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = & ssh -n -o BatchMode=yes -o ConnectTimeout=$TimeoutSec -o StrictHostKeyChecking=accept-new $SshHostName "echo REACHABLE" 2>&1 }
+  finally { $ErrorActionPreference = $prevEap }
   return (($out | Out-String) -match 'REACHABLE')
 }
 
@@ -360,7 +382,7 @@ function Get-HostsConfig([string]$ConfigPath) {
   $path = Resolve-ConfigPath $ConfigPath
   if (-not (Test-Path $path)) {
     $cfg = Get-DefaultHosts
-    Save-HostsConfig $cfg -ConfigPath $Config -ConfigPath $path
+    Save-HostsConfig $cfg -ConfigPath $path
     return $cfg
   }
   $raw = Get-Content $path -Raw -Encoding UTF8
@@ -1804,8 +1826,27 @@ function Get-AllStatus([switch]$NoProbeHttp) {
       }
       continue
     }
-    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { $rows += Get-RemoteStatus $i }
-    else { $rows += Get-LocalStatus $i -NoProbeHttp:$NoProbeHttp }
+    # One unreadable instance must not blank the whole panel: an exception here
+    # used to kill the entire status command, which the desktop app reported as
+    # "无法读取实例状态" for every instance, including the healthy ones. Turn it
+    # into a row for this instance alone and keep collecting the rest.
+    try {
+      if ((Get-InstProp $i 'kind' 'local') -eq 'remote') { $rows += Get-RemoteStatus $i }
+      else { $rows += Get-LocalStatus $i -NoProbeHttp:$NoProbeHttp }
+    } catch {
+      $portValue = 0
+      $configured = Get-InstProp $i 'port' 0
+      if (-not $configured) { $configured = Get-InstProp $i 'localPort' 0 }
+      if ($configured) { $portValue = [int]$configured }
+      $rows += [pscustomobject]@{
+        Name = $i.name
+        Kind = (Get-InstProp $i 'kind' 'local')
+        Port = $portValue
+        State = 'unreachable'
+        Detail = "状态查询失败：$($_.Exception.Message)"
+        Http = 0; Url = ''
+      }
+    }
   }
   return $rows
 }
@@ -2465,7 +2506,11 @@ function Write-Json($Obj) {
      writing the result throws, and $ErrorActionPreference='Stop' would turn that
      into a crash after the work had in fact succeeded. #>
   try {
-    $Obj | ConvertTo-Json -Depth 8 -Compress | Write-Output
+    # -InputObject, not the pipeline: the pipeline unrolls a one-element array, so
+    # `list -Json` with a single instance emitted `{...}` instead of `[{...}]` and
+    # every consumer that maps over the result (the panel's cfg.map) threw
+    # "cfg.map is not a function". -InputObject passes the array through intact.
+    ConvertTo-Json -InputObject $Obj -Depth 8 -Compress | Write-Output
   } catch {
     try { Write-Log "Write-Json failed (stdout closed?): $($_.Exception.Message)" } catch { }
   }
