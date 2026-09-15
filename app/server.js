@@ -227,6 +227,94 @@ function invalidateConfig() {
   configCache = null;
 }
 
+// ------------------------------------------------------- status cache
+
+/**
+ * Background-refreshed instance status.
+ *
+ * Why: a refresh cost one PowerShell process plus an ssh handshake per remote
+ * host, measured at ~2s with five instances, on a 20-second timer. The backend
+ * is already a long-lived process, so it probes on its own schedule and callers
+ * read the result. A panel refresh becomes a map lookup.
+ *
+ * `inFlight` is what makes concurrent callers safe. Without it, several requests
+ * arriving during a refresh would each spawn their own probe -- worse than the
+ * polling this replaces, not better. Everyone who asks while a probe runs awaits
+ * that same probe.
+ *
+ * A failure is never cached as data: the previous rows are kept so the panel can
+ * still render, and the error is surfaced through statusError for the UI to show
+ * if it wants to.
+ */
+// The TTL must be LONGER than the poll interval, or the cache is stale by
+// construction: with a 15s TTL under a 30s poll, half of all reads found an
+// expired entry and paid ~1.5s for their own probe, which defeats the point.
+// At 45s the background poll (30s) always refreshes before expiry, so every read
+// is served from cache and only a genuinely dead poller makes a reader wait.
+const STATUS_TTL_MS = 45000;
+const STATUS_POLL_MS = 30000;
+
+let statusCache = { rows: null, at: 0, error: '' };
+let statusInFlight = null;
+
+function getStatus(force) {
+  const age = Date.now() - statusCache.at;
+  if (!force && statusCache.rows && age < STATUS_TTL_MS) {
+    return Promise.resolve(statusCache.rows);
+  }
+  if (statusInFlight) return statusInFlight;
+  statusInFlight = (async () => {
+    try {
+      const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
+      statusCache = { rows, at: Date.now(), error: '' };
+      trace(`status refreshed (${rows.length} instance(s))`);
+      return rows;
+    } catch (e) {
+      // Keep the last good rows: a transient probe failure should not blank the
+      // panel. The empty case is the one time we have nothing to fall back on.
+      statusCache = {
+        rows: statusCache.rows,
+        at: Date.now(),
+        error: String(e && e.message ? e.message : e),
+      };
+      trace(`status refresh failed: ${statusCache.error}`);
+      if (statusCache.rows) return statusCache.rows;
+      throw e;
+    } finally {
+      statusInFlight = null;
+    }
+  })();
+  return statusInFlight;
+}
+
+let statusTimer = null;
+
+function startStatusPolling() {
+  if (statusTimer) return;
+  // Unref'd so a pending timer can never hold the process open.
+  statusTimer = setInterval(() => {
+    getStatus(true).catch(() => { /* already traced */ });
+  }, STATUS_POLL_MS);
+  if (statusTimer.unref) statusTimer.unref();
+}
+
+/**
+ * Fold a mutation's own result into the cache.
+ *
+ * The mutation command already returns the acted-on instance's new row, so
+ * reusing it avoids the full re-probe the route used to trigger, and the panel's
+ * very next read is already correct.
+ */
+function applyStatusRows(rows) {
+  const incoming = asArray(rows);
+  if (!incoming.length) return;
+  const byName = new Map((statusCache.rows || []).map((r) => [r.Name, r]));
+  for (const r of incoming) {
+    if (r && r.Name) byName.set(r.Name, r);
+  }
+  statusCache = { rows: [...byName.values()], at: Date.now(), error: '' };
+}
+
 async function assertKnownInstance(name) {
   const insts = await loadInstances();
   if (!insts.some((i) => i.name === name)) {
@@ -258,6 +346,14 @@ function mapInstance(r, c) {
     enabled: cfg.enabled !== false,
     remotePort: cfg.remotePort || r.RemotePort || null,
     localPort: cfg.localPort || null,
+    // dshInstalled drove a card action in the panel but was never mapped, so the
+    // condition read `undefined === false` and the deploy button could not
+    // appear. Map it explicitly.
+    dshInstalled: r.DshInstalled !== false,
+    dshVersion: r.DshVersion || '',
+    latestVersion: r.LatestVersion || '',
+    updateAvailable: Boolean(r.UpdateAvailable),
+    versionDrift: Boolean(r.VersionDrift),
     // Why a host is unreachable, classified by the launcher from the ssh error.
     // The panel shows the hint and a matching next step; without it a card said
     // only "unreachable", which tells the reader nothing they can act on.
@@ -333,8 +429,27 @@ const routes = {
   },
 
   'GET /api/instances': async (ctx) => {
-    const probe = ctx.url.searchParams.get('probe') !== '0';
-    const rows = asArray(await psJson(show('status', null, probe ? ['-Probe'] : ['-NoProbe']), 300000));
+    // Served from a background-refreshed cache, so a panel refresh costs
+    // milliseconds instead of an ssh handshake per remote host.
+    //
+    // `probe=0` still means "do not touch the network": it returns whatever the
+    // cache holds and asks the launcher for the no-probe view only if the cache
+    // is empty, which is the case a caller uses it for (first paint, or a
+    // deliberately offline look).
+    const wantNoProbe = ctx.url.searchParams.get('probe') === '0';
+    if (!wantNoProbe) {
+      const rows = await getStatus(false);
+      const cfg = await loadInstances();
+      const byName = new Map(cfg.map((c) => [c.name, c]));
+      // `probedAt` / `statusError` let the panel tell "live" apart from "last
+      // known good, because the background probe is failing". Presenting a stale
+      // row as current would be the one thing this cache must not do.
+      return rows.map((r) => Object.assign(mapInstance(r, byName.get(r.Name)), {
+        probedAt: statusCache.at,
+        statusError: statusCache.error || '',
+      }));
+    }
+    const rows = asArray(await psJson(show('status', null, ['-NoProbe']), 300000));
     const cfg = await loadInstances();
     const byName = new Map(cfg.map((c) => [c.name, c]));
     return rows.map((r) => mapInstance(r, byName.get(r.Name)));
@@ -357,6 +472,7 @@ const routes = {
   'POST /api/instances/:name/start': async (ctx) => {
     const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('start', ctx.params.name, ['-NoOpen']), 300000, ctx.params.name);
+    applyStatusRows(r.state);
     return {
       ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
@@ -367,6 +483,7 @@ const routes = {
   'POST /api/instances/:name/stop': async (ctx) => {
     const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('stop', ctx.params.name), 180000, ctx.params.name);
+    applyStatusRows(r.state);
     return {
       ok: Boolean(r.state && r.state.State === 'down'),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
@@ -377,6 +494,7 @@ const routes = {
   'POST /api/instances/:name/restart': async (ctx) => {
     const cfg = await assertKnownInstance(ctx.params.name);
     const r = await psMutate(show('restart', ctx.params.name), 420000, ctx.params.name);
+    applyStatusRows(r.state);
     return {
       ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
       state: r.state, raw: r.raw, err: r.err, code: r.code,
@@ -408,9 +526,40 @@ const routes = {
     return { ok: r.ok, raw: (r.out || '').trim(), instances: insts };
   },
 
+  'GET /api/instances/:name/install': async (ctx) => {
+    // A preview built from the probe the URL route already performs, so the
+    // confirmation can state what would actually change on that host instead of
+    // a generic warning. Probing is also what makes the claim accurate: whether
+    // dsh is missing, present but broken, or already fine differs per host.
+    await assertKnownInstance(ctx.params.name);
+    const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name) || {};
+    const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
+    const row = rows.find((r) => r.Name === ctx.params.name) || {};
+    const version = row.DshVersion || '';
+    const installed = Boolean(row.DshInstalled);
+    return {
+      name: ctx.params.name,
+      sshHost: cfg.sshHost || row.SshHost || ctx.params.name,
+      kind: cfg.kind || 'remote',
+      dshInstalled: installed,
+      dshVersion: version,
+      nodeVersion: row.NodeV || '',
+      linger: row.Linger || '',
+      reachable: row.SshReady !== false,
+      plan: row.DshInstalled
+        ? `服务器上已有 dsh ${version || ''}；将更新服务定义并重新部署 systemd 单元`
+        : '服务器上还没有 dsh；将安装 Node 和 dsh，并部署 systemd 用户服务',
+    };
+  },
+
   'POST /api/instances/:name/install': async (ctx) => {
+    // Destructive-ish: this writes Node and dsh onto a remote machine and
+    // deploys a systemd user service. The panel confirms first, and the confirm
+    // text names the host so it cannot be mistaken for a local action.
     await assertKnownInstance(ctx.params.name);
     const r = await psRun(show('install', ctx.params.name), 300000);
+    // Installation can change the reported version and service state.
+    getStatus(true).catch(() => { /* traced inside */ });
     return { ok: r.ok, raw: (r.out || '').trim() };
   },
 
@@ -609,6 +758,13 @@ server.listen(0, HOST, () => {
   loadInstances()
     .then((n) => trace(`config cache warmed (${n.length} instance(s))`))
     .catch((e) => trace(`config cache warm-up failed (will retry on demand): ${e.message}`));
+
+  // Probe once now, then keep refreshing in the background. Callers read the
+  // cache and never wait on ssh, so the first panel paint is served from it too.
+  getStatus(true)
+    .then((rows) => trace(`initial status probe done (${rows.length} instance(s))`))
+    .catch((e) => trace(`initial status probe failed: ${e.message}`));
+  startStatusPolling();
 });
 
 server.on('error', (e) => {

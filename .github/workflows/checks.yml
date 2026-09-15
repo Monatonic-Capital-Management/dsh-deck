@@ -1,4 +1,4 @@
-name: checks
+﻿name: checks
 
 on:
   push:
@@ -90,10 +90,11 @@ jobs:
             Write-Host "::warning::commands missing from README: $($missing -join ', ')"
           }
 
-      - name: Failure-hint command builders produce real commands
-        # The hint buttons copy a command straight into a terminal, so a broken
-        # builder is worse than no button. Runs on every push, no Windows needed.
-        run: node tools/check-hints.js
+      - name: Panel rendering logic (hint commands, action gating)
+        # Extracts the shipped FAIL_STEP and card() from index.html, so the checks
+        # track the real rendering logic instead of a copy of it. Runs on every
+        # push and needs no Windows.
+        run: node tools/check-ui.js
 
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a

@@ -678,7 +678,11 @@ function card(it) {
     actions =
       '<button class="primary grow" onclick="act(\'start\',\'' + esc(it.name) + '\')">' + ICON.play + "启动</button>" +
       '<button class="icon" title="详情与日志" onclick="detail(\'' + esc(it.name) + '\')">' + ICON.log + "</button>";
-    if (it.kind === "remote" && it.dshInstalled === false) {
+    // Deploy is only offered for a remote instance whose dsh is missing or not
+    // working. It used to be gated on dshInstalled, which the backend never
+    // mapped, so the button was dead code; and for a *local* instance the
+    // "will install Node and dsh" wording would be plainly wrong.
+    if (it.kind === "remote" && it.state !== "unreachable" && it.dshInstalled === false) {
       actions += '<button class="icon" title="部署远程服务" onclick="act(\'install\',\'' + esc(it.name) + '\')">' +
                  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg></button>';
     }
@@ -878,9 +882,39 @@ async function act(kind, name) {
       return;
     }
     if (kind === "install") {
-      toast("正在部署远程服务…");
+      /* Confirm before touching another machine. This writes Node and dsh onto a
+         remote host and deploys a systemd unit, and the button sits on a card
+         that looks local enough to click casually. The confirmation names the
+         host and says which of the two things will happen, taken from a probe
+         rather than a generic warning -- "already has dsh 0.1.5" and "nothing is
+         installed" are very different propositions to approve. */
+      let preview = null;
+      try {
+        preview = await api("/api/instances/" + encodeURIComponent(name) + "/install");
+      } catch (e) {
+        toast("无法确认远端状态：" + e.message, "bad");
+        BUSY.delete(name); render();
+        return;
+      }
+      const host = preview.sshHost || name;
+      const lines = [
+        "将在远程主机上执行部署：",
+        "",
+        "  主机：" + host,
+        preview.dshVersion ? "  当前 dsh：" + preview.dshVersion : "  当前 dsh：未检测到",
+        preview.nodeVersion ? "  当前 Node：" + preview.nodeVersion : "",
+        "",
+        preview.plan,
+        "",
+        "这会修改 " + host + " 上的软件。确定继续？",
+      ].filter((l) => l !== "");
+      if (!confirm(lines.join("\n"))) {
+        BUSY.delete(name); render();
+        return;
+      }
+      toast("正在部署到 " + host + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/install", { method: "POST" });
-      toast(r.ok ? name + " 部署完成" : name + " 部署失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
+      toast(r.ok ? host + " 部署完成" : host + " 部署失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
     } else if (kind === "start") {
       toast("正在启动 " + name + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/start", { method: "POST" });
@@ -959,7 +993,12 @@ async function detail(name) {
     cmds.push('<button class="danger" onclick="act(\'stop\',\'' + esc(name) + '\')">' + ICON.stop + "停止</button>");
   }
   cmds.push('<button onclick="loadLog(\'' + esc(name) + '\')">' + ICON.log + "载入日志</button>");
-  if (it.kind === "remote") cmds.push('<button onclick="act(\'install\',\'' + esc(name) + '\')">部署远程服务</button>');
+  // Same gate as the card: only for a reachable remote whose dsh is missing.
+  // Offering it unconditionally invited a redeploy against a healthy production
+  // host for no reason.
+  if (it.kind === "remote" && it.state !== "unreachable" && it.dshInstalled === false) {
+    cmds.push('<button onclick="act(\'install\',\'' + esc(name) + '\')">部署远程服务</button>');
+  }
   $("#detail-cmds").innerHTML = cmds.join("");
 
   $("#detail-log").textContent = "正在载入日志…";
