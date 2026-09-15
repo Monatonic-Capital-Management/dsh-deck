@@ -359,6 +359,10 @@ function mapInstance(r, c) {
     // only "unreachable", which tells the reader nothing they can act on.
     failCode: r.FailCode || '',
     hint: r.Hint || '',
+    // Where a local instance starts sessions. Absent for remote rows, which is
+    // deliberate: the directory is on the other machine, so offering to open it
+    // here would be a lie. The panel gates the reveal action on this.
+    workdir: r.Workdir || '',
   };
 }
 
@@ -664,15 +668,51 @@ const routes = {
     return { text: (r.out || '').replace(/\r/g, '') };
   },
 
-  'POST /api/reveal': async (ctx) => {    if (ctx.body && ctx.body.path && !/^https?:\/\//.test(String(ctx.body.path))) {
-      const e = new Error('only http(s) urls can be opened');
+  'POST /api/reveal': async (ctx) => {
+    // Open a folder in Explorer (or a URL in the browser).
+    //
+    // The previous version was wrong in two ways. Its guard read
+    // `if (path && !/^https?:/.test(path)) throw` - which rejects a plain
+    // Windows path and *accepts* an http URL - and it was written inline after
+    // the opening brace, so every ordinary path fell through unchecked. It then
+    // handed whatever it was given to url.dll,FileProtocolHandler, which will
+    // happily execute a binary. Nothing here may launch a program: the caller
+    // supplies a path, and this end decides what may be done with it.
+    const raw = ctx.body && ctx.body.path ? String(ctx.body.path) : '';
+    if (!raw) {
+      // path.resolve('') is the process cwd, which would quietly open the
+      // launcher's own directory for a request that named nothing.
+      const e = new Error('path is required');
       e.statusCode = 400;
       throw e;
     }
+
+    if (/^https?:\/\//i.test(raw)) {
+      // Only an http(s) URL may be opened as a URL, and only those two schemes.
+      const { spawn: sp } = require('child_process');
+      sp('rundll32.exe', ['url.dll,FileProtocolHandler', raw],
+        { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      return { ok: true, opened: 'url' };
+    }
+
+    const path = require('path');
+    const fs = require('fs');
+    const resolved = path.resolve(raw);
+    let stat = null;
+    try { stat = fs.statSync(resolved); } catch (_) { stat = null; }
+    if (!stat || !stat.isDirectory()) {
+      // Directories only. Explorer can select a file, but there is no need to
+      // accept one, and refusing files removes the "executable" case entirely.
+      const e = new Error('path must be an existing directory');
+      e.statusCode = 400;
+      throw e;
+    }
+    // `explorer.exe <dir>` opens the folder itself and reuses an existing
+    // window; url.dll would instead try to *execute* the target.
     const { spawn: sp } = require('child_process');
-    sp('rundll32.exe', ['url.dll,FileProtocolHandler', String(ctx.body.path)],
+    sp('explorer.exe', [resolved],
       { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    return { ok: true };
+    return { ok: true, opened: 'directory' };
   },
 };
 

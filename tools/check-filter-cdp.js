@@ -135,6 +135,46 @@ async function main() {
   const countText = await evalJs('document.querySelector("#count").textContent');
   check('header count still reports the whole farm', countText.includes(String(total)), true);
 
+  // --- the folder row ----------------------------------------------------------
+  // Reset first: the checks above deliberately leave a filter applied, and a
+  // filtered grid does not contain the local card at all.
+  await evalJs('clearFilter()');
+  // Only local instances have a workdir the launcher can open, so the row must
+  // appear exactly once on a local card and never on a remote one.
+  const wdInfo = await evalJs(`(() => {
+    const rows = [...document.querySelectorAll('#list .wd-row')];
+    return {
+      count: rows.length,
+      cards: [...document.querySelectorAll('#list .card')].length,
+      hasButton: rows.every(r => Boolean(r.querySelector('button'))),
+      localHasIt: (() => {
+        const local = [...document.querySelectorAll('#list .card')]
+          .find(c => (c.querySelector('.card-name')||{}).textContent === 'local');
+        return local ? Boolean(local.querySelector('.wd-row')) : null;
+      })(),
+      remoteHasIt: [...document.querySelectorAll('#list .card')]
+        .filter(c => (c.querySelector('.card-name')||{}).textContent !== 'local')
+        .some(c => Boolean(c.querySelector('.wd-row'))),
+    };
+  })()`);
+  check('folder row renders for the local instance', wdInfo.localHasIt, true);
+  check('folder row never appears on a remote card', wdInfo.remoteHasIt, false);
+  check('every folder row has an open button', wdInfo.hasButton, true);
+
+  // Clicking it must reach the backend. The path opened here is the real
+  // workdir, so this does open one Explorer window - that is the point of the
+  // button, and it is the only way to prove the wiring rather than the markup.
+  const clicked = await evalJs(`(async () => {
+    const btn = document.querySelector('#list .wd-row button');
+    if (!btn) return 'no button';
+    btn.click();
+    await new Promise(r => setTimeout(r, 900));
+    const t = document.querySelector('.toast');
+    return t ? t.textContent : '(no toast)';
+  })()`);
+  check('clicking open reports success rather than an error',
+    /已打开/.test(String(clicked)), true);
+
   ws.close();
   const failed = results.filter((r) => !r.ok).length;
   console.log(`\n  ${results.length - failed} passed, ${failed} failed`);

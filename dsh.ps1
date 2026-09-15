@@ -698,6 +698,20 @@ function Get-RecordedPid([string]$InstanceName, [string]$Kind) {
 # Local instance
 # --------------------------------------------------------------------------
 
+function Get-InstWorkdir($Inst) {
+  <# The directory a local instance actually starts in.
+
+     Resolution used to live inline in the start path, so only a launch knew the
+     answer; status and the panel could not say where an instance would open.
+     That matters because a stale workdir silently starts a session in the wrong
+     project - the exact failure the roadmap calls out. Falls back to $HOME when
+     the configured directory is missing, matching what start does, so the value
+     reported is always the value that would be used. #>
+  $wd = Get-InstProp $Inst 'workdir' $env:USERPROFILE
+  if (-not $wd -or -not (Test-Path $wd)) { return $env:USERPROFILE }
+  return $wd
+}
+
 function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
   $configuredPort = [int](Get-InstProp $Inst 'port' 3080)
   $port = $configuredPort
@@ -745,6 +759,9 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
     Name = $Inst.name; Kind = 'local'; Port = $port
     State = $state; Detail = $detail; Http = $httpCode
     Url = $url
+    # Where this instance starts sessions. Only meaningful locally: a remote
+    # workdir lives on the other machine and cannot be opened from here.
+    Workdir = (Get-InstWorkdir $Inst)
     DshVersion = $localVersion
     LatestVersion = $latestVersion
     UpdateAvailable = $updateAvailable
@@ -819,8 +836,9 @@ function Start-LocalInstance($Inst, [switch]$Quiet, [int]$PortOverride = 0) {
 
   if (Test-Path $log) { Move-Item -Force $log "$log.1" -ErrorAction SilentlyContinue }
 
-  $workdir = Get-InstProp $Inst 'workdir' $env:USERPROFILE
-  if (-not (Test-Path $workdir)) { $workdir = $env:USERPROFILE }
+  # Resolution lives in Get-InstWorkdir so status reports the same directory a
+  # launch would use, instead of duplicating the rule here.
+  $workdir = Get-InstWorkdir $Inst
 
   # The panel backend keeps the environment it was started with, so a
   # DEEPSEEK_API_KEY added to the user environment afterwards never reaches the

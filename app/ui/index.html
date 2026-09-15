@@ -286,6 +286,23 @@
   }
   .url-row button { padding: 3px 7px; font-size: 11px; }
 
+  /* Working directory. Deliberately quieter than the url-row above it: the URL
+     is what you click to work, the folder is context. Same box so the two read
+     as a pair of facts about the instance rather than competing calls to
+     action. */
+  .wd-row {
+    display: flex; align-items: center; gap: 7px; margin: -6px 0 14px;
+    padding: 5px 10px; border-radius: 8px;
+    background: rgba(255,255,255,.022); border: 1px solid var(--line-soft);
+  }
+  .wd-row .wd-ico { display: flex; width: 13px; height: 13px; color: var(--text-faint); flex: none; }
+  .wd-row .wd-ico svg { width: 100%; height: 100%; }
+  .wd-row .u {
+    flex: 1; min-width: 0; font-family: var(--mono); font-size: 11px;
+    color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .wd-row button { padding: 2px 7px; font-size: 10.5px; flex: none; }
+
   /* Update notice. Amber so it reads as "attention" rather than "broken": the
      instance is working fine, it is simply not the newest release. */
   .update-row {
@@ -806,9 +823,42 @@ function card(it) {
       (it.detail ? '<div class="meta"><span class="chip">' + esc(it.detail) + "</span></div>" : "") +
       (it.state === "unreachable" && it.hint ? hintRow(it) : "") +
       (upNow && it.url ? urlRow(it.url) : "") +
+      (it.workdir && it.kind === "local" ? workdirRow(it) : "") +
       (it.updateAvailable ? updateRow(it) : "") +
       '<div class="actions">' + actions + "</div>" +
     "</div>";
+}
+
+/* Where this instance will start sessions, with a button to open the folder.
+   Shown for local instances only - the backend omits workdir for remotes on
+   purpose, because that directory is on the other machine.
+
+   This exists because a stale workdir silently starts a session in the wrong
+   project, and until now nothing in the panel said which directory was in use.
+   The path is abbreviated from the front: the tail is the part that identifies
+   the project, and the full path is in the tooltip. */
+function workdirRow(it) {
+  const parts = String(it.workdir).split(/[\\/]+/).filter(Boolean);
+  const tail = parts.slice(-2).join("\\");
+  const short = parts.length > 2 ? "…\\" + tail : tail;
+  return '<div class="wd-row">' +
+      '<span class="wd-ico">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+          '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>' +
+      "</span>" +
+      '<span class="u" title="' + esc(it.workdir) + '">' + esc(short) + "</span>" +
+      '<button class="ghost" title="在资源管理器中打开 ' + esc(it.workdir) + '" ' +
+        'onclick="revealDir(this.dataset.p)" data-p="' + esc(it.workdir) + '">打开</button>' +
+    "</div>";
+}
+
+async function revealDir(path) {
+  try {
+    await api("/api/reveal", { method: "POST", body: JSON.stringify({ path: path }) });
+    toast("已打开文件夹", "ok");
+  } catch (e) {
+    toast("打不开：" + e.message, "warn");
+  }
 }
 
 /* The classified failure plus a concrete next step.

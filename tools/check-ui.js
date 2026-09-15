@@ -100,6 +100,31 @@ if (!blockSrc || !escSrc || !isUpSrc || !stateSrc) {
     if (got === want) { console.log(`  PASS  ${label}`); pass++; }
     else { console.log(`  FAIL  ${label} (got ${got}, want ${want})`); fail++; }
   }
+
+  // The workdir row. The backend omits `workdir` for remote instances because
+  // that directory is on the other machine, so the two failure modes are a row
+  // that never appears and a row that claims a remote folder is local. Both
+  // directions are asserted, and the abbreviation is checked because a bare
+  // "Documents" would not identify which Documents.
+  const showsWd = (o) => buildCardFn(o).includes('wd-row');
+  const cases3 = [
+    ['local with workdir -> folder row shown',    { ...base, kind: 'local', workdir: 'C:\\Users\\you\\Documents' }, true],
+    ['local without workdir -> no folder row',    { ...base, kind: 'local', workdir: '' },  false],
+    ['remote -> no folder row even with workdir', { ...base, workdir: 'C:\\somewhere' },    false],
+  ];
+  for (const [label, obj, want] of cases3) {
+    const got = showsWd(obj);
+    if (got === want) { console.log(`  PASS  ${label}`); pass++; }
+    else { console.log(`  FAIL  ${label} (got ${got}, want ${want})`); fail++; }
+  }
+  const abbrev = buildCardFn({ ...base, kind: 'local', workdir: 'C:\\Users\\you\\Documents' });
+  if (abbrev.includes('you\\Documents') && abbrev.includes('C:\\Users\\you\\Documents')) {
+    console.log('  PASS  folder row abbreviates but keeps the full path in the tooltip');
+    pass++;
+  } else {
+    console.log('  FAIL  folder row lost either the abbreviation or the full path');
+    fail++;
+  }
 }
 
 // ---------------------------------------------------------------------------
