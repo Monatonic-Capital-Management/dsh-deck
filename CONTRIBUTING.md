@@ -141,6 +141,35 @@ Two traps in that area, both already paid for:
   self-referential shortcut, and the failure surfaced as a bare COMException.
   The variables are now `$lnkFile` and `$targetPath`.
 
+## Sandboxing a launcher test
+
+`check-local-install.ps1` and `check-app-stop.ps1` both hide something the
+launcher looks for, and both were wrong at first in the same direction: the
+sandbox leaked and the test quietly measured the host instead of the sandbox.
+
+What it takes to actually hide dsh, in the order `Find-DshLocal` looks:
+
+| What it checks | How to close it |
+| --- | --- |
+| `%USERPROFILE%\.npmrc` for a `prefix=` line | set `USERPROFILE` to a scratch dir |
+| `%APPDATA%\npm` | set `APPDATA` to a scratch dir |
+| `npm root -g` | stub `npm.exe` earlier on PATH, answering that one subcommand |
+| `Get-Command dsh` | keep the real PATH out of the child |
+
+The `$USERPROFILE` row is the easy one to miss and the one that cost the most
+time: `dsh.ps1` derives `$HomeDir` from it at startup, and a real `~/.npmrc`
+with a custom prefix sends every lookup straight back to the real install.
+
+Two more things that only work one way:
+
+- **A stub must be a real executable.** `& taskkill.exe` and `& node` resolve an
+  exact file-name match before PATHEXT, so a `.cmd` on PATH does not win — hence
+  the compiled C# shims. Measured, twice.
+- **Patch a mutant in a copy, never in place.** Rewriting a `.ps1` from
+  PowerShell drops the UTF-8 BOM unless you write the bytes back explicitly, and
+  mutation-testing the real file one time left it unparseable for the rest of the
+  run; `fix-bom.ps1` caught it, which is exactly why that gate exists.
+
 If you add tests, the highest-value target remains `app/server.js` — pure
 functions like `parseJson` and `Compare-Version` are easy to cover and have
 already carried bugs.

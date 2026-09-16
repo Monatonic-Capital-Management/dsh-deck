@@ -366,10 +366,10 @@ global npm package is a decision about the computer you are sitting at, so
 ```
 
 What is new is that the panel now says the same thing, and offers the fix. A
-local card with no dsh gets **安装 dsh** where 启动 would be — an enabled 启动
-that could never succeed was the silent half of this problem — plus a row naming
-the cause and a button to copy the manual command. The button runs one command
-and nothing else:
+local card with no usable dsh gets **安装 dsh** where 启动 would be — an enabled
+启动 that could never succeed was the silent half of this problem — plus a row
+naming the cause and a button to copy the manual command. The button runs one
+command and nothing else:
 
 ```powershell
 .\dsh.ps1 -Command install -Target local    # npm install -g @deepseek-ai/dsh
@@ -381,6 +381,27 @@ running the binary afterwards rather than trusting npm's exit code — npm can
 report success and leave a half-extracted tree. If dsh is already present it is a
 no-op that says so; changing a version is `upgrade`, which is explicit for the
 same reason.
+
+### "Not installed" and "installed but cannot run" are different problems
+
+A dsh that is present but silent is not a dsh that is missing, and the two need
+opposite advice. dsh's shebang is `#!/usr/bin/env node`, so an older Node runs it
+and it exits `0` printing **nothing** — no error, no version. Reinstalling is the
+one thing that cannot help, because the install would succeed.
+
+So the card separates them:
+
+```
+dsh 未安装。可点「安装 dsh」自动装好，或手动运行：npm i -g @deepseek-ai/dsh
+dsh 已安装但无法运行（…\bin.js）。dsh 需要 Node >= 22.19.0，当前是 v18.20.4。升级 Node 后再试。
+```
+
+and `install` refuses the second case on the spot instead of spending two
+`npm --force` runs discovering it. Both branches carry a non-zero exit code:
+
+```powershell
+.\dsh.ps1 -Command install -Target local   # 1 when nothing was made installable
+```
 
 ## Troubleshooting
 

@@ -137,8 +137,40 @@ public class NpmStub {
   # first branch it tries - the sandbox was never as sealed as it looked.
   $fakeAppData = Join-Path $scratch 'appdata'
   New-Item -ItemType Directory -Force -Path (Join-Path $fakeAppData 'npm') | Out-Null
+  # And a sandbox home, because $HomeDir comes from USERPROFILE and a real
+  # `~/.npmrc` with a prefix= line is consulted before anything else.
+  $fakeHome = Join-Path $scratch 'home'
+  New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
 
-  function Invoke-Launcher([string[]]$Arguments, [string]$NpmMode, [switch]$WithSystemPath, [switch]$RealAppData) {
+  # A sandbox node. Only present when a section asks for it (`node -v` is how the
+  # "installed but cannot run" hint reports the version in use), and silent for
+  # dsh's own `--version` unless the mode says otherwise. That silence IS the
+  # defect being reproduced: dsh's shebang is `#!/usr/bin/env node`, so an older
+  # Node runs it and it exits 0 printing nothing.
+  #
+  # It has to be a real executable named node.exe: the launcher runs `node <bin>`,
+  # so `& node` resolves through PATH and PATHEXT, and a .cmd earlier on PATH does
+  # NOT win - the same measurement that forced a compiled shim in
+  # tools/check-app-stop.ps1.
+  $nodeStubSrc = @'
+using System;
+public class NodeStub {
+  public static int Main(string[] args) {
+    string mode = Environment.GetEnvironmentVariable("DSH_STUB_NODE_MODE");
+    if (args.Length > 0 && (args[0] == "-v" || args[0] == "--version")) {
+      Console.WriteLine(mode == "ok" ? "v22.22.0" : "v18.20.4");
+      return 0;
+    }
+    if (mode != "ok") { return 0; }
+    Console.WriteLine("0.1.0-rc.6");
+    return 0;
+  }
+}
+'@
+  $nodeExeStub = Join-Path $fakeBin 'node.exe'
+  Add-Type -TypeDefinition $nodeStubSrc -OutputAssembly $nodeExeStub -OutputType ConsoleApplication -ErrorAction Stop
+
+  function Invoke-Launcher([string[]]$Arguments, [string]$NpmMode, [switch]$WithSystemPath, [string]$NodeMode) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $clone 'dsh.ps1')`"") + $Arguments
@@ -147,14 +179,24 @@ public class NpmStub {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    # Only the stub, plus System32 for the OS itself. No Program Files\nodejs, no
-    # AppData npm prefix: this is what "dsh is not installed" looks like.
+    # The stubs plus System32 for the OS itself, and nothing else. The npm stub
+    # matters more than it looks: dsh.ps1 asks `npm root -g` as its last resort
+    # for finding dsh, so with a real npm on PATH the sandbox found the machine's
+    # REAL global prefix and the REAL dsh, and every "dsh is missing" assertion
+    # was quietly measuring this host instead.
     $path = "$fakeBin;$env:WINDIR\System32;$env:WINDIR"
     if ($WithSystemPath) { $path = "$fakeBin;$env:PATH" }
     $psi.EnvironmentVariables['PATH'] = $path
     $psi.EnvironmentVariables['DSH_STUB_NPM_PREFIX'] = $fakeNpm
-    if (-not $RealAppData) { $psi.EnvironmentVariables['APPDATA'] = $fakeAppData }
+    $psi.EnvironmentVariables['APPDATA'] = $fakeAppData
+    # USERPROFILE too, and this was the last leak: dsh.ps1 resolves $HomeDir from
+    # it at startup and Find-DshLocal reads `$HOME\.npmrc` for a prefix= line
+    # BEFORE it looks at APPDATA or asks npm. With the real profile, this machine's
+    # real npm-global prefix was found there and the real dsh came back - which is
+    # why the "absent" assertions kept failing while the sandbox looked sealed.
+    $psi.EnvironmentVariables['USERPROFILE'] = $fakeHome
     if ($NpmMode) { $psi.EnvironmentVariables['DSH_STUB_NPM_MODE'] = $NpmMode }
+    if ($NodeMode) { $psi.EnvironmentVariables['DSH_STUB_NODE_MODE'] = $NodeMode }
     $proc = [System.Diagnostics.Process]::Start($psi)
     $out = $proc.StandardOutput.ReadToEnd()
     $err = $proc.StandardError.ReadToEnd()
@@ -172,41 +214,46 @@ public class NpmStub {
   $noDshArgs = @('-Command', 'status', '-Json', '-NoProbe', '-Config', $config)
 
   # -------------------------------------------------------------------------
-  # 1. the reported state: dsh absent, and said out loud
+  # 1. a dsh that cannot run is never presented as usable
   # -------------------------------------------------------------------------
-  Write-Host "`n=== 1. a machine with no dsh reports it, rather than looking healthy ==="
-  $r = Invoke-Launcher $noDshArgs $null
+  Write-Host "`n=== 1. an unusable dsh is reported, not covered up ==="
+  # The assertion is on the CONTRACT, not on one mechanism. On a machine with no
+  # dsh anywhere the notice is "not installed, here is the command"; on one whose
+  # dsh is present but silent - an old Node, docs/lessons.md #5 - it is
+  # "installed but cannot run, upgrade Node". Both are right, and which appears
+  # depends on the host running this suite, so demanding exactly one of them was
+  # asserting the wrong thing (and did fail here, for the honest reason).
+  #
+  # What must hold either way: the card reports the instance unusable, explains
+  # itself, names a next step, and never shows a version it could not read. The
+  # present-but-silent branch is driven deterministically in section 4b.
+  $r = Invoke-Launcher $noDshArgs $null -NodeMode 'ok'
   $row = $null
   try { $row = (($r.Out.Trim() -split "`r?`n" | Where-Object { $_.Trim().StartsWith('[') } | Select-Object -First 1) | ConvertFrom-Json)[0] } catch { }
   Check 'status still answers with a row' ([bool]$row) $r.Text.Trim()
-  Check 'DshInstalled is explicitly false' ($row -and $row.DshInstalled -eq $false) "got: $(if ($row) { $row.DshInstalled } else { 'no row' })"
-  Check 'the card carries a hint naming the fix' ($row -and $row.Hint -match 'dsh 未安装') "got: $(if ($row) { $row.Hint } else { '' })"
-  Check 'the hint names the install command' ($row -and $row.Hint -match 'npm i -g @deepseek-ai/dsh') "got: $(if ($row) { $row.Hint } else { '' })"
-  Check 'the row does not claim a version' ($row -and -not $row.DshVersion) "got: $(if ($row) { $row.DshVersion } else { '' })"
+  Check 'the card does not present the instance as usable' ($row -and $row.DshInstalled -eq $false) "got: $(if ($row) { $row.DshInstalled } else { 'no row' })"
+  Check 'it carries an explanation' ($row -and $row.Hint) "got: $(if ($row) { $row.Hint } else { '' })"
+  Check 'the explanation is one of the two actionable ones' `
+    ($row -and ($row.Hint -match 'dsh 未安装' -or $row.Hint -match '已安装但无法运行')) "got: $(if ($row) { $row.Hint } else { '' })"
+  Check 'it names a next step (the npm command, or the Node requirement)' `
+    ($row -and ($row.Hint -match 'npm i -g @deepseek-ai/dsh' -or $row.Hint -match '22\.19')) "got: $(if ($row) { $row.Hint } else { '' })"
+  Check 'the row does not claim a version it could not read' ($row -and -not $row.DshVersion) "got: $(if ($row) { $row.DshVersion } else { '' })"
 
   # -------------------------------------------------------------------------
   # 2. what the person is told on a machine with no dsh
   # -------------------------------------------------------------------------
   Write-Host "`n=== 2. the missing dsh is reported, and the report matches the card ==="
-  # On what is and is not reproducible here. Hiding dsh from PATH and APPDATA is
-  # not enough: Find-DshLocal's last resort shells out to npm, and npm answers
-  # `root -g` from its own prefix cache rather than from PATH. So on a machine
-  # where dsh IS installed the launcher keeps finding it however the sandbox is
-  # sealed - measured after two wrong guesses, with PATH and APPDATA both faked,
-  # `doctor` still printed the real dsh path.
-  #
-  # This section therefore asserts only what the sandbox can establish, and says
-  # so when it cannot. The "dsh is absent" path is driven for real elsewhere:
-  # section 1 reads the status row the launcher produces from the same sealed
-  # environment, and section 3 exercises install's absent case directly.
-  $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
-  if ($nodeExe) { Copy-Item $nodeExe (Join-Path $fakeBin 'node.exe') -Force }
+  # This section used to explain at length why "dsh is absent" could not be
+  # reproduced here. That turned out to be wrong, and the reason is worth
+  # keeping: the sandbox was leaking. Hiding PATH and APPDATA was not enough,
+  # because Find-DshLocal's last resort shells out to npm and a REAL npm answers
+  # `root -g` from its own prefix cache, so the launcher kept finding this
+  # machine's real dsh. With the npm stub answering that question inside the
+  # sandbox, the absent state is now genuinely reproducible - and section 1
+  # asserts on it. What remains here is the launcher's own report of the result.
   $r = Invoke-Launcher @('-Command', 'doctor', '-NoProbe', '-Config', $config) $null
-  Remove-Item (Join-Path $fakeBin 'node.exe') -Force -ErrorAction SilentlyContinue
-
   if ($r.Text -match 'dsh\s*:\s*NOT FOUND') {
     Check 'doctor reports the missing dsh' $true
-    # From here the sandbox really is clean, so the refusal itself is testable.
     $s = Invoke-Launcher @('-Command', 'start', '-Target', 'local', '-NoOpen', '-Config', $config) $null
     Check 'start refuses rather than half-starting' ($s.Text -match 'cannot start') $s.Text.Trim()
     Check 'the refusal names dsh and the exact install command' ($s.Text -match 'dsh not found' -and $s.Text -match 'npm i -g @deepseek-ai/dsh') $s.Text.Trim()
@@ -223,7 +270,7 @@ public class NpmStub {
 
   # 3a. npm refuses
   Remove-Item $marker -Force -ErrorAction SilentlyContinue
-  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) 'fail'
+  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) 'fail' -NodeMode 'ok'
   Check 'the npm stub ran' (Test-Path $marker) "no marker at $marker"
   if (Test-Path $marker) {
     $calls = @(Get-Content $marker)
@@ -235,7 +282,7 @@ public class NpmStub {
 
   # 3b. npm "succeeds" but dsh still does not run - the false-success case
   Remove-Item $marker -Force -ErrorAction SilentlyContinue
-  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) 'succeed'
+  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) 'succeed' -NodeMode 'ok'
   $calls = if (Test-Path $marker) { @(Get-Content $marker) } else { @() }
   Check 'npm was asked twice (the --force retry)' ($calls.Count -ge 2) "calls: $($calls.Count)"
   Check 'a still-missing dsh is NOT reported as installed' ($r.Out -match '"ok":false') "stdout: $($r.Out.Trim())"
@@ -275,11 +322,74 @@ public class NpmStub {
     # -Json is deliberately NOT passed here: it sets -Quiet, which suppresses the
     # "already installed" line, and asserting on a message that quiet mode
     # removes was the first version of this check failing for the wrong reason.
-    $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -WithSystemPath
+    #
+    # -WithSystemPath brings the real PATH back, and with it the machine's real
+    # dsh; the fake home and APPDATA still point Find-DshLocal at the sandbox
+    # first, so the run below is a genuine "already installed" only because the
+    # system PATH is what supplies it.
+    $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -WithSystemPath -NodeMode 'ok'
     Check 'install succeeds when dsh is already there' ($r.Code -eq 0) "exit=$($r.Code) $($r.Text.Trim())"
     Check 'it says so rather than pretending to install' ($r.Text -match 'already installed') $r.Text.Trim()
     Check 'it reports the version it found' ($r.Text -match '\d+\.\d+') $r.Text.Trim()
   }
+
+  # -------------------------------------------------------------------------
+  # 4b. present but silent - installed, and unable to run
+  # -------------------------------------------------------------------------
+  Write-Host "`n=== 4b. a dsh that is installed but cannot run is not called 'missing' ==="
+  # The real case: dsh's shebang is `#!/usr/bin/env node`, so an older Node runs
+  # it and it exits 0 printing nothing (docs/lessons.md #5, #6). "Absent" and
+  # "cannot run" need different advice - telling this user to run `npm i -g`
+  # sends them through a reinstall that succeeds and changes nothing - and the
+  # install path must not spend two --force npm runs discovering that.
+  #
+  # The shared stubs do the work: the npm stub answers `root -g` with the sandbox
+  # prefix (so Find-DshLocal finds the sandbox dsh, not this machine's), and the
+  # node stub is silent for dsh's `--version` unless DSH_STUB_NODE_MODE=ok.
+  # A dsh that is present at the prefix Find-DshLocal checks first.
+  $presentDsh = Join-Path $fakeAppData 'npm\node_modules\@deepseek-ai\dsh\lib'
+  New-Item -ItemType Directory -Force -Path $presentDsh | Out-Null
+  Set-Content -Path (Join-Path $presentDsh 'bin.js') -Value '// present, not runnable' -Encoding ASCII
+
+  # Control: with a node that CAN run dsh, the sandbox dsh reports a version.
+  # Without this, "DshInstalled is false" below could pass merely because the
+  # sandbox never finds that dsh at all.
+  $r = Invoke-Launcher $noDshArgs $null -NodeMode 'ok'
+  $row = $null
+  try { $row = (($r.Out.Trim() -split "`r?`n" | Where-Object { $_.Trim().StartsWith('[') } | Select-Object -First 1) | ConvertFrom-Json)[0] } catch { }
+  Check 'control: the sandbox dsh is found and runnable' ($row -and $row.DshInstalled -eq $true) "got: $(if ($row) { $row.DshInstalled } else { 'no row' })"
+  Check 'control: its version is reported' ($row -and $row.DshVersion -match '0\.1\.0-rc\.6') "got: $(if ($row) { $row.DshVersion } else { '' })"
+
+  # Now the same dsh under an older Node: present, silent, unusable.
+  $r = Invoke-Launcher $noDshArgs $null -NodeMode 'old'
+  $row = $null
+  try { $row = (($r.Out.Trim() -split "`r?`n" | Where-Object { $_.Trim().StartsWith('[') } | Select-Object -First 1) | ConvertFrom-Json)[0] } catch { }
+  Check 'a silent dsh is not reported as installed' ($row -and $row.DshInstalled -eq $false) "got: $(if ($row) { $row.DshInstalled } else { 'no row' })"
+  Check 'the hint says installed-but-cannot-run, not missing' ($row -and $row.Hint -match '已安装但无法运行') "got: $(if ($row) { $row.Hint } else { '' })"
+  Check 'the hint names the Node requirement' ($row -and $row.Hint -match '22\.19') "got: $(if ($row) { $row.Hint } else { '' })"
+  Check 'the hint reports the Node actually in use' ($row -and $row.Hint -match '18\.20\.4') "got: $(if ($row) { $row.Hint } else { '' })"
+  # The important one: the advice must not be the command that cannot help.
+  Check 'the hint does NOT tell them to reinstall dsh' ($row -and $row.Hint -notmatch 'npm i -g') "got: $(if ($row) { $row.Hint } else { '' })"
+
+  Remove-Item $marker -Force -ErrorAction SilentlyContinue
+  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -NodeMode 'old'
+  $calls = if (Test-Path $marker) { @(Get-Content $marker) } else { @() }
+  Check 'install refuses, knowing a reinstall cannot help' ($r.Code -ne 0) "exit=$($r.Code)"
+  Check 'it says the dsh is installed but does not run' ($r.Text -match 'does not run') $r.Text.Trim()
+  Check 'it points at Node as the fix' ($r.Text -match 'upgrade Node') $r.Text.Trim()
+  Check 'and npm is never invoked' ($calls.Count -eq 0) "npm calls: $($calls.Count) -> $($calls -join ' | ')"
+
+  # The human-readable path must carry the verdict too. It used to discard it
+  # ("it already printed the detail") and exit 0, so a caller could not tell a
+  # failed install from a successful one - while the -Json branch, above, got
+  # that right. Both are asserted because they are separate code paths.
+  $rj = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) $null -NodeMode 'old'
+  Check '-Json answers ok:false' ($rj.Out -match '"ok":false') "stdout: $($rj.Out.Trim())"
+  Check '-Json exits non-zero' ($rj.Code -ne 0) "exit=$($rj.Code)"
+  Check 'the plain output exits non-zero as well' ($r.Code -ne 0) "exit=$($r.Code)"
+
+  # Put the sandbox back the way section 5 expects it.
+  Remove-Item (Join-Path $fakeAppData 'npm\node_modules') -Recurse -Force -ErrorAction SilentlyContinue
 
   # -------------------------------------------------------------------------
   # 5. the panel routes a local install calls
@@ -290,6 +400,10 @@ public class NpmStub {
   # backend is started from the clone, and DSH_LAUNCHER_CONFIG points it at the
   # scratch config, so the instance it reports is the sandbox one; it is stopped
   # again before the test ends.
+  # The real node, resolved here: section 2 used to copy it into the sandbox and
+  # no longer does, so $nodeExe was empty and Start-Process rejected it.
+  $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if (-not $nodeExe) { Write-Host '  SKIP  node not found, cannot start a backend'; }
   $env:DSH_LAUNCHER_CONFIG = $config
   $backend = Start-Process -FilePath $nodeExe -ArgumentList @((Join-Path $clone 'app\server.js')) `
                -WorkingDirectory $clone -WindowStyle Hidden -PassThru

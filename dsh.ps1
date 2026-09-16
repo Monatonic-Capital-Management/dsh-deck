@@ -765,10 +765,27 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
   # failure this tool's contract forbids. DshInstalled says it outright, and the
   # hint is the same sentence the launcher prints on the command line, so the
   # card and `doctor` cannot disagree.
+  #
+  # "Cannot run" is not the same as "absent", and the difference decides which
+  # advice is right. A dsh that is present but silent means the Node under it is
+  # too old (docs/lessons.md #5: `#!/usr/bin/env node`, so an older Node makes
+  # dsh exit 0 with no output). Telling that user to run `npm i -g` sends them
+  # through a reinstall that succeeds and changes nothing - the tool would be
+  # wrong about the fix, which is worse than saying nothing.
   $dshInstalled = [bool]$localVersion
   $hint = ''
   if (-not $dshInstalled) {
-    $hint = 'dsh 未安装。可点「安装 dsh」自动装好，或手动运行：npm i -g @deepseek-ai/dsh'
+    $bin = Find-DshLocal
+    if ($bin) {
+      $node = Get-NodeExe
+      $nodeV = ''
+      if ($node) { $nodeV = (& $node -v 2>&1 | Out-String).Trim() }
+      $hint = "dsh 已安装但无法运行（$bin）。dsh 需要 Node >= 22.19.0" +
+              $(if ($nodeV) { "，当前是 $nodeV" } else { '，当前没有可用的 node' }) +
+              '。升级 Node 后再试。'
+    } else {
+      $hint = 'dsh 未安装。可点「安装 dsh」自动装好，或手动运行：npm i -g @deepseek-ai/dsh'
+    }
   }
 
   return [pscustomobject]@{
@@ -2526,6 +2543,24 @@ function Install-LocalDsh([switch]$Quiet) {
     return $true
   }
 
+  # Present but silent is NOT absent, and reinstalling cannot fix it.
+  #
+  # A dsh that is on disk and reports no version is the old-Node case: its
+  # shebang is `#!/usr/bin/env node`, so an older Node runs it and it exits 0
+  # with no output (docs/lessons.md #5, #6). Installing again would succeed and
+  # change nothing, and the --force retry below would spend two npm runs proving
+  # it - so say what is actually wrong and stop.
+  $present = Find-DshLocal
+  if ($present) {
+    $node = Get-NodeExe
+    $nodeV = ''
+    if ($node) { $nodeV = (& $node -v 2>&1 | Out-String).Trim() }
+    Write-Err "dsh is installed at $present but does not run"
+    Write-Info "dsh needs Node >= 22.19.0$(if ($nodeV) { "; this machine has $nodeV" } else { '; no node was found on PATH' })"
+    Write-Info 'installing dsh again will not help - upgrade Node, then re-run this'
+    return $false
+  }
+
   $target = Get-LatestDshVersion
   $spec = if ($target) { "@deepseek-ai/dsh@$target" } else { '@deepseek-ai/dsh' }
   if (-not $Quiet) { Write-Info "installing $spec into the npm global prefix" }
@@ -2587,6 +2622,12 @@ function Invoke-Install([string[]]$Names, [switch]$Quiet) {
       if (-not (Install-LocalDsh -Quiet:$Quiet)) { $allOk = $false }
     }
   }
+  # $allOk, not @($allOk). The caller asks `[bool](Invoke-Install ...)` for the
+  # -Json verdict, and a single-element ARRAY is truthy whatever it contains:
+  # [bool]@($false) is $true, so `install -Json` answered ok:true and exited 0
+  # for a failed install. Only single boolean is safe here, because both
+  # Install-LocalDsh and Install-RemoteService emit their own objects (bools and
+  # strings) into the pipeline - writing a bare `$false` would make $allOk true.
   return $allOk
 }
 
@@ -3254,12 +3295,17 @@ try {
                 if ($Json) { Write-Json $insts } else { Invoke-List } }
     # ok reflects what actually happened, not that the command was invoked: a
     # failed or empty deploy used to answer {"ok":true} with exit 0. The
-    # non-Json path discards the verdict because it already printed the detail.
+    # Both branches carry the verdict to the exit code. The non-Json path used to
+    # discard it with `[void](...)` because "it already printed the detail" - but
+    # a detail on screen is not something a script can read. `install -Target
+    # local` printed "[fail] dsh is installed ... but does not run" and then
+    # exited 0, so a caller could not tell a failed install from a good one; the
+    # -Json branch has enforced the opposite since the verdict was introduced.
     'install' { if ($Json) {
                   $ok = [bool](Invoke-Install $Target -Quiet)
                   Write-Json @{ ok = $ok }
                   if (-not $ok) { exit 1 }
-                } else { [void](Invoke-Install $Target) } }
+                } else { if (-not (Invoke-Install $Target)) { exit 1 } } }
     'check'   { Invoke-Check }
     'upgrade' { Invoke-Upgrade $Target -DryRun:([bool]$DryRun) }
     'balance' { Invoke-Balance -Refresh:([bool]$Refresh) }
