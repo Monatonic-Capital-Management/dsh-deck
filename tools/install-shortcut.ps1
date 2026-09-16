@@ -35,6 +35,21 @@ if ($Remove) {
 
 if (-not (Test-Path $script)) { throw "cannot find dsh.ps1 at $script" }
 
+# Explorer caches a shortcut's icon against its icon PATH, so a re-install that
+# reuses the same .ico filename keeps drawing the old bitmap on the desktop and
+# in the Start Menu. SHCNE_ASSOCCHANGED is the shell's own "icons changed" ping
+# and makes it re-read them (a swap to a different colourway depends on this).
+$notify = @'
+using System;
+using System.Runtime.InteropServices;
+public static class DshIconRefresh {
+  [DllImport("shell32.dll")]
+  public static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+  public static void Now() { SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero); }
+}
+'@
+try { Add-Type -TypeDefinition $notify -ErrorAction Stop } catch { }
+
 # powershell.exe is present on every supported Windows version, unlike pwsh.
 $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 # The panel's own mark (a dolphin). Falls back to the node binary and then to
@@ -57,6 +72,8 @@ foreach ($target in @($lnkPath, $lnkStart)) {
   $lnk.Save()
   if (-not $Quiet) { Write-Host "  created $target" }
 }
+
+try { [DshIconRefresh]::Now() } catch { }
 
 if (-not $Quiet) {
   Write-Host ''
