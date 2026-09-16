@@ -2613,27 +2613,105 @@ function Open-AppWindow([string]$Url) {
   }
 }
 
+function Test-ProcessAlive([int]$ProcId) {
+  <# Is this pid a live process right now?
+
+     Asked through the process table rather than Get-Process because the answer
+     is used as a VERDICT - "did the backend actually die?" - and a verdict may
+     not depend on whether the name lookup happens to succeed. See
+     Stop-App for the bug that made this necessary.
+
+     Defaults to "still alive" when the query itself cannot answer. The safe
+     direction is to leave the runtime file alone and say so, because forgetting
+     a live backend leaves a process holding the panel's port: the next launch
+     cannot adopt it (the state file is gone) and silently starts a second one. #>
+  if ($ProcId -le 0) { return $false }
+  try {
+    return [bool](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcId" -ErrorAction Stop)
+  } catch {
+    return $true
+  }
+}
+
 function Stop-App {
   <# Stop the app backend, and optionally the browser window that points at it.
      The window is identified by its command line containing our app URL, so we
-     never kill an unrelated browser the user has open. #>
+     never kill an unrelated browser the user has open.
+
+     The bug this function now guards against, reproduced 6 times in 8 runs:
+     `taskkill /T` can kill the parent and still print
+     "ERROR: The process with PID n (child process of PID m) could not be
+     terminated." on stderr. Because $ErrorActionPreference is 'Stop' at the top
+     of this file, that stderr line is a TERMINATING error (the same rule
+     Invoke-B64 and Get-NetstatListeners already document), so the assignment
+     below it never ran, the surrounding catch swallowed the exception, and a
+     backend that had in fact been killed was reported as "app backend was not
+     running". The runtime file was deleted anyway, so the next launch could not
+     adopt anything and simply started a second backend on a new port.
+
+     So the verdict comes from the PROCESS TABLE, not from taskkill's exit code
+     and not from its stderr: a kill is a success exactly when the pid is gone
+     afterwards, which is true both for a clean kill and for that half-failure,
+     and false when the process really did survive ("Access is denied"). #>
   $runtimeFile = Join-Path $StateDir 'app.json'
   $stopped = $false
+  $survivorPid = 0
   if (Test-Path $runtimeFile) {
+    # Only the read is guarded here. An earlier version wrapped the kill in the
+    # same try, so any failure while killing was reported as "could not read
+    # <runtime file>" - a message that names the wrong thing and sends the
+    # reader looking at a file that is perfectly fine.
+    $rt = $null
     try {
       $rt = Get-Content $runtimeFile -Raw -Encoding UTF8 | ConvertFrom-Json
-      if ($rt.pid) {
-        $p = Get-Process -Id ([int]$rt.pid) -ErrorAction SilentlyContinue
-        if ($p -and $p.ProcessName -eq 'node') {
-          & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null
-          Write-Ok "app backend stopped (pid $($p.Id))"
-          $stopped = $true
-        }
+    } catch {
+      Write-Diag "  [warn] could not read $runtimeFile : $($_.Exception.Message)" 'Yellow'
+    }
+
+    $targetPid = 0
+    if ($rt -and $rt.pid) { $targetPid = [int]$rt.pid }
+    $p = $null
+    if ($targetPid -gt 0) { $p = Get-Process -Id $targetPid -ErrorAction SilentlyContinue }
+    if ($p -and $p.ProcessName -eq 'node') {
+      # Continue, not Stop, for the duration of the call: that keeps taskkill's
+      # stderr ordinary text so its output can be shown when a kill does not
+      # take, instead of becoming the terminating error this whole function
+      # exists to survive.
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      $killOut = ''
+      try { $killOut = & taskkill.exe /PID $targetPid /T /F 2>&1 | Out-String }
+      catch { $killOut = $_.Exception.Message }
+      finally { $ErrorActionPreference = $prevEap }
+
+      # Both sides of the tree are being torn down asynchronously, so wait for
+      # the pid to leave the process table instead of reading the table once and
+      # reporting whatever it said at that instant.
+      $deadline = (Get-Date).AddSeconds(5)
+      while ((Get-Date) -lt $deadline -and (Test-ProcessAlive $targetPid)) {
+        Start-Sleep -Milliseconds 200
       }
-    } catch { }
-    Remove-Item $runtimeFile -Force -ErrorAction SilentlyContinue
+      if (Test-ProcessAlive $targetPid) {
+        $survivorPid = $targetPid
+        Write-Err "app backend did not stop (pid $targetPid is still running)"
+        foreach ($line in ($killOut.Trim() -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 3)) {
+          Write-C "    $($line.Trim())" 'DarkGray'
+        }
+        Write-Info "stop it by hand with: taskkill /PID $targetPid /T /F"
+      } else {
+        Write-Ok "app backend stopped (pid $targetPid)"
+        $stopped = $true
+      }
+    }
+
+    # Deleting the runtime file is what makes the backend unreachable for the
+    # next launch, so it only goes once the process is known to be gone. While
+    # it survives, the file stays and keeps the survivor adoptable.
+    if (-not (Test-ProcessAlive $survivorPid)) {
+      Remove-Item $runtimeFile -Force -ErrorAction SilentlyContinue
+    }
   }
-  if (-not $stopped) { Write-Info 'app backend was not running' }
+  if (-not $stopped -and $survivorPid -eq 0) { Write-Info 'app backend was not running' }
 
   # Close only our own app window. The profile directory identifies our
   # browser instance, so a user's normal Chrome is never touched. Child
@@ -2652,6 +2730,11 @@ function Stop-App {
     } catch { }
   }
   if ($killed -gt 0) { Write-Ok "closed $killed app window process(es)" }
+
+  # A stop that did not stop anything must not answer like one that did: the
+  # caller scripts `app -Stop` and needs a non-zero exit to notice. Returned
+  # rather than exited here so the dispatcher stays the only place that exits.
+  return ($survivorPid -eq 0)
 }
 
 function Start-TrayLoop([int]$IntervalSeconds = 20) {
@@ -3030,7 +3113,12 @@ function Write-Json($Obj) {
 try {
   switch ($Command) {
     'menu'    { Invoke-Menu }
-    'app'     { if ($PSBoundParameters.ContainsKey('Stop') -and [bool]$Stop) { Stop-App } else { Invoke-App } }
+    'app'     { if ($PSBoundParameters.ContainsKey('Stop') -and [bool]$Stop) {
+                  # The verdict has to reach the exit code: a stop that left the
+                  # backend alive is a failure, and reporting it as success is
+                  # how a surviving backend ends up shadowing the next launch.
+                  if (-not (Stop-App)) { exit 1 }
+                } else { Invoke-App } }
     # `tray` starts or toggles, `tray-start` is the explicit form for scripted
     # callers, and `tray-stop` exists because a trailing -Stop switch would be
     # collected into the positional target list instead of reaching this switch.

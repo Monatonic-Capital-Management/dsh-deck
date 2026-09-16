@@ -103,6 +103,11 @@ dsh.ps1 -Command menu                   terminal control panel
 Useful switches: `-NoOpen`, `-AppWindow`, `-Json`, `-NoProbe`, `-LocalPort 3097`,
 `-Lines 200`, `-Follow`, `-Config <path>`, `-Refresh`, `-SshConfigPath <path>`.
 
+`app -Stop` exits non-zero when the backend it was asked to stop is still
+running, so a script can tell a real stop from a failed one. It also keeps
+`state/app.json` in that case — the file is what lets the next launch adopt the
+surviving backend instead of starting a second one on a second port.
+
 `-Target` takes instance names, and accepts a comma-separated list as well as
 separate arguments (`-Target local,DuckServer`). `status -Target <name>` probes
 only that instance, and `-NoProbe` skips the HTTP liveness check entirely.
@@ -274,6 +279,7 @@ tools/
   fix-bom.ps1            keeps .ps1 files readable by PowerShell 5.1
   make-icon.ps1          renders the .ico from the .svg (needs Chrome or Edge)
   install-shortcut.ps1   creates the desktop shortcut
+  check-*.js|ps1         the test suites (see CONTRIBUTING.md)
 docs/
   architecture.md        how the pieces fit, and why
   configuration.md       every config field

@@ -106,6 +106,15 @@ jobs:
         # is why this is a unit test on the extracted functions.
         run: node tools/check-status-cache.js
 
+      - name: Stop-App contract (the verdict, not taskkill's exit code)
+        # `app -Stop` reported "app backend was not running" while the backend
+        # was still alive, because taskkill printed a "could not be terminated"
+        # line on stderr after it had already killed the parent and
+        # $ErrorActionPreference='Stop' turned that line into a terminating
+        # error. Static half of the guard, so it still runs where taskkill does
+        # not exist; the windows job below proves the behaviour end to end.
+        run: node tools/check-stop-contract.js
+
       - name: Machine-readable output stays machine-readable
         shell: pwsh
         run: |
@@ -123,6 +132,26 @@ jobs:
           $parsed = $text | ConvertFrom-Json
           if ($parsed.Count -lt 1) { throw "expected at least one instance, got $($parsed.Count)" }
           Write-Host "ok  list -Json parsed $($parsed.Count) instance(s) with no chatter on stdout"
+
+  # ---------------------------------------------------------------------------
+  # Windows-only behavioural checks. The lint job parses PowerShell; this job
+  # RUNS it, because the bug it covers lived in the gap between the two: the
+  # sources parsed, the contract was documented in comments, and `app -Stop`
+  # still lied about having stopped the panel.
+  # ---------------------------------------------------------------------------
+  windows-behaviour:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: app -Stop actually stops the panel
+        # Starts a real panel from a throwaway copy of this checkout, then
+        # intercepts taskkill with a compiled shim that emits the exact stderr
+        # line that caused the defect. Asserts the verdict comes from the
+        # process table: a backend that died is reported as stopped, a backend
+        # that survived is reported as a failure and keeps its runtime file.
+        shell: pwsh
+        run: pwsh -File tools/check-app-stop.ps1
 
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a

@@ -77,8 +77,34 @@ remote host.
 
 ## Testing
 
-There is no test suite yet; verification so far has been end to end against real
-hosts. If you add tests, the highest-value target is `app/server.js` — pure
+The suites live in `tools/` and CI runs all of them except the two that need a
+deployment (`check-panel.ps1`, which asserts on the author's own instance names,
+and the live half of `check-status-cache.js`, which skips itself when no backend
+is up).
+
+```powershell
+node tools\check-ui.js              # panel rendering logic, extracted from index.html
+node tools\check-status-cache.js    # the status cache's three guarantees
+node tools\check-stop-contract.js   # app -Stop's verdict contract (static, cross-platform)
+node tools\check-no-deps.js         # the backend uses only Node builtins
+.\tools\fix-bom.ps1                 # BOM + parse gate, under PowerShell 5.1
+.\tools\check-app-stop.ps1          # Windows: app -Stop end to end, against a real panel
+```
+
+`check-app-stop.ps1` is worth knowing about before you touch `Stop-App`. It
+compiles a shim named `taskkill.exe` that forwards to the real one and then
+prints the `could not be terminated` line on stderr — the exact thing that made
+`app -Stop` report a killed backend as "was not running". Point it at any
+launcher to check the test is still meaningful:
+
+```powershell
+.\tools\check-app-stop.ps1 -LauncherPath <path to a dsh.ps1>
+```
+
+Against the pre-fix launcher it fails 12 of 24 checks, which is the only real
+evidence that the suite can see the bug it was written for.
+
+If you add tests, the highest-value target remains `app/server.js` — pure
 functions like `parseJson` and `Compare-Version` are easy to cover and have
 already carried bugs.
 
@@ -87,6 +113,7 @@ Manual smoke test before opening a pull request:
 ```powershell
 .\dsh.ps1 -Command status               # all instances report sanely
 .\dsh.ps1 -Command app                  # panel opens, cards clickable
+.\dsh.ps1 -Command app -Stop            # exits 0 AND the backend is really gone
 .\dsh.ps1 -Command doctor               # no unexpected errors
 .\dsh.ps1 -Command start -Target local  # lifecycle still works
 ```

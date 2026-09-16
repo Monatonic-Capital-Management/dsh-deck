@@ -225,7 +225,8 @@ the failure looked like an npm problem rather than a PowerShell one.
 **Fix:** set `$ErrorActionPreference = 'Continue'` for the duration of the native
 call and restore it afterwards. There is no per-invocation flag for this; the
 preference is inherited by the child. The same trait is why `taskkill` needed
-wrapping (see #14) — it writes "process not found" to stderr.
+wrapping (see #21) — it writes "process not found" to stderr — and why wrapping
+alone turned out not to be enough.
 
 ## 18. A switch can be declared, documented, and completely inert
 
@@ -316,6 +317,68 @@ because it is internal and coupling to it would break silently on a dsh update.
 **Rule:** before building a feature on top of a claim about another tool, verify
 the claim against that tool. "The data exists" does not imply "the capability is
 missing".
+
+## 21. Wrapping taskkill was not enough — the verdict has to come from the process table
+
+#17 says `taskkill` needs `$ErrorActionPreference = 'Continue'` around it because
+it writes to stderr. `Stop-App` never got that treatment, and the failure it
+caused is worse than a stray message.
+
+Reproduced 6 times in 8 runs:
+
+```
+[ok]   app backend running on port 60210          <- started
+  [info] app backend was not running              <- stopped?? 
+  [ok]   closed 1 app window process(es)
+backend alive after stop: True                    <- but it is still serving
+still listening on 60210: True
+```
+
+`taskkill /PID n /T /F` can kill the parent and still print, on stderr:
+
+```
+ERROR: The process with PID 37276 (child process of PID 36936) could not be terminated.
+```
+
+That line arrives as a **terminating error** under `'Stop'`, so the
+`$stopped = $true` on the next line never ran, the surrounding `catch { }`
+swallowed the exception, and the old code then deleted `state/app.json` anyway.
+The consequences compound: the panel window closes, the user believes they
+stopped it, the backend keeps polling, and because the runtime file is gone the
+next launch cannot adopt it and starts a **second** backend on a new port. Two
+panels, two ports, one of them invisible.
+
+The subtlety, and the reason #17's fix does not cover it: **allowing for stderr
+is not the same as having a verdict.** With `Continue` in place the command
+succeeds and stderr is just text — but "did it work?" is still unanswered by
+anything the command says. Exit code 0 does not prove the process died; exit
+code 1 does not prove it survived, because `taskkill /T` reports failure when any
+*descendant* fails while the parent is already gone. So the verdict is read from
+the process table:
+
+```powershell
+while ((Get-Date) -lt $deadline -and (Test-ProcessAlive $targetPid)) { Start-Sleep -Milliseconds 200 }
+if (Test-ProcessAlive $targetPid) { ...report the survivor, keep app.json... }
+```
+
+**Fixes, all three needed:**
+1. `Continue` around the kill, so stderr cannot terminate the function.
+2. Success/failure decided by whether the pid is *gone*, polled, because the tree
+   is torn down asynchronously.
+3. A survivor keeps `state/app.json` and makes `app -Stop` exit non-zero — the
+   file is the only thing that makes the orphan adoptable, and deleting it is
+   what turned one orphan into a second backend.
+
+**Guards:** `tools/check-app-stop.ps1` proves it end to end by compiling a shim
+named `taskkill.exe` that forwards to the real one and then prints exactly that
+stderr line; it fails 12 of 24 checks against the pre-fix launcher.
+`tools/check-stop-contract.js` is the cheap cross-platform half, so the contract
+still holds on Linux CI where `taskkill` does not exist.
+
+An instrumentation note worth keeping: the first hypothesis was that the process
+lookup failed intermittently. Inserting a `Write-Diag` inside the `catch` — rather
+than reasoning about it — produced the real `RemoteException` immediately. The
+observable symptom ("was not running" while it was) pointed at the wrong line.
 
 ## The pattern
 
