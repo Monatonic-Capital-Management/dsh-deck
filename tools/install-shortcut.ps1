@@ -58,19 +58,32 @@ $icon = Join-Path $root 'app\icon\dsh-deck.ico'
 if (-not (Test-Path $icon)) { $icon = 'C:\Program Files\nodejs\node.exe' }
 if (-not (Test-Path $icon)) { $icon = $ps }
 
-$arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Command app"
+# $exeTarget, not $target: this script previously used $target as the loop
+# variable below, and setting TargetPath = $target then wrote the SHORTCUT's own
+# path into the link's target. The shell declines to save a self-referential
+# shortcut, so the installer failed with a bare COMException while the fallback
+# path looked fine. Names on both sides now say which is which.
+$exeTarget = Join-Path $root 'Start.exe'
+if (Test-Path $exeTarget) {
+  $targetPath = $exeTarget
+  $arguments  = ''
+  $icon       = $exeTarget
+} else {
+  $targetPath = $ps
+  $arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Command app"
+}
 
-foreach ($target in @($lnkPath, $lnkStart)) {
-  $dir = Split-Path -Parent $target
+foreach ($lnkFile in @($lnkPath, $lnkStart)) {
+  $dir = Split-Path -Parent $lnkFile
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  $lnk = $wsh.CreateShortcut($target)
-  $lnk.TargetPath       = $ps
+  $lnk = $wsh.CreateShortcut($lnkFile)
+  $lnk.TargetPath       = $targetPath
   $lnk.Arguments        = $arguments
   $lnk.WorkingDirectory = $root
   $lnk.IconLocation     = "$icon,0"
   $lnk.Description      = 'dsh-deck - choose and use local or remote dsh instances'
   $lnk.Save()
-  if (-not $Quiet) { Write-Host "  created $target" }
+  if (-not $Quiet) { Write-Host "  created $lnkFile" }
 }
 
 try { [DshIconRefresh]::Now() } catch { }

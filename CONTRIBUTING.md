@@ -104,6 +104,36 @@ launcher to check the test is still meaningful:
 Against the pre-fix launcher it fails 12 of 24 checks, which is the only real
 evidence that the suite can see the bug it was written for.
 
+## Start.exe is a generated artifact
+
+`Start.exe` is committed so a fresh clone has a double-clickable entry point
+carrying the panel's icon, and so a shortcut can point at a file that is
+actually in the repo rather than at absolute paths baked into a `.lnk`. It is
+built from `tools\exe\DshDeck.cs`:
+
+```powershell
+.\tools\build-exe.ps1 -Verify
+```
+
+**Rebuild it whenever `dsh.ps1`, `app\server.js`, `app\ui\index.html` or the
+icon changes**, or the committed binary ships a stale panel. The script compares
+timestamps and skips the work when nothing moved, so running it before a commit
+is cheap. CI cannot check this for you — the exe is a binary — which is exactly
+why the build is one command with no SDK, no Visual Studio and no NuGet: csc.exe
+from the .NET Framework is enough. `-Verify` inspects the built file for the
+embedded resource names and the icon, the parts that fail invisibly.
+
+Two traps in that area, both already paid for:
+
+- **Resource names are embedded verbatim.** csc's `-resource:<file>,<name>` does
+  not prefix `<name>` with the root namespace; that belongs to `.resx`
+  compilation, a different code path. `DshDeck.cs` searches for `payload/...`,
+  which is exactly what the build script passes.
+- **`$target` in `install-shortcut.ps1` was the shortcut's own path.** Reusing
+  that name for the link's target made the shell refuse to save a
+  self-referential shortcut, and the failure surfaced as a bare COMException.
+  The variables are now `$lnkFile` and `$targetPath`.
+
 If you add tests, the highest-value target remains `app/server.js` — pure
 functions like `parseJson` and `Compare-Version` are easy to cover and have
 already carried bugs.
@@ -116,6 +146,7 @@ Manual smoke test before opening a pull request:
 .\dsh.ps1 -Command app -Stop            # exits 0 AND the backend is really gone
 .\dsh.ps1 -Command doctor               # no unexpected errors
 .\dsh.ps1 -Command start -Target local  # lifecycle still works
+.\Start.exe                             # the double-click path still works
 ```
 
 ## Reporting a bug

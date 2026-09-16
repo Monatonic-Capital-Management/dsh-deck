@@ -13,3 +13,7 @@
 *.png binary
 *.ico binary
 *.jpg binary
+
+# The compiled entry point is a binary artifact: never line-ending convert it.
+Start.exe binary
+

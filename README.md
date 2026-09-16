@@ -49,13 +49,19 @@ No `npm install` step, and the app backend has **zero dependencies**.
 
 ## Quick start
 
-Double-click **`Start.cmd`** — that is the whole thing. Windows runs a `.cmd` by
-default, so it is the one file in the repo that works from a fresh clone with no
-terminal, no PATH edit and no configuration. (Double-clicking `dsh.ps1` instead
-opens it in an editor: Windows does not execute `.ps1` files by default, which is
-how "just double-click it" quietly fails.)
+Double-click **`Start.exe`** — that is the whole thing. It carries the panel's
+own icon, so the natural move after that is right-click → **Send to → Desktop
+(create shortcut)**, or:
 
-Or from a terminal:
+```powershell
+.\tools\install-shortcut.ps1        # desktop + Start Menu, pointing at Start.exe
+```
+
+`Start.cmd` does the same job with no compiled binary at all, for a checkout
+where the exe cannot run — see [What it needs](#what-it-needs-and-what-it-does-not).
+
+Whichever you use, the panel opens with a single `local` instance. Or from a
+terminal, which is also what everything below assumes:
 
 ```powershell
 git clone https://github.com/Monatonic-Capital-Management/dsh-deck.git
@@ -63,7 +69,7 @@ cd dsh-deck
 .\dsh.ps1 -Command app
 ```
 
-Either way you get the panel with a single `local` instance. To add a server:
+To add a server:
 
 ```powershell
 # register a host by its ssh alias or user@host (picks a free tunnel port)
@@ -73,15 +79,28 @@ Either way you get the panel with a single `local` instance. To add a server:
 .\dsh.ps1 -Command start -Target prod
 ```
 
-For a desktop and Start Menu icon with the panel's own artwork:
+### Why an exe, and not a committed shortcut
+
+A Windows shortcut stores **absolute** paths — the target, the working
+directory and the icon are all baked in as full paths, inside a binary file. A
+`.lnk` committed to this repo would therefore point at whichever machine
+generated it, and `*.lnk` is git-ignored for that reason. An exe has the
+opposite property: it is a file *in* the repo, so the shortcut points at the
+checkout rather than at one machine, and the icon travels with it.
+
+`Start.exe` is built from `tools\exe\DshDeck.cs` by `tools\build-exe.ps1`, using
+the C# compiler that ships with Windows — no SDK, no Visual Studio, no NuGet.
+The source is committed beside the binary so it can be rebuilt and read rather
+than merely trusted:
 
 ```powershell
-.\tools\install-shortcut.ps1
+.\tools\build-exe.ps1 -Verify     # rebuild only if inputs changed, then inspect
 ```
 
-A Windows shortcut stores **absolute** paths, so it is generated per machine
-rather than committed — regenerate it after moving the checkout. `Start.cmd` is
-the location-independent entry point and needs no installation at all.
+It is a thin wrapper, not a second implementation: it finds `dsh.ps1` (in the
+checkout, or from the payload embedded in the binary when the exe has been
+copied somewhere on its own) and hands over to it. All real behaviour stays in
+one place.
 
 ## Command line
 
@@ -278,7 +297,8 @@ reason for the control panel to look broken. The key is never logged or echoed.
 ## Project layout
 
 ```
-Start.cmd                double-click this: opens the panel, works from any path
+Start.exe                double-click this: the panel. Shortcut-friendly (has the icon)
+Start.cmd                the same entry point without a compiled binary
 dsh.ps1                  the launcher: all dsh logic lives here
 dsh.cmd                  PATH-friendly shim for the CLI
 app/
@@ -289,6 +309,8 @@ app/
 remote/
   dsh-web-service.sh     systemd wrapper deployed to servers
 tools/
+  exe/DshDeck.cs         source of Start.exe (a thin wrapper over dsh.ps1)
+  build-exe.ps1          compiles it with the .NET Framework csc, no SDK
   fix-bom.ps1            keeps .ps1 files readable by PowerShell 5.1
   make-icon.ps1          renders the .ico from the .svg (needs Chrome or Edge)
   install-shortcut.ps1   creates the desktop shortcut
@@ -316,6 +338,7 @@ What it does need, and how it gets it:
 | --- | --- | --- |
 | Windows 10/11 | you | the launcher is PowerShell; see the roadmap for Linux/macOS |
 | PowerShell 5.1 | Windows | built in |
+| .NET Framework 4.x | Windows | only for `Start.exe`; `Start.cmd` needs nothing |
 | Node.js 18+ | **you install it** | the panel backend runs on it |
 | Chrome or Edge | you have it | for the chromeless app window; falls back to the default browser |
 | `dsh` itself | **you install it** | `npm i -g @deepseek-ai/dsh`, and **22.19+ on any host running dsh** |
@@ -324,6 +347,8 @@ What it does need, and how it gets it:
 
 So: the **code** is self-contained, the **runtime is not**. Nothing is vendored,
 and nothing needs to be — but a machine with no Node still cannot run the panel.
+`Start.exe` in particular is not a self-contained panel: it embeds the launcher
+and the UI, and still runs the backend with the `node` on your PATH.
 
 ### Local instances are not auto-installed
 
