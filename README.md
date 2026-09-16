@@ -49,13 +49,21 @@ No `npm install` step, and the app backend has **zero dependencies**.
 
 ## Quick start
 
+Double-click **`Start.cmd`** — that is the whole thing. Windows runs a `.cmd` by
+default, so it is the one file in the repo that works from a fresh clone with no
+terminal, no PATH edit and no configuration. (Double-clicking `dsh.ps1` instead
+opens it in an editor: Windows does not execute `.ps1` files by default, which is
+how "just double-click it" quietly fails.)
+
+Or from a terminal:
+
 ```powershell
 git clone https://github.com/Monatonic-Capital-Management/dsh-deck.git
 cd dsh-deck
 .\dsh.ps1 -Command app
 ```
 
-That opens the panel with a single `local` instance. To add a server:
+Either way you get the panel with a single `local` instance. To add a server:
 
 ```powershell
 # register a host by its ssh alias or user@host (picks a free tunnel port)
@@ -65,11 +73,15 @@ That opens the panel with a single `local` instance. To add a server:
 .\dsh.ps1 -Command start -Target prod
 ```
 
-Create a desktop shortcut for the panel:
+For a desktop and Start Menu icon with the panel's own artwork:
 
 ```powershell
 .\tools\install-shortcut.ps1
 ```
+
+A Windows shortcut stores **absolute** paths, so it is generated per machine
+rather than committed — regenerate it after moving the checkout. `Start.cmd` is
+the location-independent entry point and needs no installation at all.
 
 ## Command line
 
@@ -266,6 +278,7 @@ reason for the control panel to look broken. The key is never logged or echoed.
 ## Project layout
 
 ```
+Start.cmd                double-click this: opens the panel, works from any path
 dsh.ps1                  the launcher: all dsh logic lives here
 dsh.cmd                  PATH-friendly shim for the CLI
 app/
@@ -289,6 +302,48 @@ docs/
 
 Generated and machine-specific (`state/`, `logs/`, `hosts.json`,
 `browser-profile/`) is git-ignored.
+
+## What it needs, and what it does not
+
+This repo has **no build step, no `npm install`, no `package.json`, no
+lockfile, and no `node_modules`** — there is not one third-party package in it.
+`app/server.js` is required by CI to use Node builtins only, and the tests
+enforce that, so "clone and run" stays true.
+
+What it does need, and how it gets it:
+
+| Need | Who provides it | Notes |
+| --- | --- | --- |
+| Windows 10/11 | you | the launcher is PowerShell; see the roadmap for Linux/macOS |
+| PowerShell 5.1 | Windows | built in |
+| Node.js 18+ | **you install it** | the panel backend runs on it |
+| Chrome or Edge | you have it | for the chromeless app window; falls back to the default browser |
+| `dsh` itself | **you install it** | `npm i -g @deepseek-ai/dsh`, and **22.19+ on any host running dsh** |
+| `ssh` | Windows OpenSSH | remote instances only |
+| A DeepSeek API key | dsh's own login | only for the balance badge and for agent runs |
+
+So: the **code** is self-contained, the **runtime is not**. Nothing is vendored,
+and nothing needs to be — but a machine with no Node still cannot run the panel.
+
+### Local instances are not auto-installed
+
+`install` and `start` provision a **remote** host completely: Node, dsh, a
+systemd user service, linger, and a verification that it serves. That path is
+for Linux and is gated per instance by `"autoInstall": false`.
+
+For the **local** machine there is deliberately no auto-install. `start` checks
+for dsh, and if it is missing it stops with a named cause and the exact command:
+
+```
+[fail] local cannot start: dsh not found. Install with: npm i -g @deepseek-ai/dsh
+```
+
+Installing a global npm package — and potentially Node before it — is a bigger
+decision than the tool should take on its own on the machine you are sitting at,
+which is why this is a report rather than an action. The consequence to know
+about: if you launch the panel on a machine without dsh, the `local` card is
+there but its 启动 button cannot succeed, and the reason is in the log rather
+than on the card. `dsh.ps1 -Command doctor` names it directly.
 
 ## Troubleshooting
 
