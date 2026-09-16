@@ -7,8 +7,6 @@ A desktop control panel for **every** [DeepSeek Harness](https://github.com/deep
 > terminal open, build an SSH tunnel, re-derive an auth URL — and do it again on
 > every machine. **dsh-deck makes reaching dsh one click, everywhere.**
 
-![The control panel](docs/images/panel.png)
-
 Each card is one instance. Green means running: click **打开** and dsh opens in its
 own window while the panel stays put. Red means stopped: click **启动** and dsh-deck
 starts the server, brings up the SSH tunnel, redeems the auth token and hands you

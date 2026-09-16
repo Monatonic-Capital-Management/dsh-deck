@@ -4,7 +4,7 @@
 # make the launcher spawn a doomed second process and still report success.
 # Deliberately never touches port 3080, which serves the user's own GUI.
 $ErrorActionPreference = 'Continue'
-Set-Location '$PSScriptRoot\..'
+Set-Location (Join-Path $PSScriptRoot '..')
 
 $TestPort = 3123
 $AltPort  = 3124
@@ -29,7 +29,7 @@ foreach ($p in @($TestPort, $AltPort)) { Kill-Port $p }
 Start-Sleep -Seconds 2
 Write-Host ("  {0} listening: {1}" -f $TestPort, (Listening $TestPort))
 
-$dsh = 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\lib\bin.js'
+`$dsh = Join-Path `$env:APPDATA 'npm\node_modules\@deepseek-ai\dsh\lib\bin.js'
 $node = 'C:\Program Files\nodejs\node.exe'
 
 # ---------------------------------------------------------------- case 1
@@ -39,7 +39,7 @@ Write-Host '  starting an "external" dsh, as if the user ran npx dsh web themsel
 $extLog = Join-Path $env:TEMP 'ext_dsh.log'
 Remove-Item $extLog -Force -ErrorAction SilentlyContinue
 $ext = Start-Process -FilePath $node -ArgumentList @($dsh, 'web', '--port', "$TestPort", '--no-open') `
-  -WorkingDirectory '$env:USERPROFILE' -WindowStyle Hidden -PassThru `
+  -WorkingDirectory $env:USERPROFILE -WindowStyle Hidden -PassThru `
   -RedirectStandardOutput $extLog -RedirectStandardError "$env:TEMP\ext_dsh.err"
 $deadline = (Get-Date).AddSeconds(60)
 while ((Get-Date) -lt $deadline) {
