@@ -47,6 +47,9 @@
   balance  show the DeepSeek account balance
   url      print an instance's current authenticated URL
   doctor   diagnose the environment and every configured host
+  node-path
+           which node runs the panel and dsh, and whether this tool installed it
+           (-Ensure downloads a suitable Node when none usable is found)
   tray  tray-start  tray-stop
            notification-area icon; alerts when an instance changes state
   tray-loop  internal: the detached process that owns the tray's message loop
@@ -77,7 +80,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','balance','url','doctor')]
+  [ValidateSet('menu','app','tray','tray-start','tray-stop','tray-loop','status','start','stop','restart','open','logs','add','list','install','check','upgrade','balance','url','doctor','node-path')]
   [string]$Command = 'menu',
 
   [Parameter(Position = 1)]
@@ -112,6 +115,14 @@ param(
   [string]$SshConfigPath,  # override the ssh config used for host discovery
 
   [int]$TrayInterval = 20, # seconds between tray state polls
+
+  # node-path: download a suitable Node when none usable is found. Without it the
+  # verb only reports, so asking "which node am I using?" never installs anything.
+  [switch]$Ensure,
+
+  # node-path -Ensure: download even when a runtime is already present, which is the
+  # only way to replace one that reports a version and then fails at real work.
+  [switch]$Force,
 
   [switch]$DryRun,         # upgrade: report what would change, change nothing
 
@@ -358,6 +369,218 @@ function Find-FreePort([int]$Start) {
   return $Start
 }
 
+function Get-ManagedNode {
+  <# A Node this tool installed itself, or $null.
+
+     Windows had no equivalent of the remote path's "install Node into ~/.local",
+     so a machine without Node could not run anything - including the panel
+     backend, which is a Node program. This is where that Node lives:
+     %LOCALAPPDATA%\dsh-deck\node\<version>\, per-user so no administrator is
+     involved, one directory per version so an upgrade can never half-overwrite a
+     runtime dsh is currently executing.
+
+     Returned as the node.exe path, because that is how every caller wants it. #>
+  $root = Get-ManagedNodeRoot
+  if (-not (Test-Path $root)) { return $null }
+  foreach ($dir in @(Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Descending)) {
+    $exe = Join-Path $dir.FullName 'node.exe'
+    if (Test-Path $exe) { return $exe }
+  }
+  return $null
+}
+
+function Get-ManagedNodeRoot {
+  <# Where a self-installed Node lives. Deliberately beside the exe's extraction
+     cache (%LOCALAPPDATA%\dsh-deck) rather than inside the checkout: a runtime is
+     machine state, not repository content, and putting it in the repo would make
+     it per-clone and would show up as an untracked directory. #>
+  $base = $env:LOCALAPPDATA
+  if (-not $base) { $base = Join-Path $HomeDir 'AppData\Local' }
+  return (Join-Path $base 'dsh-deck\node')
+}
+
+function Get-NodeExe {
+  <# The node that runs everything: the panel backend and dsh alike.
+
+     A managed Node wins over the system one, and that ordering is the point.
+     dsh needs >= 22.19.0 while the backend only needs 18+, so a machine with an
+     old system Node would otherwise keep failing in the silent way
+     docs/lessons.md #5 documents even though a perfectly good Node is sitting in
+     %LOCALAPPDATA%. One Node, chosen once, used by both. #>
+  $managed = Get-ManagedNode
+  if ($managed) { return $managed }
+  $n = Get-Command node -ErrorAction SilentlyContinue
+  if ($n) { return $n.Source }
+  $p = Join-Path $env:ProgramFiles 'nodejs\node.exe'
+  if (Test-Path $p) { return $p }
+  return $null
+}
+
+function Get-NodeVersionOf([string]$NodeExe) {
+  <# The version a given node.exe reports, or ''. Never throws: this runs on the
+     status path, where a missing or unreadable node is a reportable state, not
+     an error. #>
+  if (-not $NodeExe -or -not (Test-Path $NodeExe)) { return '' }
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = (& $NodeExe -v 2>&1 | Out-String).Trim() } finally { $ErrorActionPreference = $prevEap }
+  if ($out -match '(v?\d+\.\d+\.\d+[^\s]*)') { return $Matches[1] }
+  return ''
+}
+
+# The Node this tool installs for itself. Pinned, and older than the version the
+# remote path installs only by accident of history - both are the 22.x LTS line,
+# which is what dsh's `>=22.19.0` engine needs.
+$script:ManagedNodeVersion = 'v22.23.2'
+$script:NodeMinVersion     = '22.19.0'
+
+function Ensure-ManagedNode {
+  <# Make sure a Node new enough for dsh exists, downloading one if it does not.
+
+     Why this exists at all: the panel backend is a Node program, and dsh needs
+     Node >= 22.19.0, so on a machine with no Node nothing can run and nothing
+     can fix itself - the install button had nothing to install dsh WITH. The
+     remote path has always solved this (it fetches a tarball into ~/.local, no
+     root); this is the Windows half of the same idea.
+
+     Two rules this follows, both from the project's own posture:
+
+       * Integrity is checked before anything is executed. A 34 MB binary from
+         the network is a trust decision, so the SHA-256 is verified against the
+         official SHASUMS256.txt first and the download is deleted if it does not
+         match. (The remote path does not verify yet; that is a gap, noted in
+         docs/lessons.md rather than quietly copied here.)
+       * Nothing is installed into the system. It goes to
+         %LOCALAPPDATA%\dsh-deck\node\<version>\, per-user, no administrator, and
+         never over an existing runtime: an upgrade writes a NEW version
+         directory, so a dsh currently executing the old node.exe cannot be
+         invalidated mid-run.
+
+     Returns the node.exe path on success, $null on failure. #>
+  param([switch]$Quiet, [switch]$Force)
+
+  $existing = Get-ManagedNode
+  if ($existing -and -not $Force) {
+    $v = Get-NodeVersionOf $existing
+    if ($v -and (Compare-Version $v $script:NodeMinVersion) -ge 0) { return $existing }
+  }
+
+  $version = $script:ManagedNodeVersion
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+  $stem  = "node-$version-win-$arch"
+  $root  = Join-Path (Get-ManagedNodeRoot) $version
+  $dest  = Join-Path $root 'node.exe'
+
+  if ((Test-Path $dest) -and -not $Force) {
+    if (-not $Quiet) { Write-Ok "node $version is already installed at $root" }
+    return $dest
+  }
+
+  $baseUrl = "https://nodejs.org/dist/$version"
+  # $env:DSH_NODE_MIRROR overrides the distribution root, so a machine that cannot
+  # reach nodejs.org (an internal mirror, or an offline copy of the two files) can
+  # still be provisioned. Honouring it is also what lets the test suite point this
+  # at a local fixture instead of downloading 34 MB, which makes the checksum
+  # failure path - the one that matters most - actually testable.
+  if ($env:DSH_NODE_MIRROR) {
+    $baseUrl = $env:DSH_NODE_MIRROR.TrimEnd('/')
+    if (-not $Quiet) { Write-Info "using mirror: $baseUrl" }
+  }
+  $zipName = "$stem.zip"
+  if (-not $Quiet) {
+    Write-Info "downloading Node $version ($arch)"
+    Write-Info "  into $root"
+    Write-Info '  the system Node, if any, is not touched'
+  }
+
+  $staging = Join-Path ([IO.Path]::GetTempPath()) ("dsh-node-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  New-Item -ItemType Directory -Force -Path $staging | Out-Null
+  try {
+    $zip  = Join-Path $staging $zipName
+    $sums = Join-Path $staging 'SHASUMS256.txt'
+
+    # Integrity first. If the checksum list cannot be fetched, stop: downloading
+    # an executable without a way to verify it is exactly the kind of quiet
+    # compromise this tool refuses elsewhere.
+    try {
+      Invoke-WebRequest -Uri "$baseUrl/SHASUMS256.txt" -OutFile $sums -UseBasicParsing -TimeoutSec 60
+    } catch {
+      Write-Err "could not fetch the checksum list: $($_.Exception.Message)"
+      Write-Info "refusing to download and run a binary that cannot be verified"
+      return $null
+    }
+    $expected = ''
+    foreach ($line in (Get-Content $sums -ErrorAction SilentlyContinue)) {
+      if ($line -match "^\s*([0-9a-fA-F]{64})\s+\*?$([regex]::Escape($zipName))\s*$") { $expected = $Matches[1].ToLower(); break }
+    }
+    if (-not $expected) {
+      Write-Err "$zipName is not listed in the checksum file; refusing to install it"
+      return $null
+    }
+
+    try {
+      # Progress off: with large files the progress bar makes this many times
+      # slower in Windows PowerShell, which is not a trade worth making here.
+      $prevProgress = $ProgressPreference
+      $ProgressPreference = 'SilentlyContinue'
+      try { Invoke-WebRequest -Uri "$baseUrl/$zipName" -OutFile $zip -UseBasicParsing -TimeoutSec 1800 }
+      finally { $ProgressPreference = $prevProgress }
+    } catch {
+      Write-Err "download failed: $($_.Exception.Message)"
+      Write-Info "check the network, or install Node 18+ by hand and re-run"
+      return $null
+    }
+
+    $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected) {
+      Write-Err "checksum mismatch for $zipName - the download is not what nodejs.org published"
+      Write-C "    expected $expected" 'DarkGray'
+      Write-C "    actual   $actual"   'DarkGray'
+      return $null
+    }
+    if (-not $Quiet) { Write-Ok "checksum verified (SHA-256 $($expected.Substring(0,12))...)" }
+
+    # Extract into a staging directory, then move the whole thing into place, so
+    # an interrupted extraction can never leave a half-written runtime that a
+    # later run would treat as installed. .NET's extractor rather than
+    # Expand-Archive: the same 2032 files take well under a second this way.
+    $unpack = Join-Path $staging 'x'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpack)
+    $inner = Join-Path $unpack $stem
+    if (-not (Test-Path (Join-Path $inner 'node.exe'))) {
+      Write-Err "the archive did not contain $stem\node.exe"
+      return $null
+    }
+    if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $root) | Out-Null
+    Move-Item -Path $inner -Destination $root -Force
+  } finally {
+    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  # Verify by running it, and by asking npm for a version: a runtime that cannot
+  # run itself is not installed, whatever the filesystem says (the same rule
+  # Invoke-NpmGlobal applies to npm's exit code).
+  $got = Get-NodeVersionOf $dest
+  if (-not $got) {
+    Write-Err "the downloaded Node does not run: $dest"
+    return $null
+  }
+  $npmCmd = Join-Path $root 'npm.cmd'
+  if (-not (Test-Path $npmCmd)) {
+    Write-Err "the downloaded Node has no npm, so dsh cannot be installed with it"
+    return $null
+  }
+  if ((Compare-Version $got $script:NodeMinVersion) -lt 0) {
+    Write-Err "the downloaded Node reports $got, which is older than the required $($script:NodeMinVersion)"
+    return $null
+  }
+  if (-not $Quiet) { Write-Ok "node $got installed at $root (npm included)" }
+  return $dest
+}
+
 function Find-DshLocal {
   <# Locate the dsh entry point on this machine. Prefers the node script path so
      the server can be spawned without a console window.
@@ -368,6 +591,15 @@ function Find-DshLocal {
      over the default, exactly as npm resolves it; `npm root -g` remains the
      fallback for anything neither of those covers (env vars, fnm, pnpm, ...). #>
   $prefixes = @()
+
+  # The prefix a managed Node's npm installs into, FIRST. When this tool provides
+  # the Node it also provides its npm, and that npm's global prefix lives inside
+  # the Node directory - a location none of the branches below would ever look at,
+  # so `install` would put dsh somewhere Find-DshLocal never searched and every
+  # later status read would say "not installed" about a dsh that is right there.
+  $managedDir = Get-ManagedNode
+  if ($managedDir) { $prefixes += (Split-Path -Parent $managedDir) }
+
   $npmrc = Join-Path $HomeDir '.npmrc'
   if (Test-Path $npmrc) {
     foreach ($line in @(Get-Content $npmrc -ErrorAction SilentlyContinue)) {
@@ -387,14 +619,6 @@ function Find-DshLocal {
   }
   $cmd = Get-Command dsh -ErrorAction SilentlyContinue
   if ($cmd) { return $cmd.Source }
-  return $null
-}
-
-function Get-NodeExe {
-  $n = Get-Command node -ErrorAction SilentlyContinue
-  if ($n) { return $n.Source }
-  $p = Join-Path $env:ProgramFiles 'nodejs\node.exe'
-  if (Test-Path $p) { return $p }
   return $null
 }
 
@@ -1120,8 +1344,21 @@ function Upgrade-LocalDsh([string]$Version, [switch]$DryRun) {
 
      Warns rather than upgrading silently when an instance is currently served by
      this dsh: replacing it would disturb a running session. #>
-  $npm = Get-Command npm -ErrorAction SilentlyContinue
-  if (-not $npm) { Write-Err 'npm not found on PATH; cannot upgrade the local dsh'; return $false }
+  # The npm that belongs to the Node actually running dsh, so the upgrade lands in
+  # the same prefix the running dsh came from. With a managed Node, bare `npm`
+  # would be the system one and the upgrade would write to a prefix nothing looks
+  # at - the same mismatch Invoke-NpmGlobal's -NpmExe exists to prevent.
+  $npmExe = ''
+  $node = Get-NodeExe
+  if ($node) {
+    $candidate = Join-Path (Split-Path -Parent $node) 'npm.cmd'
+    if (Test-Path $candidate) { $npmExe = $candidate }
+  }
+  if (-not $npmExe) {
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npm) { $npmExe = $npm.Source }
+  }
+  if (-not $npmExe) { Write-Err 'npm not found; cannot upgrade the local dsh'; return $false }
   $current = Get-LocalDshVersion
   $target = if ($Version) { $Version } else { Get-LatestDshVersion }
   if (-not $target) { Write-Err 'could not determine the target version'; return $false }
@@ -1132,7 +1369,7 @@ function Upgrade-LocalDsh([string]$Version, [switch]$DryRun) {
 
   $spec = "@deepseek-ai/dsh@$target"
   if ($DryRun) {
-    Write-Info "[dry-run] would run: npm install -g $spec"
+    Write-Info "[dry-run] would run: `"$npmExe`" install -g $spec"
     Write-Info "[dry-run] current $current -> $target"
     return $true
   }
@@ -1143,13 +1380,13 @@ function Upgrade-LocalDsh([string]$Version, [switch]$DryRun) {
     Write-Warn2 'a local dsh server is running; it keeps the old code until restarted'
     Write-Warn2 'on Windows its native DLLs stay locked, so a repair pass may be needed'
   }
-  if (-not (Invoke-NpmGlobal $spec)) {
+  if (-not (Invoke-NpmGlobal $spec -NpmExe $npmExe)) {
     # A locked native dependency (sharp/koffi ship .node/.dll files that a running
     # dsh holds open) can produce a half-extracted tree: npm reports the new
     # version while a dependency is missing files. That is not a warning, it is a
     # broken install, and it is repaired by forcing a re-extract.
     Write-Warn2 'first attempt did not leave a working install; retrying with --force'
-    if (-not (Invoke-NpmGlobal $spec -Force)) {
+    if (-not (Invoke-NpmGlobal $spec -Force -NpmExe $npmExe)) {
       Write-Err 'could not install a working dsh'
       return $false
     }
@@ -1161,7 +1398,7 @@ function Upgrade-LocalDsh([string]$Version, [switch]$DryRun) {
   return $true
 }
 
-function Invoke-NpmGlobal([string]$Spec, [switch]$Force) {
+function Invoke-NpmGlobal([string]$Spec, [switch]$Force, [string]$NpmExe) {
   <# Run `npm install -g` and decide success by whether dsh RUNS afterwards, not
      by npm's exit code.
 
@@ -1174,13 +1411,29 @@ function Invoke-NpmGlobal([string]$Spec, [switch]$Force) {
        2. An exit code of 0 does NOT mean a usable install. npm can register the
           new version while leaving a dependency directory incomplete, because a
           file was locked by a running process. Only executing the binary proves
-          otherwise, so that is the check. #>
+          otherwise, so that is the check.
+
+     -NpmExe pins which npm runs. That matters now that a managed Node can exist:
+     `npm` on PATH would be the SYSTEM one, and dsh would land in the system
+     prefix where the managed Node's dsh lookup never looks. When the caller has
+     resolved a Node, it passes that Node's own npm.cmd, and dsh ends up in the
+     matching prefix. #>
   $args = @('install', '-g', $Spec, '--no-fund', '--no-audit')
   if ($Force) { $args += '--force' }
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $out = & npm @args 2>&1 | Out-String
+    if ($NpmExe -and (Test-Path $NpmExe)) {
+      # The managed Node must also be FIRST on PATH for the install itself: npm
+      # spawns node for lifecycle scripts, and the system node may be too old.
+      $nodeDir = Split-Path -Parent $NpmExe
+      $prevPath = $env:PATH
+      $env:PATH = "$nodeDir;$prevPath"
+      try { $out = & $NpmExe @args 2>&1 | Out-String }
+      finally { $env:PATH = $prevPath }
+    } else {
+      $out = & npm @args 2>&1 | Out-String
+    }
   } finally {
     $ErrorActionPreference = $prev
   }
@@ -2524,14 +2777,51 @@ function Install-LocalDsh([switch]$Quiet) {
      reports "dsh not found" and stops. This function exists so that decision can
      be made explicitly - from the panel's 安装 button, or `dsh.ps1 install`.
 
-     What it does NOT do: install Node. Node is what runs the panel backend and
-     is a documented prerequisite; a launcher that silently installs a language
-     runtime is a different kind of tool. If node/npm are absent this reports
-     exactly that and stops. #>
-  $npm = Get-Command npm -ErrorAction SilentlyContinue
-  if (-not $npm) {
-    Write-Err 'npm not found on PATH; cannot install dsh'
-    Write-Info 'install Node.js 18+ first (dsh itself then needs 22.19+ to run), then retry'
+     It does install a Node when there is none usable, because without one there
+     is nothing to install dsh WITH: npm ships inside the Node distribution, so
+     "no Node" and "cannot install dsh" are the same problem, not two. That Node
+     goes to %LOCALAPPDATA% (per-user, no administrator) and is checksum-verified
+     first - see Ensure-ManagedNode. `start` still never downloads anything. #>
+  # Node first, and BEFORE the npm lookup: an unusable npm is usually an
+  # unusable Node, and the fix for both is the same download.
+  $node = Get-NodeExe
+  $nodeV = Get-NodeVersionOf $node
+  $needNode = $true
+  if ($node -and $nodeV -and (Compare-Version $nodeV $script:NodeMinVersion) -ge 0) {
+    $needNode = $false
+  } elseif ($node -and $nodeV) {
+    if (-not $Quiet) { Write-Warn2 "node $nodeV is older than the required $($script:NodeMinVersion)" }
+  }
+
+  if ($needNode) {
+    if (-not $Quiet) {
+      Write-Info 'no usable Node found; dsh needs Node >= 22.19.0 and npm comes with it'
+    }
+    $node = Ensure-ManagedNode -Quiet:$Quiet
+    if (-not $node) {
+      Write-Err 'could not provide a Node runtime, so dsh cannot be installed'
+      Write-Info 'install Node.js 22.19+ by hand from https://nodejs.org/en/download and re-run'
+      return $false
+    }
+    $nodeV = Get-NodeVersionOf $node
+  }
+
+  # npm from the SAME directory as the chosen node, not from PATH: with a managed
+  # Node the system one may be absent entirely, and dsh must end up in the prefix
+  # that the managed Node's npm reports - that is the prefix Find-DshLocal looks
+  # in first once a managed Node is what runs dsh.
+  $npmExe = ''
+  if ($node) {
+    $candidate = Join-Path (Split-Path -Parent $node) 'npm.cmd'
+    if (Test-Path $candidate) { $npmExe = $candidate }
+  }
+  if (-not $npmExe) {
+    $cmd = Get-Command npm -ErrorAction SilentlyContinue
+    if ($cmd) { $npmExe = $cmd.Source }
+  }
+  if (-not $npmExe) {
+    Write-Err 'npm not found, and no Node runtime could be provided'
+    Write-Info 'install Node.js 22.19+ by hand from https://nodejs.org/en/download, then retry'
     return $false
   }
 
@@ -2568,9 +2858,14 @@ function Install-LocalDsh([switch]$Quiet) {
   # Invoke-NpmGlobal decides success by running the binary afterwards, not by
   # npm's exit code: npm can report success and leave a half-extracted tree (see
   # its comment, and docs/lessons.md #16). It also clears the version cache.
-  if (-not (Invoke-NpmGlobal $spec)) {
+  #
+  # $npmExe, not bare `npm`: whichever npm runs decides which global prefix dsh
+  # lands in, and with a managed Node that prefix lives inside the Node directory.
+  # Using the PATH npm here would install dsh into the SYSTEM prefix while the
+  # managed Node's dsh lookup looks somewhere else entirely.
+  if (-not (Invoke-NpmGlobal $spec -NpmExe $npmExe)) {
     Write-Warn2 'the install did not leave a working dsh; retrying with --force'
-    if (-not (Invoke-NpmGlobal $spec -Force)) {
+    if (-not (Invoke-NpmGlobal $spec -Force -NpmExe $npmExe)) {
       Write-Err 'could not install dsh'
       Write-Info 'check the npm output above; a permissions problem on the global prefix is the usual cause'
       return $false
@@ -3133,6 +3428,81 @@ function Invoke-Tray([switch]$Stop) {
   Write-Info 'stop it with: dsh.ps1 -Command tray-stop'
 }
 
+function Invoke-NodePath([switch]$Ensure, [switch]$Force) {
+  <# Which node runs everything, and where it came from.
+
+     Exists because "which Node is this actually using" became a real question
+     once this tool could provide its own: a machine can have a system Node, a
+     managed one, and a stub from a test all at once, and `node -v` in a shell
+     answers about the shell, not about the panel. `-Ensure` makes it act, so the
+     download path is reachable without going through an install of dsh. #>
+  $managed = Get-ManagedNode
+  $chosen  = Get-NodeExe
+  $isManaged = ($managed -and $chosen -and ($managed -eq $chosen))
+  $ensureFailed = $false
+
+  if ($Ensure) {
+    $v = Get-NodeVersionOf $chosen
+    $ok = ($chosen -and $v -and (Compare-Version $v $script:NodeMinVersion) -ge 0)
+    if (-not $ok -or $Force) {
+      # -Force downloads even when a runtime is already present. That is the only
+      # way to replace one that reports a version and then fails at real work: a
+      # version check cannot see that, and neither can this verb.
+      $got = Ensure-ManagedNode -Force:([bool]$Force)
+      if (-not $got) {
+        # Deliberately NOT an early exit: the report below IS the diagnosis, and
+        # bailing out here left a failed download with no word about where a
+        # runtime belongs or what version it must be.
+        $ensureFailed = $true
+      } else {
+        $chosen = $got
+        $managed = Get-ManagedNode
+        $isManaged = $true
+      }
+    }
+  }
+
+  $ver = Get-NodeVersionOf $chosen
+  $result = [pscustomobject]@{
+    ok        = [bool]($chosen -and $ver -and (Compare-Version $ver $script:NodeMinVersion) -ge 0)
+    node      = [string]$chosen
+    version   = $ver
+    managed   = [bool]$isManaged
+    root      = [string](Get-ManagedNodeRoot)
+    minimum   = $script:NodeMinVersion
+    ensureFailed = $ensureFailed
+    # Stated so a report can never read as "fine" on a Node that is too old: the
+    # whole reason this verb exists is that `node -v` elsewhere answers a
+    # different question.
+    requiredFor = 'the panel backend (18+) and dsh (>= 22.19.0)'
+  }
+  if ($Json) { Write-Json $result; if ($ensureFailed) { exit 1 }; return }
+
+  Write-Head 'node'
+  if ($chosen) {
+    Write-C ("  {0,-10} {1}" -f 'in use', $chosen) 'DarkCyan'
+    Write-C ("  {0,-10} {1}" -f 'version', $(if ($ver) { $ver } else { '(did not answer)' })) 'DarkCyan'
+    Write-C ("  {0,-10} {1}" -f 'source', $(if ($isManaged) { "installed by this tool (managed)" } else { 'the system / PATH' })) 'DarkCyan'
+  } else {
+    Write-Warn2 'no node found at all'
+  }
+  Write-Info "managed runtime directory: $($result.root)"
+  Write-Info "minimum for this tool: $($script:NodeMinVersion)  ($($result.requiredFor))"
+  if ($ensureFailed) {
+    Write-Host ''
+    Write-Warn2 'the download did not complete - the reason is above'
+  }
+  if (-not $result.ok) {
+    Write-Host ''
+    Write-Info 'fix it with: dsh.ps1 -Command node-path -Ensure    (downloads a suitable Node)'
+    Write-Info "or install Node $($script:NodeMinVersion)+ yourself from https://nodejs.org/en/download"
+  }
+  Write-Host ''
+  # A failed download is a failure even though the report itself succeeded: the
+  # caller asked for a runtime and did not get one.
+  if ($ensureFailed) { exit 1 }
+}
+
 function Invoke-Doctor([string]$SshConfigOverride) {
   Write-Head 'this machine'
   Write-Info "powershell : $($PSVersionTable.PSVersion)"
@@ -3311,6 +3681,7 @@ try {
     'balance' { Invoke-Balance -Refresh:([bool]$Refresh) }
     'url'     { Invoke-Url $Target }
     'doctor'  { Invoke-Doctor -SshConfigOverride $SshConfigPath }
+    'node-path' { Invoke-NodePath -Ensure:([bool]$Ensure) -Force:([bool]$Force) }
   }
 } catch {
   if ($Json) {

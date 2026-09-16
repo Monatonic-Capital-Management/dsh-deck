@@ -141,6 +141,15 @@ public class NpmStub {
   # `~/.npmrc` with a prefix= line is consulted before anything else.
   $fakeHome = Join-Path $scratch 'home'
   New-Item -ItemType Directory -Force -Path $fakeHome | Out-Null
+  # Sandbox LOCALAPPDATA too: it is where a self-installed Node runtime goes.
+  $fakeLocalAppData = Join-Path $scratch 'localappdata'
+  New-Item -ItemType Directory -Force -Path $fakeLocalAppData | Out-Null
+  # Nothing may be downloaded during a normal run. DSH_NODE_MIRROR points the
+  # managed-Node installer at the sandbox itself, so if any section ever reaches
+  # it, it fails fast on a missing file instead of spending 34 MB of the
+  # machine's bandwidth - and, more importantly, instead of succeeding.
+  $emptyMirror = Join-Path $scratch 'mirror'
+  New-Item -ItemType Directory -Force -Path $emptyMirror | Out-Null
 
   # A sandbox node. Only present when a section asks for it (`node -v` is how the
   # "installed but cannot run" hint reports the version in use), and silent for
@@ -170,7 +179,7 @@ public class NodeStub {
   $nodeExeStub = Join-Path $fakeBin 'node.exe'
   Add-Type -TypeDefinition $nodeStubSrc -OutputAssembly $nodeExeStub -OutputType ConsoleApplication -ErrorAction Stop
 
-  function Invoke-Launcher([string[]]$Arguments, [string]$NpmMode, [switch]$WithSystemPath, [string]$NodeMode) {
+  function Invoke-Launcher([string[]]$Arguments, [string]$NpmMode, [switch]$WithSystemPath, [string]$NodeMode, [switch]$NoNodePath) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $clone 'dsh.ps1')`"") + $Arguments
@@ -186,6 +195,9 @@ public class NodeStub {
     # was quietly measuring this host instead.
     $path = "$fakeBin;$env:WINDIR\System32;$env:WINDIR"
     if ($WithSystemPath) { $path = "$fakeBin;$env:PATH" }
+    # -NoNodePath drops the node stub as well, for the sections about a machine
+    # with no Node at all.
+    if ($NoNodePath) { $path = "$env:WINDIR\System32;$env:WINDIR" }
     $psi.EnvironmentVariables['PATH'] = $path
     $psi.EnvironmentVariables['DSH_STUB_NPM_PREFIX'] = $fakeNpm
     $psi.EnvironmentVariables['APPDATA'] = $fakeAppData
@@ -195,6 +207,16 @@ public class NodeStub {
     # real npm-global prefix was found there and the real dsh came back - which is
     # why the "absent" assertions kept failing while the sandbox looked sealed.
     $psi.EnvironmentVariables['USERPROFILE'] = $fakeHome
+    # LOCALAPPDATA, because this tool now installs a Node runtime under
+    # %LOCALAPPDATA%\dsh-deck\node when nothing usable is found. Without this the
+    # section that runs with no node on PATH downloaded a REAL 34 MB Node into
+    # the machine running the suite - the tests were installing software on the
+    # host. Faking it puts the managed runtime inside the scratch directory, and
+    # the guard below fails loudly if that ever stops being true.
+    $psi.EnvironmentVariables['LOCALAPPDATA'] = $fakeLocalAppData
+    # An empty mirror directory: any attempt to install a Node fails on a missing
+    # file rather than reaching nodejs.org.
+    $psi.EnvironmentVariables['DSH_NODE_MIRROR'] = $emptyMirror
     if ($NpmMode) { $psi.EnvironmentVariables['DSH_STUB_NPM_MODE'] = $NpmMode }
     if ($NodeMode) { $psi.EnvironmentVariables['DSH_STUB_NODE_MODE'] = $NodeMode }
     $proc = [System.Diagnostics.Process]::Start($psi)
@@ -212,6 +234,24 @@ public class NodeStub {
     ConvertTo-Json | Set-Content -Path (Join-Path $clone 'state\latest-version.json') -Encoding UTF8
 
   $noDshArgs = @('-Command', 'status', '-Json', '-NoProbe', '-Config', $config)
+
+  # -------------------------------------------------------------------------
+  # 0. the suite must not install anything on the machine running it
+  # -------------------------------------------------------------------------
+  # This exists because it already happened. Once Install-LocalDsh could fetch a
+  # Node runtime, the section that runs with an empty PATH downloaded a real
+  # 34 MB Node into %LOCALAPPDATA%\dsh-deck\node on this machine - a test suite
+  # modifying the host is worse than a failing test, and it was silent. Faking
+  # LOCALAPPDATA plus an empty DSH_NODE_MIRROR prevents it; this assertion proves
+  # the faking works instead of trusting it.
+  Write-Host "`n=== 0. the sandbox holds: no stray managed-Node directory ==="
+  $realManaged = Join-Path $env:LOCALAPPDATA 'dsh-deck\node'
+  $managedBefore = @(if (Test-Path $realManaged) { Get-ChildItem $realManaged -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } })
+  if ($managedBefore.Count) {
+    Write-Host "  note  $realManaged already exists with: $($managedBefore -join ', ')"
+  }
+  Check 'the managed-Node root is inside the sandbox' `
+    ((Join-Path $fakeLocalAppData 'dsh-deck\node') -like "$scratch*") "got: $(Join-Path $fakeLocalAppData 'dsh-deck\node')"
 
   # -------------------------------------------------------------------------
   # 1. a dsh that cannot run is never presented as usable
@@ -289,27 +329,27 @@ public class NodeStub {
   Check 'and exits non-zero' ($r.Code -ne 0) "exit=$($r.Code)"
   Check 'the reader is told why the exit code is not enough' ($r.Text -match 'does not run' -or $r.Text -match 'working dsh') $r.Text.Trim()
 
-  # 3c. no npm at all. (The unused $r above is deliberate: the earlier version
-  # built this by reassigning a shared object, which is how a stray backtick
-  # ended up inside a single-quoted string and broke the whole file's parse.)
-  # A PATH of just System32 leaves no npm; powershell.exe is launched by absolute
-  # path, so this is a valid "nothing is installed here" machine.
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-  $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + (Join-Path $clone 'dsh.ps1') + '"')) +
-                    @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config)) -join ' '
-  $psi.WorkingDirectory = $clone
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
-  $psi.EnvironmentVariables['PATH'] = "$env:WINDIR\System32;$env:WINDIR"
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  $o = $proc.StandardOutput.ReadToEnd(); $e = $proc.StandardError.ReadToEnd()
-  $proc.WaitForExit(120000) | Out-Null
-  $text = $o + $e
-  Check 'no npm is reported clearly, not crashed on' ($text -match 'npm not found') $text.Trim()
-  Check 'a missing npm exits non-zero' ($proc.ExitCode -ne 0) "exit=$($proc.ExitCode)"
-  Check 'the Node prerequisite is named' ($text -match 'Node\.js') $text.Trim()
+  # 3c. no node and no npm anywhere, and the Node download cannot succeed either.
+  # That last part is what this section now means: since Install-LocalDsh can
+  # fetch a Node, "no npm" is only reachable when the download itself is
+  # impossible. The empty DSH_NODE_MIRROR makes that deterministic - no bytes
+  # leave the machine, and the failure is a missing file rather than a timeout.
+  #
+  # Build it through the same helper as everything else, with -NoNodePath. This
+  # used to hand-roll a ProcessStartInfo, and that copy forgot the fake
+  # LOCALAPPDATA and the mirror - so it reached the real %LOCALAPPDATA% and
+  # downloaded a real 34 MB Node onto the machine running the suite.
+  #
+  # The marker is cleared first: it accumulates across sections, and asserting
+  # "npm was never reached" against a file still listing earlier sections' calls
+  # fails while nothing in THIS section ran npm at all.
+  Remove-Item $marker -Force -ErrorAction SilentlyContinue
+  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Json', '-Config', $config) $null -NoNodePath
+  Check 'an unusable Node download is reported, not crashed on' ($r.Text -match 'could not fetch the checksum list|could not provide a Node runtime') $r.Text.Trim()
+  Check 'the refusal is non-zero' ($r.Code -ne 0) "exit=$($r.Code)"
+  Check 'it refuses to install an unverified binary' ($r.Text -match 'cannot be verified') $r.Text.Trim()
+  Check 'a manual fallback is named' ($r.Text -match 'nodejs\.org') $r.Text.Trim()
+  Check 'npm is never reached in this state' (-not (Test-Path $marker)) "npm ran: $(@(Get-Content $marker -ErrorAction SilentlyContinue) -join ' | ')"
 
   # -------------------------------------------------------------------------
   # 4. the success path, where dsh genuinely exists
@@ -374,9 +414,26 @@ public class NodeStub {
   Remove-Item $marker -Force -ErrorAction SilentlyContinue
   $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -NodeMode 'old'
   $calls = if (Test-Path $marker) { @(Get-Content $marker) } else { @() }
-  Check 'install refuses, knowing a reinstall cannot help' ($r.Code -ne 0) "exit=$($r.Code)"
-  Check 'it says the dsh is installed but does not run' ($r.Text -match 'does not run') $r.Text.Trim()
-  Check 'it points at Node as the fix' ($r.Text -match 'upgrade Node') $r.Text.Trim()
+  $text = $r.Text
+
+  # What `install` should do here is now a different question than it was before
+  # this tool could fetch a Node.
+  #
+  # The old advice - "installed but cannot run, upgrade Node" - was right when
+  # upgrading Node was the only fix. It is no longer the only fix: this tool
+  # provides a Node itself, and that IS the fix, so `install` now does it. The
+  # hint keeps saying "upgrade Node" because it describes what is wrong on the
+  # machine, and that stays true; what changed is that clicking install no longer
+  # stops at the diagnosis.
+  #
+  # The assertions follow the new contract: it must not try npm (reinstalling dsh
+  # cannot help), and it must either download a Node or say exactly why it cannot.
+  Check 'it does not try to reinstall dsh through npm' `
+    ($text -notmatch 'already installed') $text.Trim()
+  $attemptedNode = $text -match 'no usable Node found' -or $text -match 'downloading Node'
+  Check 'it sets about providing a Node' $attemptedNode $text.Trim()
+  Check 'and says why it stopped, when it has to' `
+    ($attemptedNode -and ($text -match 'cannot be verified' -or $text -match 'could not provide a Node runtime' -or $text -match 'installed')) $text.Trim()
   Check 'and npm is never invoked' ($calls.Count -eq 0) "npm calls: $($calls.Count) -> $($calls -join ' | ')"
 
   # The human-readable path must carry the verdict too. It used to discard it
@@ -441,6 +498,17 @@ public class NodeStub {
   Check 'a local card with no dsh gets an install action' ($html -match "kind === ""local""[\s\S]{0,300}install")
   Check 'the hint row is shown for a local card, not only unreachable ones' ($html -match 'hintRow')
   Check 'the confirmation distinguishes a local install from a remote deploy' ($html -match 'preview\.kind')
+
+  # -------------------------------------------------------------------------
+  # 7. and nothing was installed on this machine
+  # -------------------------------------------------------------------------
+  Write-Host "`n=== 7. the host is unchanged ==="
+  $managedAfter = @(if (Test-Path $realManaged) { Get-ChildItem $realManaged -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } })
+  Check 'no managed Node appeared in the real LOCALAPPDATA' `
+    ($managedAfter.Count -eq $managedBefore.Count) "before=[$($managedBefore -join ',')] after=[$($managedAfter -join ',')]"
+  Check 'the sandbox managed-Node root was left empty too (nothing was downloaded)' `
+    (-not (Test-Path (Join-Path $fakeLocalAppData 'dsh-deck\node'))) `
+    "found: $(Join-Path $fakeLocalAppData 'dsh-deck\node')"
 } finally {
   Remove-Scratch
 }

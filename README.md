@@ -122,6 +122,8 @@ dsh.ps1 -Command install -Target local  install dsh on this machine (never autom
 dsh.ps1 -Command add -SshHost prod      register a host by ssh alias
 dsh.ps1 -Command list                   show configured instances
 dsh.ps1 -Command doctor                 diagnose this machine and every host
+dsh.ps1 -Command node-path              which node runs the panel and dsh
+dsh.ps1 -Command node-path -Ensure      download a suitable Node when none is usable
 dsh.ps1 -Command check                  compare versions against npm's latest
 dsh.ps1 -Command upgrade                upgrade everything to the latest
 dsh.ps1 -Command upgrade -DryRun        show what would change, change nothing
@@ -340,16 +342,43 @@ What it does need, and how it gets it:
 | Windows 10/11 | you | the launcher is PowerShell; see the roadmap for Linux/macOS |
 | PowerShell 5.1 | Windows | built in |
 | .NET Framework 4.x | Windows | only for `Start.exe`; `Start.cmd` needs nothing |
-| Node.js 18+ | **you install it** | the panel backend runs on it |
+| Node.js 18+ | **you, or `install`** | the panel backend runs on it; see "If there is no Node at all" |
 | Chrome or Edge | you have it | for the chromeless app window; falls back to the default browser |
-| `dsh` itself | **you install it** | `npm i -g @deepseek-ai/dsh`, and **22.19+ on any host running dsh** |
+| `dsh` itself | **you, or `install`** | `npm i -g @deepseek-ai/dsh`, and **22.19+ on any host running dsh** |
 | `ssh` | Windows OpenSSH | remote instances only |
 | A DeepSeek API key | dsh's own login | only for the balance badge and for agent runs |
 
-So: the **code** is self-contained, the **runtime is not**. Nothing is vendored,
-and nothing needs to be — but a machine with no Node still cannot run the panel.
-`Start.exe` in particular is not a self-contained panel: it embeds the launcher
-and the UI, and still runs the backend with the `node` on your PATH.
+So: the **code** is self-contained, and the two runtimes it needs can be fetched
+on request — but nothing is vendored, and nothing is downloaded behind your back.
+A machine with no Node can bootstrap itself with one explicit command; it cannot
+do so silently, and `Start.exe` is still not a self-contained panel: it embeds
+the launcher and the UI, and runs the backend with a real `node`.
+
+### If there is no Node at all
+
+Node is what runs the panel backend, and npm ships inside it, so "no Node" and
+"cannot install dsh" are the same problem rather than two. `install` therefore
+provides one:
+
+```powershell
+.\dsh.ps1 -Command install -Target local      # downloads Node first if needed
+.\dsh.ps1 -Command node-path                  # which node is in use, and where from
+.\dsh.ps1 -Command node-path -Ensure          # download one when none is usable
+```
+
+The Node goes to `%LOCALAPPDATA%\dsh-deck\node\<version>\` — per-user, so no
+administrator, and one directory per version so an upgrade can never overwrite a
+runtime dsh is executing. It is **checksum-verified against nodejs.org's own
+`SHASUMS256.txt` before anything is extracted**, and the download is discarded if
+it does not match; a checksum list that cannot be fetched stops the whole thing,
+because downloading an executable you cannot verify is not a trade this makes
+quietly. `dsh.ps1 -Command node-path` reports which Node the panel and dsh will
+actually use — a question a shell's `node -v` does not answer.
+
+Nothing is downloaded by `start`, by opening the panel, or by asking `node-path`
+what is in use: only an explicit install does it. For an internal mirror or an
+offline copy, set `DSH_NODE_MIRROR` to a directory or URL holding the same two
+files.
 
 ### Local instances are not auto-installed
 

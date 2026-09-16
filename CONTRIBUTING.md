@@ -90,6 +90,7 @@ node tools\check-no-deps.js         # the backend uses only Node builtins
 .\tools\fix-bom.ps1                 # BOM + parse gate, under PowerShell 5.1
 .\tools\check-app-stop.ps1          # Windows: app -Stop end to end, against a real panel
 .\tools\check-local-install.ps1     # Windows: local install / missing-dsh reporting
+.\tools\check-node-bootstrap.ps1    # Windows: the Node runtime it downloads for itself
 .\tools\check-local-card.ps1        # local-only: the local card, in a real browser
 ```
 
@@ -169,6 +170,26 @@ Two more things that only work one way:
   PowerShell drops the UTF-8 BOM unless you write the bytes back explicitly, and
   mutation-testing the real file one time left it unparseable for the rest of the
   run; `fix-bom.ps1` caught it, which is exactly why that gate exists.
+
+## A test must never install anything on the host
+
+This one is not a style preference. Once `Install-LocalDsh` could fetch a Node
+runtime, the section of `check-local-install.ps1` that runs with an empty PATH
+reached the **real** `%LOCALAPPDATA%` and downloaded a real 34 MB Node onto the
+machine — silently, during a test run. Two things came out of it:
+
+- the harness now fakes `LOCALAPPDATA` too, and `DSH_NODE_MIRROR` points at an
+  empty sandbox directory so any download attempt fails on a missing file rather
+  than reaching the network;
+- section 0 and section 7 assert the sandbox holds, comparing the real managed-Node
+  directory before and after. A test that modifies the host is worse than a test
+  that fails, because nothing tells you.
+
+`check-node-bootstrap.ps1` follows the same rule from the other direction: it
+serves a *synthetic* nodejs.org from a local directory, so the download, checksum,
+extraction and refusal paths are all exercised while nothing leaves the machine.
+That is also the only way to test the failures that matter — a tampered zip, an
+unlisted zip, an unreachable checksum list.
 
 If you add tests, the highest-value target remains `app/server.js` — pure
 functions like `parseJson` and `Compare-Version` are easy to cover and have

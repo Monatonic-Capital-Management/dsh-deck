@@ -163,6 +163,15 @@ jobs:
         shell: pwsh
         run: pwsh -File tools/check-local-install.ps1
 
+      - name: The Node runtime can be provided, and only when verified
+        # Serves a synthetic nodejs.org from a local directory, so this downloads
+        # nothing and installs nothing on the runner. The cases that matter most
+        # are the refusals: a checksum mismatch, a zip the checksum list does not
+        # cover, and a checksum list that cannot be fetched at all - none of which
+        # can be produced against the real nodejs.org without breaking it.
+        shell: pwsh
+        run: pwsh -File tools/check-node-bootstrap.ps1
+
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a
   # stray require() of an external package would break "clone and run".
