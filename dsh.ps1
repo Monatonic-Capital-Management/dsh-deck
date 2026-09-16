@@ -40,7 +40,8 @@
   logs     print an instance's log, or stream it with -Follow
   add      register an instance in the config (does not read your ~/.ssh/config)
   list     list configured instances
-  install  deploy the remote systemd service to a host
+  install  deploy the remote systemd service to a host, or install dsh on this
+           machine (local instances; never automatic - see the .NOTES below)
   upgrade  check for and install a newer dsh (-DryRun to preview)
   check    report which instances have an update available
   balance  show the DeepSeek account balance
@@ -755,6 +756,21 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
     $updateAvailable = (Compare-Version $latestVersion $localVersion) -gt 0
   }
 
+  # dsh missing is a state the panel has to be able to act on, not just print.
+  #
+  # This row used to carry only DshVersion, which is '' when dsh is absent - the
+  # same value as "could not read the version". The panel therefore showed a
+  # normal red card with a 启动 button that could never succeed, and the reason
+  # existed only in a log the user had to go looking for: exactly the silent
+  # failure this tool's contract forbids. DshInstalled says it outright, and the
+  # hint is the same sentence the launcher prints on the command line, so the
+  # card and `doctor` cannot disagree.
+  $dshInstalled = [bool]$localVersion
+  $hint = ''
+  if (-not $dshInstalled) {
+    $hint = 'dsh 未安装。可点「安装 dsh」自动装好，或手动运行：npm i -g @deepseek-ai/dsh'
+  }
+
   return [pscustomobject]@{
     Name = $Inst.name; Kind = 'local'; Port = $port
     State = $state; Detail = $detail; Http = $httpCode
@@ -762,6 +778,8 @@ function Get-LocalStatus($Inst, [switch]$NoProbeHttp) {
     # Where this instance starts sessions. Only meaningful locally: a remote
     # workdir lives on the other machine and cannot be opened from here.
     Workdir = (Get-InstWorkdir $Inst)
+    DshInstalled = $dshInstalled
+    Hint = $hint
     DshVersion = $localVersion
     LatestVersion = $latestVersion
     UpdateAvailable = $updateAvailable
@@ -2478,22 +2496,96 @@ function Invoke-List {
   Write-Host ''
 }
 
+function Install-LocalDsh([switch]$Quiet) {
+  <# Install dsh on THIS machine, into the npm global prefix.
+
+     Asymmetric with the remote path on purpose, and the asymmetry is the point.
+     A remote host is provisioned completely - Node, dsh, systemd unit, linger -
+     because that machine exists to run dsh and nothing there is the user's
+     desktop. Locally, installing a global npm package is a decision about the
+     machine someone is sitting at, so it never happens by itself: `start` still
+     reports "dsh not found" and stops. This function exists so that decision can
+     be made explicitly - from the panel's 安装 button, or `dsh.ps1 install`.
+
+     What it does NOT do: install Node. Node is what runs the panel backend and
+     is a documented prerequisite; a launcher that silently installs a language
+     runtime is a different kind of tool. If node/npm are absent this reports
+     exactly that and stops. #>
+  $npm = Get-Command npm -ErrorAction SilentlyContinue
+  if (-not $npm) {
+    Write-Err 'npm not found on PATH; cannot install dsh'
+    Write-Info 'install Node.js 18+ first (dsh itself then needs 22.19+ to run), then retry'
+    return $false
+  }
+
+  # Already there? Then this is a no-op, reported as success. `upgrade` is the
+  # command that changes a version, and it is explicit for the same reason.
+  $before = Get-LocalDshVersion
+  if ($before) {
+    if (-not $Quiet) { Write-Ok "local dsh is already installed ($before)" }
+    return $true
+  }
+
+  $target = Get-LatestDshVersion
+  $spec = if ($target) { "@deepseek-ai/dsh@$target" } else { '@deepseek-ai/dsh' }
+  if (-not $Quiet) { Write-Info "installing $spec into the npm global prefix" }
+
+  # Invoke-NpmGlobal decides success by running the binary afterwards, not by
+  # npm's exit code: npm can report success and leave a half-extracted tree (see
+  # its comment, and docs/lessons.md #16). It also clears the version cache.
+  if (-not (Invoke-NpmGlobal $spec)) {
+    Write-Warn2 'the install did not leave a working dsh; retrying with --force'
+    if (-not (Invoke-NpmGlobal $spec -Force)) {
+      Write-Err 'could not install dsh'
+      Write-Info 'check the npm output above; a permissions problem on the global prefix is the usual cause'
+      return $false
+    }
+  }
+
+  # Verify by running it, and say which Node it ran under. dsh's shebang is
+  # `#!/usr/bin/env node`, so an older Node resolves to a dsh that exits 0 with
+  # no output at all - the silent failure docs/lessons.md #5 and #6 describe.
+  $after = Get-LocalDshVersion
+  if (-not $after) {
+    Write-Err 'dsh was installed but does not run'
+    Write-Info 'this is the Node-too-old case: dsh needs Node >= 22.19.0, and an older one makes it exit silently'
+    return $false
+  }
+  $node = Get-NodeExe
+  if (-not $Quiet) {
+    Write-Ok "local dsh installed ($after)"
+    if ($node) { Write-Info "running under $node ($(& $node -v 2>&1))" }
+    Write-Info 'click 启动 on the local card, or: dsh.ps1 -Command start -Target local'
+  }
+  return $true
+}
+
 function Invoke-Install([string[]]$Names, [switch]$Quiet) {
   <# Returns $true only when every requested instance was installed.
 
      The -Json caller used to answer {"ok":true} unconditionally, so a run that
      printed "[fail] no remote instances selected" and did nothing still told
      the panel the deploy had succeeded. The verdict has to come from here,
-     because only this function knows whether any work happened. #>
-  $insts = @(Get-Instances $Names $Config) | Where-Object { $_.kind -eq 'remote' }
-  if (-not $insts -or @($insts).Count -eq 0) { Write-Err 'no remote instances selected'; return $false }
+     because only this function knows whether any work happened.
+
+     Local instances are now included. This used to filter to kind -eq 'remote'
+     and reject everything else with "no remote instances selected", which is
+     how `install local` - and the panel's install button on a local card - had
+     nothing to call. #>
+  $insts = @(Get-Instances $Names $Config)
+  if (-not $insts -or @($insts).Count -eq 0) { Write-Err 'no instances selected'; return $false }
   $allOk = $true
   foreach ($i in $insts) {
-    if (-not $Quiet) { Write-Head "install $($i.name) -> $($i.sshHost)" }
-    # Install-RemoteService reports failure by returning a falsy value rather
-    # than throwing, so it has to be inspected instead of discarded.
-    $res = Install-RemoteService $i -Quiet:$Quiet
-    if (-not $res) { $allOk = $false }
+    if ((Get-InstProp $i 'kind' 'local') -eq 'remote') {
+      if (-not $Quiet) { Write-Head "install $($i.name) -> $($i.sshHost)" }
+      # Install-RemoteService reports failure by returning a falsy value rather
+      # than throwing, so it has to be inspected instead of discarded.
+      $res = Install-RemoteService $i -Quiet:$Quiet
+      if (-not $res) { $allOk = $false }
+    } else {
+      if (-not $Quiet) { Write-Head "install $($i.name) -> this machine" }
+      if (-not (Install-LocalDsh -Quiet:$Quiet)) { $allOk = $false }
+    }
   }
   return $allOk
 }

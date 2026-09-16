@@ -546,12 +546,33 @@ const routes = {
   },
 
   'GET /api/instances/:name/install': async (ctx) => {
-    // A preview built from the probe the URL route already performs, so the
-    // confirmation can state what would actually change on that host instead of
-    // a generic warning. Probing is also what makes the claim accurate: whether
-    // dsh is missing, present but broken, or already fine differs per host.
+    // A preview built so the confirmation can state what would actually change
+    // instead of a generic warning. For a remote host that comes from the probe
+    // the URL route already performs, because whether dsh is missing, present
+    // but broken, or already fine differs per host.
     await assertKnownInstance(ctx.params.name);
     const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name) || {};
+    const isLocal = (cfg.kind || 'remote') === 'local';
+
+    if (isLocal) {
+      // A local install is a different proposition and used to have no preview
+      // at all: the route described a remote deployment unconditionally, so a
+      // local card would have been told "服务器上还没有 dsh" about a machine the
+      // reader is sitting at. Nothing here touches the network or ssh.
+      return {
+        name: ctx.params.name,
+        kind: 'local',
+        sshHost: '',
+        dshInstalled: false,
+        dshVersion: '',
+        nodeVersion: '',
+        linger: '',
+        reachable: true,
+        plan: '将在这台机器上执行：npm install -g @deepseek-ai/dsh，装进 npm 的全局目录。' +
+              '不会安装 Node，也不会修改 hosts.json。',
+      };
+    }
+
     const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
     const row = rows.find((r) => r.Name === ctx.params.name) || {};
     const version = row.DshVersion || '';
@@ -572,14 +593,19 @@ const routes = {
   },
 
   'POST /api/instances/:name/install': async (ctx) => {
-    // Destructive-ish: this writes Node and dsh onto a remote machine and
-    // deploys a systemd user service. The panel confirms first, and the confirm
-    // text names the host so it cannot be mistaken for a local action.
+    // Destructive-ish either way, so the panel always confirms first and the
+    // confirm text names the target: a remote machine, or the one the reader is
+    // sitting at. Locally it installs a global npm package and nothing else -
+    // Node is never installed for you, and no config file is touched.
     await assertKnownInstance(ctx.params.name);
-    const r = await psRun(show('install', ctx.params.name), 300000);
+    const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name) || {};
+    const isLocal = (cfg.kind || 'remote') === 'local';
+    // The local path only runs npm, but a cold registry plus the --force retry
+    // can take minutes; the remote path provisions a whole host.
+    const r = await psRun(show('install', ctx.params.name), isLocal ? 600000 : 300000);
     // Installation can change the reported version and service state.
     getStatus(true).catch(() => { /* traced inside */ });
-    return { ok: r.ok, raw: (r.out || '').trim() };
+    return { ok: r.ok, kind: isLocal ? 'local' : 'remote', raw: (r.out || '').trim() };
   },
 
   'GET /api/ssh-hosts': async () => {

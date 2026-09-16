@@ -117,7 +117,8 @@ dsh.ps1 -Command restart -Target prod
 dsh.ps1 -Command open                   open whatever is already running
 dsh.ps1 -Command logs -Target prod      remote journal / local server log
 dsh.ps1 -Command logs -Target prod -Follow   stream it until Ctrl-C
-dsh.ps1 -Command install -Target prod   provision and deploy only
+dsh.ps1 -Command install -Target prod   provision and deploy a remote host
+dsh.ps1 -Command install -Target local  install dsh on this machine (never automatic)
 dsh.ps1 -Command add -SshHost prod      register a host by ssh alias
 dsh.ps1 -Command list                   show configured instances
 dsh.ps1 -Command doctor                 diagnose this machine and every host
@@ -356,19 +357,30 @@ and the UI, and still runs the backend with the `node` on your PATH.
 systemd user service, linger, and a verification that it serves. That path is
 for Linux and is gated per instance by `"autoInstall": false`.
 
-For the **local** machine there is deliberately no auto-install. `start` checks
-for dsh, and if it is missing it stops with a named cause and the exact command:
+For the **local** machine, nothing installs dsh behind your back. Installing a
+global npm package is a decision about the computer you are sitting at, so
+`start` still refuses and names the reason:
 
 ```
 [fail] local cannot start: dsh not found. Install with: npm i -g @deepseek-ai/dsh
 ```
 
-Installing a global npm package — and potentially Node before it — is a bigger
-decision than the tool should take on its own on the machine you are sitting at,
-which is why this is a report rather than an action. The consequence to know
-about: if you launch the panel on a machine without dsh, the `local` card is
-there but its 启动 button cannot succeed, and the reason is in the log rather
-than on the card. `dsh.ps1 -Command doctor` names it directly.
+What is new is that the panel now says the same thing, and offers the fix. A
+local card with no dsh gets **安装 dsh** where 启动 would be — an enabled 启动
+that could never succeed was the silent half of this problem — plus a row naming
+the cause and a button to copy the manual command. The button runs one command
+and nothing else:
+
+```powershell
+.\dsh.ps1 -Command install -Target local    # npm install -g @deepseek-ai/dsh
+```
+
+It does **not** install Node (that is a documented prerequisite, not something a
+launcher should quietly add), it does not touch `hosts.json`, and it verifies by
+running the binary afterwards rather than trusting npm's exit code — npm can
+report success and leave a half-extracted tree. If dsh is already present it is a
+no-op that says so; changing a version is `upgrade`, which is explicit for the
+same reason.
 
 ## Troubleshooting
 

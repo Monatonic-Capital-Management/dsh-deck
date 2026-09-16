@@ -89,7 +89,14 @@ node tools\check-stop-contract.js   # app -Stop's verdict contract (static, cros
 node tools\check-no-deps.js         # the backend uses only Node builtins
 .\tools\fix-bom.ps1                 # BOM + parse gate, under PowerShell 5.1
 .\tools\check-app-stop.ps1          # Windows: app -Stop end to end, against a real panel
+.\tools\check-local-install.ps1     # Windows: local install / missing-dsh reporting
+.\tools\check-local-card.ps1        # local-only: the local card, in a real browser
 ```
+
+The last one needs Chrome or Edge and is not in CI; it drives the panel through
+CDP and asserts on the DOM. It earned its place on the first run: the card
+rendered correctly but also carried "发现新版本 0.1.5-rc.1（当前 ?）" with an 升级
+button, on a machine with no dsh to upgrade.
 
 `check-app-stop.ps1` is worth knowing about before you touch `Stop-App`. It
 compiles a shim named `taskkill.exe` that forwards to the real one and then
@@ -144,6 +151,7 @@ Manual smoke test before opening a pull request:
 .\dsh.ps1 -Command status               # all instances report sanely
 .\dsh.ps1 -Command app                  # panel opens, cards clickable
 .\dsh.ps1 -Command app -Stop            # exits 0 AND the backend is really gone
+.\dsh.ps1 -Command install -Target local # no-op when dsh is present, and says so
 .\dsh.ps1 -Command doctor               # no unexpected errors
 .\dsh.ps1 -Command start -Target local  # lifecycle still works
 .\Start.exe                             # the double-click path still works

@@ -101,6 +101,47 @@ if (!blockSrc || !escSrc || !isUpSrc || !stateSrc) {
     else { console.log(`  FAIL  ${label} (got ${got}, want ${want})`); fail++; }
   }
 
+  // The local card with no dsh. This is the state that used to be invisible: the
+  // launcher reported "dsh not found" only to a log, and the card showed an
+  // enabled 启动 that could never succeed. The install action replaces it, and
+  // the hint row says why - so both directions are asserted, plus the two things
+  // that would make the fix cosmetic: an install button with no explanation, and
+  // the copy button offering something other than the command that works.
+  const localNoDsh = {
+    ...base, kind: 'local', sshHost: '', state: 'down', dshInstalled: false,
+    dshVersion: '', hint: 'dsh 未安装。可点「安装 dsh」自动装好，或手动运行：npm i -g @deepseek-ai/dsh',
+  };
+  // Each card must offer exactly one of the two actions - install when dsh is
+  // missing, start when it is present - so the pair is asserted per state rather
+  // than one action in isolation.
+  const cards4 = [
+    ['local without dsh -> install offered, start withdrawn', localNoDsh, ['install'], ['start']],
+    ['local with dsh -> start offered, install withdrawn',
+      { ...localNoDsh, dshInstalled: true, hint: '' }, ['start'], ['install']],
+  ];
+  for (const [label, obj, wanted, unwanted] of cards4) {
+    const rendered = buildCardFn(obj);
+    // Match the onclick handler, not the bare word: "install" appears in the
+    // install button's label too, so a substring test on the word alone is
+    // ambiguous. The first version of this check failed against correct code.
+    const has = (a) => rendered.includes(`act('${a}','`);
+    const ok = wanted.every(has) && unwanted.every((a) => !has(a));
+    if (ok) { console.log(`  PASS  ${label}`); pass++; }
+    else {
+      console.log(`  FAIL  ${label} (want ${wanted.join('+')}, not ${unwanted.join('+')})`);
+      fail++;
+    }
+  }
+  {
+    const rendered = buildCardFn(localNoDsh);
+    const hasHint = rendered.includes('hint-row') && rendered.includes('dsh 未安装');
+    if (hasHint) { console.log('  PASS  the hint row explains the missing dsh'); pass++; }
+    else { console.log('  FAIL  the hint row explains the missing dsh'); fail++; }
+    const cmd = "npm i -g @deepseek-ai/dsh";
+    if (rendered.includes(cmd)) { console.log('  PASS  the copy button carries the working command'); pass++; }
+    else { console.log('  FAIL  the copy button carries the working command'); fail++; }
+  }
+
   // The workdir row. The backend omits `workdir` for remote instances because
   // that directory is on the other machine, so the two failure modes are a row
   // that never appears and a row that claims a remote folder is local. Both

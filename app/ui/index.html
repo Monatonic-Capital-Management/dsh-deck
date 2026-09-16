@@ -797,13 +797,26 @@ function card(it) {
       '<button class="icon" title="重启" onclick="act(\'restart\',\'' + esc(it.name) + '\')">' + ICON.again + "</button>" +
       '<button class="icon danger" title="停止" onclick="act(\'stop\',\'' + esc(it.name) + '\')">' + ICON.stop + "</button>";
   } else {
-    actions =
-      '<button class="primary grow" onclick="act(\'start\',\'' + esc(it.name) + '\')">' + ICON.play + "启动</button>" +
-      '<button class="icon" title="详情与日志" onclick="detail(\'' + esc(it.name) + '\')">' + ICON.log + "</button>";
+    // A local instance with no dsh cannot be started, so 启动 is replaced by the
+    // action that CAN work. Offering an enabled 启动 on a card that can never
+    // start was the silent half of this bug: the button looked fine, and the
+    // reason lived only in a log.
+    const noDsh = it.kind === "local" && it.dshInstalled === false;
+    if (noDsh) {
+      actions =
+        '<button class="primary grow" onclick="act(\'install\',\'' + esc(it.name) + '\')">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>安装 dsh</button>' +
+        '<button class="icon" title="详情与日志" onclick="detail(\'' + esc(it.name) + '\')">' + ICON.log + "</button>";
+    } else {
+      actions =
+        '<button class="primary grow" onclick="act(\'start\',\'' + esc(it.name) + '\')">' + ICON.play + "启动</button>" +
+        '<button class="icon" title="详情与日志" onclick="detail(\'' + esc(it.name) + '\')">' + ICON.log + "</button>";
+    }
     // Deploy is only offered for a remote instance whose dsh is missing or not
     // working. It used to be gated on dshInstalled, which the backend never
     // mapped, so the button was dead code; and for a *local* instance the
-    // "will install Node and dsh" wording would be plainly wrong.
+    // "will install Node and dsh" wording would be plainly wrong - locally it is
+    // npm and dsh only, which is what the local install preview now says.
     if (it.kind === "remote" && it.state !== "unreachable" && it.dshInstalled === false) {
       actions += '<button class="icon" title="部署远程服务" onclick="act(\'install\',\'' + esc(it.name) + '\')">' +
                  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg></button>';
@@ -822,6 +835,7 @@ function card(it) {
       "</div>" +
       (it.detail ? '<div class="meta"><span class="chip">' + esc(it.detail) + "</span></div>" : "") +
       (it.state === "unreachable" && it.hint ? hintRow(it) : "") +
+      (it.kind === "local" && it.dshInstalled === false && it.hint ? localDshRow(it) : "") +
       (upNow && it.url ? urlRow(it.url) : "") +
       (it.workdir && it.kind === "local" ? workdirRow(it) : "") +
       (it.updateAvailable ? updateRow(it) : "") +
@@ -897,13 +911,40 @@ function copyCmd(cmd) {
   );
 }
 
+/* dsh is not installed on this machine, so the local instance cannot start.
+   The launcher already knew this and only ever said it in a log, which is how a
+   card could sit there looking merely stopped while its start button could never
+   work. The sentence comes from the launcher (status row "Hint"), so the card
+   and `dsh.ps1 doctor` cannot say different things.
+
+   The manual command stays visible next to the button on purpose: the install
+   button runs npm, and someone who would rather run that themselves - or who
+   has npm in a place this launcher cannot see - should not have to go looking
+   for the command. */
+function localDshRow(it) {
+  const cmd = "npm i -g @deepseek-ai/dsh";
+  return '<div class="hint-row">' +
+      '<span class="h-ico">!</span>' +
+      '<span class="h-txt">' + esc(it.hint) + "</span>" +
+      '<button class="ghost" title="复制：' + esc(cmd) + '" ' +
+        'onclick="copyCmd(this.dataset.cmd)" data-cmd="' + esc(cmd) + '">复制命令</button>' +
+    "</div>";
+}
+
 /* An update notice, shown only when the registry has something newer. Kept as a
    notice plus a button rather than an automatic upgrade: applying one restarts
-   dsh and would end a session in progress. */
+   dsh and would end a session in progress.
+
+   No current version means there is nothing to upgrade, so there is no notice.
+   `updateAvailable` is supposed to guarantee that, but it can arrive true with an
+   empty dshVersion, and this row then rendered "发现新版本 0.1.5-rc.1（当前 ?）"
+   next to an 升级 button on a machine with no dsh installed at all. Caught by
+   tools/check-local-card.ps1, which reads this card out of a real browser. */
 function updateRow(it) {
+  if (!it.dshVersion) return "";
   return '<div class="update-row">' +
       '<span class="u-txt">发现新版本 ' + esc(it.latestVersion || "") +
-      "（当前 " + esc(it.dshVersion || "?") + "）</span>" +
+      "（当前 " + esc(it.dshVersion) + "）</span>" +
       '<button class="ghost" title="先看看会做什么，不做任何改动" ' +
         'onclick="upgrade(\'' + esc(it.name) + '\', true)">预览</button>' +
       '<button class="primary" title="升级并重启该实例" ' +
@@ -1051,25 +1092,49 @@ async function act(kind, name) {
         BUSY.delete(name); render();
         return;
       }
+      // A local install and a remote deploy are different propositions, so the
+      // dialog changes shape rather than reusing the remote wording. Saying
+      // "将在远程主机上执行部署" about the machine the reader is sitting at
+      // would be the same class of lie as the card that would not start.
+      const isLocalInstall = preview.kind === "local";
       const host = preview.sshHost || name;
-      const lines = [
-        "将在远程主机上执行部署：",
-        "",
-        "  主机：" + host,
-        preview.dshVersion ? "  当前 dsh：" + preview.dshVersion : "  当前 dsh：未检测到",
-        preview.nodeVersion ? "  当前 Node：" + preview.nodeVersion : "",
-        "",
-        preview.plan,
-        "",
-        "这会修改 " + host + " 上的软件。确定继续？",
-      ].filter((l) => l !== "");
-      if (!confirm(lines.join("\n"))) {
+      let lines;
+      if (isLocalInstall) {
+        const me = preview.dshVersion || "未检测到";
+        lines = [
+          "将在这台机器上安装 dsh：",
+          "",
+          "  当前 dsh：" + me,
+          preview.nodeVersion ? "  当前 Node：" + preview.nodeVersion : "",
+          "",
+          preview.plan,
+          "",
+          "不会安装 Node，不会改动 hosts.json。确定继续？",
+        ];
+      } else {
+        lines = [
+          "将在远程主机上执行部署：",
+          "",
+          "  主机：" + host,
+          preview.dshVersion ? "  当前 dsh：" + preview.dshVersion : "  当前 dsh：未检测到",
+          preview.nodeVersion ? "  当前 Node：" + preview.nodeVersion : "",
+          "",
+          preview.plan,
+          "",
+          "这会修改 " + host + " 上的软件。确定继续？",
+        ];
+      }
+      if (!confirm(lines.filter((l) => l !== "").join("\n"))) {
         BUSY.delete(name); render();
         return;
       }
-      toast("正在部署到 " + host + "…");
+      toast(isLocalInstall ? "正在安装 dsh…" : "正在部署到 " + host + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/install", { method: "POST" });
-      toast(r.ok ? host + " 部署完成" : host + " 部署失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
+      if (isLocalInstall) {
+        toast(r.ok ? "dsh 安装完成，现在可以启动" : "安装失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
+      } else {
+        toast(r.ok ? host + " 部署完成" : host + " 部署失败：" + (r.raw || ""), r.ok ? "ok" : "bad");
+      }
     } else if (kind === "start") {
       toast("正在启动 " + name + "…");
       const r = await api("/api/instances/" + encodeURIComponent(name) + "/start", { method: "POST" });

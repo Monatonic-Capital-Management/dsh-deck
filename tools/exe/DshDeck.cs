@@ -33,6 +33,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Text;
 
 namespace DshDeck
 {
@@ -135,9 +136,14 @@ namespace DshDeck
         /// Write the embedded panel payload into the per-user cache and return
         /// that directory.
         ///
-        /// Extraction is skipped when the cache is already complete, which is the
-        /// normal case after the first run - 250 KB is small, but it is also the
-        /// difference between an instant start and a visible one on every launch.
+        /// Extraction is skipped only when the cache is complete AND carries the
+        /// fingerprint of the payload this binary holds. Keying that on the
+        /// assembly version alone was not enough: rebuilding Start.exe with a
+        /// changed dsh.ps1 but the same version left a cache that looked complete,
+        /// so a copied exe kept running the OLD panel with no way to tell. The
+        /// fingerprint is a new file in a new version of this binary, so an
+        /// existing cache never matches it and is refreshed once, after which
+        /// launches skip extraction again.
         /// </summary>
         private static string ExtractEmbedded()
         {
@@ -154,6 +160,7 @@ namespace DshDeck
             {
                 if (n.StartsWith("payload/", StringComparison.Ordinal)) { files.Add(n); }
             }
+            files.Sort(StringComparer.Ordinal);
             if (files.Count == 0)
             {
                 throw new InvalidOperationException(
@@ -162,48 +169,86 @@ namespace DshDeck
                     "outside a checkout.");
             }
 
-            bool complete = true;
-            foreach (string n in files)
-            {
-                string rel = n.Substring("payload/".Length).Replace('/', Path.DirectorySeparatorChar);
-                if (!File.Exists(Path.Combine(root, rel))) { complete = false; break; }
-            }
+            string stamp = PayloadStamp(asm, files);
+            string stampFile = Path.Combine(root, ".payload");
 
-            if (!complete)
+            bool current = false;
+            try { current = File.Exists(stampFile) && File.ReadAllText(stampFile).Trim() == stamp; }
+            catch { current = false; }
+
+            if (current)
             {
-                Directory.CreateDirectory(root);
+                bool complete = true;
                 foreach (string n in files)
                 {
                     string rel = n.Substring("payload/".Length).Replace('/', Path.DirectorySeparatorChar);
-                    string target = Path.Combine(root, rel);
-                    string dir = Path.GetDirectoryName(target);
-                    if (!string.IsNullOrEmpty(dir)) { Directory.CreateDirectory(dir); }
-
-                    // Write beside the target and move into place, so an
-                    // interrupted extraction cannot leave a half-written
-                    // dsh.ps1 that then fails to parse on the next launch.
-                    string staging = target + ".new";
-                    using (Stream src = asm.GetManifestResourceStream(n))
-                    using (FileStream dst = new FileStream(staging, FileMode.Create, FileAccess.Write))
-                    {
-                        src.CopyTo(dst);
-                    }
-                    // A file the running panel holds open makes the replace fail;
-                    // the extracted copy is still the right one, so continue.
-                    try
-                    {
-                        if (File.Exists(target)) { File.Delete(target); }
-                        File.Move(staging, target);
-                    }
-                    catch (IOException)
-                    {
-                        try { File.Delete(staging); } catch { }
-                    }
+                    if (!File.Exists(Path.Combine(root, rel))) { complete = false; break; }
                 }
-                SweepStaging(root);
+                if (complete) { return root; }
             }
 
+            Directory.CreateDirectory(root);
+            foreach (string n in files)
+            {
+                string rel = n.Substring("payload/".Length).Replace('/', Path.DirectorySeparatorChar);
+                string target = Path.Combine(root, rel);
+                string dir = Path.GetDirectoryName(target);
+                if (!string.IsNullOrEmpty(dir)) { Directory.CreateDirectory(dir); }
+
+                // Write beside the target and move into place, so an interrupted
+                // extraction cannot leave a half-written dsh.ps1 that then fails
+                // to parse on the next launch.
+                string staging = target + ".new";
+                using (Stream src = asm.GetManifestResourceStream(n))
+                using (FileStream dst = new FileStream(staging, FileMode.Create, FileAccess.Write))
+                {
+                    src.CopyTo(dst);
+                }
+                // A file the running panel holds open makes the replace fail; the
+                // extracted copy is still the right one, so continue.
+                try
+                {
+                    if (File.Exists(target)) { File.Delete(target); }
+                    File.Move(staging, target);
+                }
+                catch (IOException)
+                {
+                    try { File.Delete(staging); } catch { }
+                }
+            }
+            SweepStaging(root);
+            try { File.WriteAllText(stampFile, stamp); } catch { }
+
             return root;
+        }
+
+        /// <summary>
+        /// A fingerprint of the embedded payload: the binary's version plus each
+        /// resource's length and write time. Length and timestamp come from the
+        /// resource table, so nothing is read or hashed here - and since the
+        /// build stamps resources as it embeds them, a rebuilt payload always
+        /// differs.
+        /// </summary>
+        private static string PayloadStamp(Assembly asm, List<string> files)
+        {
+            string version;
+            try { version = asm.GetName().Version.ToString(); }
+            catch { version = "0.0.0.0"; }
+            StringBuilder sb = new StringBuilder(version);
+            foreach (string n in files)
+            {
+                sb.Append('|').Append(n);
+                try
+                {
+                    using (Stream s = asm.GetManifestResourceStream(n))
+                    {
+                        sb.Append(':').Append(s == null ? -1 : s.Length);
+                    }
+                    sb.Append('@').Append(File.GetLastWriteTimeUtc(asm.Location).Ticks);
+                }
+                catch { sb.Append(":?"); }
+            }
+            return sb.ToString();
         }
 
         /// <summary>Remove staging files left by an interrupted extraction.</summary>

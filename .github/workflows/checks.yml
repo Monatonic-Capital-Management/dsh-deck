@@ -153,6 +153,16 @@ jobs:
         shell: pwsh
         run: pwsh -File tools/check-app-stop.ps1
 
+      - name: A local instance with no dsh says so, and can fix itself
+        # The gap this closes: `start` reported "dsh not found" only to a log and
+        # nothing installed dsh locally, so the panel showed a card whose start
+        # button could never work. npm is hidden behind a compiled stub with a
+        # controllable exit code, so npm is never asked to install anything for
+        # real - every assertion is about what the launcher REPORTS, including
+        # that a stub which exits 0 while dsh is still missing is not a success.
+        shell: pwsh
+        run: pwsh -File tools/check-local-install.ps1
+
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a
   # stray require() of an external package would break "clone and run".
