@@ -72,6 +72,7 @@ function Remove-Scratch {
 # be chosen - the measurement behind every shim in this repo.
 $nodeStubSrc = @'
 using System;
+using System.IO;
 public class BootNodeStub {
   public static int Main(string[] args) {
     string m = Environment.GetEnvironmentVariable("DSH_STUB_NODE_MODE");
@@ -79,6 +80,18 @@ public class BootNodeStub {
     if (args.Length > 0 && (args[0] == "-v" || args[0] == "--version")) {
       Console.WriteLine(m == "old" ? "v18.20.4" : "v22.23.2");
       return 0;
+    }
+    // Handed a .js FILE, behave like a real node. This matters because the
+    // launcher now decides usability by RUNNING a probe rather than by reading a
+    // version string: a stub that ignored the file made every install look
+    // broken, which is the check working correctly against a stale fixture.
+    // The expected hash is echoed exactly, so a genuine crypto failure would
+    // still show up as one.
+    if (args.Length > 0 && File.Exists(args[0])) {
+      string body = File.ReadAllText(args[0]);
+      if (body.Contains("70129bc805718e0a482fd67713218dfde822b3c9df861c95e16ed3d4a68b697b")) {
+        Console.Write("NODE_OK v22.23.2");
+      }
     }
     return 0;
   }

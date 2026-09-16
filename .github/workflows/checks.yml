@@ -172,6 +172,14 @@ jobs:
         shell: pwsh
         run: pwsh -File tools/check-node-bootstrap.ps1
 
+      # Git Bash stands in for a remote Linux host: it ships sha256sum, awk, curl
+      # and tar, which is everything the provisioning script touches. GitHub's
+      # windows runners have it, so the checksum logic is checked for real rather
+      # than only parsed.
+      - name: Provisioning a host verifies the Node it installs
+        shell: pwsh
+        run: pwsh -File tools/check-remote-node.ps1
+
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a
   # stray require() of an external package would break "clone and run".

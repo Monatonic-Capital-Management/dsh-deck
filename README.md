@@ -375,6 +375,17 @@ because downloading an executable you cannot verify is not a trade this makes
 quietly. `dsh.ps1 -Command node-path` reports which Node the panel and dsh will
 actually use — a question a shell's `node -v` does not answer.
 
+**The remote path verifies the same way.** Installing Node on a host checks the
+tarball against nodejs.org's published SHA-256 before extracting it, and stops if
+the checksum list is missing or the hash does not match. The point of automating
+a machine's provisioning is that nobody is watching the download, so it should
+not be the one place that trusts whatever came back.
+
+A runtime that answers `node -v` is not automatically trusted either: `node-path`
+and install both run a short script in it first, because a binary quarantined by
+antivirus or left half-extracted still prints a version and then fails at real
+work.
+
 Nothing is downloaded by `start`, by opening the panel, or by asking `node-path`
 what is in use: only an explicit install does it. For an internal mirror or an
 offline copy, set `DSH_NODE_MIRROR` to a directory or URL holding the same two

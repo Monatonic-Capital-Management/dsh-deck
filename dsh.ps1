@@ -435,6 +435,66 @@ function Get-NodeVersionOf([string]$NodeExe) {
 $script:ManagedNodeVersion = 'v22.23.2'
 $script:NodeMinVersion     = '22.19.0'
 
+function Test-NodeUsable([string]$NodeExe) {
+  <# Is this node actually able to run something?
+
+     `node -v` is a weak check and it is worth being explicit about why: it is a
+     version string, and a runtime can answer it and still fail at real work. A
+     .dll quarantined by antivirus, a half-extracted directory, a binary left
+     locked mid-copy - all of those still print a version. Believing them means
+     every later failure is reported as "node is fine", which is the one message
+     that cannot help.
+
+     The probe exercises the parts that break for real reasons: process startup,
+     loading a builtin, the stdio that npm and child_process depend on, and a
+     HASH - so the value has to come out right, not merely be printed.
+
+     It runs from a FILE rather than `-e`, and that is not a style choice: passing
+     the script as an argument means its quotes have to survive a PowerShell ->
+     CreateProcess -> node trip, and they do not. Node 22 then treats the mangled
+     text as TypeScript and reports a syntax error, so a perfectly good Node comes
+     back unusable - which is exactly what happened the first time this ran. A
+     file has no quoting to survive.
+
+     Returns $true/$false; the caller reports. #>
+  if (-not $NodeExe -or -not (Test-Path $NodeExe)) { return $false }
+  $probeFile = Join-Path ([IO.Path]::GetTempPath()) ("dsh-node-probe-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".js")
+  # No BOM: node would read it as part of the first token. The source is ASCII, so
+  # there is no encoding question to answer either.
+  #
+  # The expected hash is asserted INSIDE the probe, so it fails if crypto is
+  # broken rather than printing something and leaving the caller's regex to judge.
+  # The regex then only has to recognise the OK line.
+  $probe = @'
+const crypto = require("crypto");
+const expected = "70129bc805718e0a482fd67713218dfde822b3c9df861c95e16ed3d4a68b697b";
+const got = crypto.createHash("sha256").update("dsh-probe").digest("hex");
+if (got !== expected) {
+  process.stderr.write("crypto produced " + got + ", expected " + expected);
+  process.exit(4);
+}
+process.stdout.write("NODE_OK " + process.version);
+'@
+  try {
+    [IO.File]::WriteAllText($probeFile, $probe, (New-Object Text.UTF8Encoding($false)))
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $out = (& $NodeExe $probeFile 2>&1 | Out-String).Trim()
+      $code = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $prevEap
+    }
+  } catch {
+    return $false
+  } finally {
+    Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+  }
+  # Exit code 0 is the real assertion. The OK line additionally proves stdout is
+  # reachable, which npm and the panel backend both depend on.
+  return ($code -eq 0 -and $out -match 'NODE_OK v\d+\.\d+\.\d+')
+}
+
 function Ensure-ManagedNode {
   <# Make sure a Node new enough for dsh exists, downloading one if it does not.
 
@@ -463,7 +523,15 @@ function Ensure-ManagedNode {
   $existing = Get-ManagedNode
   if ($existing -and -not $Force) {
     $v = Get-NodeVersionOf $existing
-    if ($v -and (Compare-Version $v $script:NodeMinVersion) -ge 0) { return $existing }
+    # Both halves: new enough AND able to run. Answering "-v" is not the same as
+    # working, so a runtime that fails the second test is replaced rather than
+    # trusted - which is the difference this check exists to make.
+    if ($v -and (Compare-Version $v $script:NodeMinVersion) -ge 0 -and (Test-NodeUsable $existing)) {
+      return $existing
+    }
+    if (-not $Quiet) {
+      Write-Warn2 "the existing Node at $existing did not pass a run test; replacing it"
+    }
   }
 
   $version = $script:ManagedNodeVersion
@@ -560,12 +628,17 @@ function Ensure-ManagedNode {
     Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
   }
 
-  # Verify by running it, and by asking npm for a version: a runtime that cannot
-  # run itself is not installed, whatever the filesystem says (the same rule
-  # Invoke-NpmGlobal applies to npm's exit code).
+  # Verify by running it, then by running real code in it, and then by checking
+  # npm came along: a runtime that cannot do work is not installed, whatever the
+  # filesystem says (the same rule Invoke-NpmGlobal applies to npm's exit code).
   $got = Get-NodeVersionOf $dest
   if (-not $got) {
     Write-Err "the downloaded Node does not run: $dest"
+    return $null
+  }
+  if (-not (Test-NodeUsable $dest)) {
+    Write-Err "the downloaded Node answers -v but failed to run a short script: $dest"
+    Write-Info 'that points at a corrupted or incomplete download; re-run to fetch it again'
     return $null
   }
   $npmCmd = Join-Path $root 'npm.cmd'
@@ -2129,6 +2202,18 @@ function Install-RemoteDsh([string]$SshHostName, [switch]$Quiet) {
     $tarball = "node-$nodeVersion-linux-$arch"
     # Single-quoted here-string; placeholders are substituted afterwards so the
     # bash body is never touched by PowerShell's own interpolation.
+    #
+    # The tarball is CHECKSUM-VERIFIED before it is extracted, matching what the
+    # Windows path does. Without it this downloads an executable from the network
+    # and runs it on whatever came back - a tampered mirror or an intercepted
+    # connection would be installed silently. nodejs.org publishes SHASUMS256.txt
+    # for exactly this, and the whole point of automating a host's provisioning is
+    # that nobody is watching the download.
+    #
+    # If no hashing tool exists, this STOPS rather than proceeding unverified:
+    # refusing to install is recoverable, installing something unverified is not.
+    # Every Linux this tool targets has sha256sum (coreutils), so the branch is a
+    # guard rather than a common path.
     $installNode = @'
 set -e
 cd "$HOME"
@@ -2136,8 +2221,35 @@ mkdir -p .local .dsh-deck-dl
 cd .dsh-deck-dl
 TARBALL="__TARBALL__"
 URL="https://nodejs.org/dist/__NODEVER__/$TARBALL.tar.xz"
+SUMS="https://nodejs.org/dist/__NODEVER__/SHASUMS256.txt"
 echo "  downloading $URL"
-if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$TARBALL.tar.xz" "$URL"; else wget -qO "$TARBALL.tar.xz" "$URL"; fi
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL -o "$TARBALL.tar.xz" "$URL"
+  curl -fsSL -o SHASUMS256.txt "$SUMS"
+else
+  wget -qO "$TARBALL.tar.xz" "$URL"
+  wget -qO SHASUMS256.txt "$SUMS"
+fi
+
+EXPECTED="$(awk -v f="$TARBALL.tar.xz" '$2 == f { print $1; exit }' SHASUMS256.txt)"
+if [ -z "$EXPECTED" ]; then
+  echo "CHECKSUM_FAIL $TARBALL.tar.xz is not listed in SHASUMS256.txt"
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "$TARBALL.tar.xz" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "$TARBALL.tar.xz" | awk '{print $1}')"
+else
+  echo "CHECKSUM_FAIL no sha256sum or shasum on this host"
+  exit 1
+fi
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  echo "CHECKSUM_FAIL expected $EXPECTED got $ACTUAL"
+  exit 1
+fi
+echo "  checksum verified"
+
 tar -xf "$TARBALL.tar.xz"
 rm -rf "$HOME/.local/node"
 mv "$TARBALL" "$HOME/.local/node"
@@ -2152,6 +2264,13 @@ done
 '@
     $installNode = $installNode.Replace('__TARBALL__', $tarball).Replace('__NODEVER__', $nodeVersion)
     $res = Invoke-B64 $installNode $SshHostName
+    if ($res -match 'CHECKSUM_FAIL') {
+      $why = (($res -split "`r?`n" | Where-Object { $_ -match 'CHECKSUM_FAIL' } | Select-Object -First 1) -replace '.*CHECKSUM_FAIL\s*', '').Trim()
+      Write-Err "$SshHostName`: refusing to install an unverified Node tarball"
+      Write-Info $why
+      Write-Info "nothing was extracted on $SshHostName"
+      return $false
+    }
     if ($res -notmatch 'v\d+\.') {
       Write-Err "Node installation failed:"
       Write-C ($res.Trim()) 'DarkGray'
@@ -3443,7 +3562,9 @@ function Invoke-NodePath([switch]$Ensure, [switch]$Force) {
 
   if ($Ensure) {
     $v = Get-NodeVersionOf $chosen
-    $ok = ($chosen -and $v -and (Compare-Version $v $script:NodeMinVersion) -ge 0)
+    # Test-NodeUsable, not just a version: this verb decides whether to fetch a
+    # runtime, and "answers -v" is not the same as "can do work".
+    $ok = ($chosen -and $v -and (Compare-Version $v $script:NodeMinVersion) -ge 0 -and (Test-NodeUsable $chosen))
     if (-not $ok -or $Force) {
       # -Force downloads even when a runtime is already present. That is the only
       # way to replace one that reports a version and then fails at real work: a
@@ -3464,7 +3585,7 @@ function Invoke-NodePath([switch]$Ensure, [switch]$Force) {
 
   $ver = Get-NodeVersionOf $chosen
   $result = [pscustomobject]@{
-    ok        = [bool]($chosen -and $ver -and (Compare-Version $ver $script:NodeMinVersion) -ge 0)
+    ok        = [bool]($chosen -and $ver -and (Compare-Version $ver $script:NodeMinVersion) -ge 0 -and (Test-NodeUsable $chosen))
     node      = [string]$chosen
     version   = $ver
     managed   = [bool]$isManaged

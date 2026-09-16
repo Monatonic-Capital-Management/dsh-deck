@@ -91,6 +91,7 @@ node tools\check-no-deps.js         # the backend uses only Node builtins
 .\tools\check-app-stop.ps1          # Windows: app -Stop end to end, against a real panel
 .\tools\check-local-install.ps1     # Windows: local install / missing-dsh reporting
 .\tools\check-node-bootstrap.ps1    # Windows: the Node runtime it downloads for itself
+.\tools\check-remote-node.ps1       # Windows+Git Bash: host provisioning verifies its download
 .\tools\check-local-card.ps1        # local-only: the local card, in a real browser
 ```
 
@@ -190,6 +191,23 @@ serves a *synthetic* nodejs.org from a local directory, so the download, checksu
 extraction and refusal paths are all exercised while nothing leaves the machine.
 That is also the only way to test the failures that matter — a tampered zip, an
 unlisted zip, an unreachable checksum list.
+
+`check-remote-node.ps1` does the same for the **remote** path: it extracts the
+bash the launcher runs on a host and executes it under **Git Bash**, which ships
+sha256sum, awk, curl and tar — everything that script touches. `HOME` points at a
+scratch directory so the shell-profile edits stay in the sandbox, and
+`tools/fake-nodejs-server.js` serves a synthetic `nodejs.org/dist`. That makes a
+tampered tarball, an unlisted one, and an unfetchable checksum list all testable.
+
+Two things that bit while writing these, both worth knowing:
+
+- **Windows paths must reach bash as `/c/...`.** Git Bash's tar reads `C:/x` as a
+  remote host named `C` and fails with "Cannot connect to C: resolve failed" —
+  a harness problem that looks exactly like a product problem.
+- **A stub `node.exe` has to answer a script FILE, not just `-v`.** Once the
+  launcher decided usability by running a probe, a fixture that only printed
+  versions made every install look broken. The failure was correct; the fixture
+  was stale.
 
 If you add tests, the highest-value target remains `app/server.js` — pure
 functions like `parseJson` and `Compare-Version` are easy to cover and have
