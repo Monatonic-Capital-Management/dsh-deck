@@ -266,7 +266,7 @@ dsh.cmd                  PATH-friendly shim for the CLI
 app/
   server.js              panel backend (Node, no dependencies)
   ui/index.html          the interface (one self-contained file)
-  icon/dsh-deck.svg      the mark, as vector source
+  icon/dsh-deck.svg      DeepSeek's own mark, as vector source
   icon/dsh-deck.ico      what the shortcuts use (16-256 px)
 remote/
   dsh-web-service.sh     systemd wrapper deployed to servers
