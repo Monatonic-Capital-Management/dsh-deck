@@ -127,6 +127,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Use runner-owned temporary paths
+        # The user-profile TEMP can use an 8.3 alias (RUNNER~1), while PowerShell
+        # publishes expanded script paths. Keep fixture ownership comparisons
+        # and cleanup on the same spelling without weakening their assertions.
+        shell: powershell
+        run: |
+          $testTemp = $env:RUNNER_TEMP
+          if (-not $testTemp -or -not (Test-Path -LiteralPath $testTemp -PathType Container)) {
+            throw 'The runner temporary directory is unavailable.'
+          }
+          @("TEMP=$testTemp", "TMP=$testTemp") | Out-File -LiteralPath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: PowerShell 5.1 BOM and parse gate (read-only)
         shell: powershell
         run: powershell -NoProfile -File tools/fix-bom.ps1 -Check
