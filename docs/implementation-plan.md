@@ -94,7 +94,9 @@
 
 首次推送 `b761442` 后的 [Actions 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35177396719) 未通过：失败步骤为 Windows 隔离源码检查与 Linux shellcheck。未将其当作通过结果。
 
-后续修复保持门禁强度：测试显式在受限策略环境中启动仅本进程生效的 PowerShell 执行策略，不修改系统策略；远端脚本拆开 PATH 赋值与导出，消除 `SC2155`。修复后的 CI 状态以对应提交的 Actions 记录为准，不用本机复现代替远端结果。
+后续修复保持门禁强度：测试显式在受限策略环境中启动仅本进程生效的 PowerShell 执行策略，不修改系统策略；远端脚本拆开 PATH 赋值与导出，消除 `SC2155`。
+
+`30d8da1` 的 [CI 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35178192203) 中，Linux lint 和依赖检查通过；Windows 源码检查仍在约 33 秒后因子进程未返回退出码失败，不能将本机的执行策略复现当作 CI 超时的根因证明。进一步将测试的模块搜索限定为 PowerShell 内置模块，隔离 APPDATA/LOCALAPPDATA，隐藏子进程窗口，并在失败时只输出错误码、耗时及可执行文件存在性。保留原有超时和断言；后续 CI 状态以对应提交的 Actions 记录为准。
 
 ## 切换与兼容性
 
