@@ -39,7 +39,9 @@ test('BOM check refuses without rewriting; explicit repair excludes user directo
   env.PSModulePath = path.join(path.dirname(executable), 'Modules');
   const expectExit = (args, expected) => {
     const started = Date.now();
-    const result = spawnSync(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', tool, ...args], { cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    // Fresh hosted Windows profiles took 76s across these three successful
+    // launches; 30s per process was flaky. This is only the test deadline.
+    const result = spawnSync(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', tool, ...args], { cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 90_000 });
     const known = ['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT', 'UNKNOWN'];
     const errorCode = result.error ? (known.includes(result.error.code) ? result.error.code : 'unclassified') : 'none';
     assert.equal(result.status, expected, JSON.stringify({ phase: args.length ? 'check' : 'repair', errorCode, elapsedMs: Date.now() - started, executableFound: fs.existsSync(executable) }));

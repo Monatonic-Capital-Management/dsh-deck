@@ -98,7 +98,9 @@
 
 `30d8da1` 的 [CI 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35178192203) 中，Linux lint 和依赖检查通过；Windows 源码检查仍在约 33 秒后因子进程未返回退出码失败，不能将本机的执行策略复现当作 CI 超时的根因证明。进一步将测试的模块搜索限定为 PowerShell 内置模块，隔离 APPDATA/LOCALAPPDATA，隐藏子进程窗口，并在失败时只输出错误码、耗时及可执行文件存在性。保留原有超时和断言。
 
-`afd7c83` 的 [CI 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35178812458) 已通过上述源码检查、启动器契约与 EXE 校验；后续 `app -Stop` 检查仅“没有重复后端”一项断言失败。该 runner 的用户临时路径包含 Windows 8.3 别名，测试按目录字符串统计进程，存在与 PowerShell 展开的路径不一致的风险。CI 改用 `RUNNER_TEMP` 作为测试 TEMP/TMP，原业务实现与断言不变；后续 CI 状态以对应提交的 Actions 记录为准。
+`afd7c83` 的 [CI 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35178812458) 已通过上述源码检查、启动器契约与 EXE 校验；后续 `app -Stop` 检查仅“没有重复后端”一项断言失败。该 runner 的用户临时路径包含 Windows 8.3 别名，测试按目录字符串统计进程，存在与 PowerShell 展开的路径不一致的风险。CI 改用 `RUNNER_TEMP` 作为测试 TEMP/TMP，原业务实现与断言不变。
+
+`7664be5` 的 [CI 运行](https://github.com/Monatonic-Capital-Management/dsh-deck/actions/runs/35180034552) 为源码检查提供了明确诊断：可执行文件存在，首次检查在 30069ms 触发 `ETIMEDOUT`。对照 `afd7c83` 同一检查成功时三次启动共用 76 秒，单次 30 秒期限过紧。将这一测试子进程期限改为 90 秒，保持产品操作超时、所有断言与脱敏诊断不变；后续 CI 状态以对应提交的 Actions 记录为准。
 
 ## 切换与兼容性
 
