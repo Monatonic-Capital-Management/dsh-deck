@@ -285,7 +285,11 @@ public class TaskKillShim {
   # -------------------------------------------------------------------------
   Write-Host "`n=== 1. taskkill succeeds but writes the 'could not be terminated' line ==="
   Remove-Item $marker -Force -ErrorAction SilentlyContinue
-  $r = Invoke-Launcher @('-Command', 'app', '-Stop') 'noisy'
+  # Automatic reuse across contexts remains forbidden. Explicit stop is
+  # different: it must release the exact, fully verified backend even when the
+  # caller supplies another config, or the recovery advice is impossible.
+  $r = Invoke-Launcher @('-Command', 'app', '-Stop', '-Config', $alternate) 'noisy'
+  Check 'a verified backend can be stopped from another config context' ($r.Code -eq 0) "exit=$($r.Code)"
   Check 'the stub intercepted taskkill' (Test-Path $marker) "no marker at $marker"
   Check 'stop succeeds when the backend really did die' ($r.Code -eq 0) "exit=$($r.Code)"
   Check 'the pid is gone afterwards' (-not (Test-Alive $backendPid)) "pid $backendPid still alive"

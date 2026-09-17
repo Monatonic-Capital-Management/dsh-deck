@@ -94,7 +94,10 @@ function Stop-App {
   $id = [int](Get-InstProp $runtime 'pid' 0)
   $wasRunning = $id -gt 0 -and (Test-ProcessAlive $id)
   if ($wasRunning) {
-    if (-not (Test-AppProcess $runtime $owner)) { Throw-LauncherError 'ownership-unknown' '无法核对面板进程归属或配置上下文；未终止进程、未删除记录。' }
+    # Explicit stop may arrive through a different -Config invocation. Context
+    # blocks automatic adoption, but PID, image, arguments, stamp and published
+    # paths still prove this is the backend recorded by this launcher.
+    if (-not (Test-AppProcess $runtime $owner -AnyContext)) { Throw-LauncherError 'ownership-unknown' '无法核对面板进程归属；未终止进程、未删除记录。' }
     if (-not (Stop-OwnedProcess $id ([string]$owner.startedAt))) {
       Write-Err "app backend did not stop (pid $id is still running)"
       Write-Info "after checking ownership, stop it manually: taskkill /PID $id /T /F"

@@ -60,6 +60,9 @@ function check(label, ok, detail) {
 
 check('Stop-App delegates termination to the shared owned-process helper',
   killIdx > 0 && body.includes('Stop-OwnedProcess'), 'termination is not delegated');
+check('explicit stop permits only a verified backend from another context',
+  body.includes('Test-AppProcess $runtime $owner -AnyContext'),
+  'Stop-App still requires the caller context after ownership verification');
 check('stderr is tolerated for the kill (Continue before the call)',
   eapIdx > 0 && killIdx > 0 && eapIdx < killIdx,
   eapIdx < 0 ? "no $ErrorActionPreference = 'Continue'" : 'Continue comes after taskkill');
