@@ -28,8 +28,11 @@ test('BOM check refuses without rewriting; explicit repair excludes user directo
   const env = {};
   for (const name of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'OS']) if (process.env[name]) env[name] = process.env[name];
   env.USERPROFILE = path.join(fixture, 'home'); env.TEMP = env.TMP = path.join(fixture, 'temp');
+  // A clean child environment must not depend on the runner's inherited policy.
+  // Force the restrictive case; the command-line policy is process-local only.
+  env.PSExecutionPolicyPreference = 'Restricted';
   const executable = path.join(env.WINDIR || env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
-  const run = args => spawnSync(executable, ['-NoProfile', '-NonInteractive', '-File', tool, ...args], { cwd: fixture, env, encoding: 'utf8', timeout: 30_000 });
+  const run = args => spawnSync(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', tool, ...args], { cwd: fixture, env, encoding: 'utf8', timeout: 30_000 });
   assert.equal(run(['-Check']).status, 1);
   assert.deepEqual(fs.readFileSync(source), before);
   assert.deepEqual(fs.readFileSync(privateFile), privateBefore);

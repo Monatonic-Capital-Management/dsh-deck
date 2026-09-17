@@ -53,7 +53,8 @@ fi
 if [ -x "$HOME/.local/node/bin/node" ]; then
   export PATH="$HOME/.local/node/bin:$PATH"
 fi
-export PATH="$(dirname "$DSH_BIN"):$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+PATH="$(dirname "$DSH_BIN"):$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+export PATH
 
 cd "$WORKDIR" || exit 1
 
