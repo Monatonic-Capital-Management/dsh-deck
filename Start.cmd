@@ -32,22 +32,19 @@ if not exist "%LAUNCHER%" (
   exit /b 1
 )
 
-rem -WindowStyle Hidden keeps the console from flashing, but it also stops
-rem PowerShell from reporting anything, so the window below is held open by the
-rem error path instead: a silent launch failure was the whole reason this
-rem project added an entry point in the first place.
-rem >nul on the success path only: Windows PowerShell can announce a console code
-rem page change ("Active code page: 65001") when a profile or the system has set
-rem one, and that line is noise in front of the panel. The error path below is
-rem left alone - a failure must print everything it has.
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%LAUNCHER%" -Command app >nul
+rem Keep startup diagnostics visible. Missing Node is a recoverable first-run
+rem condition, not a reason for a double-click to silently close its window.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER%" -Command app
 set "RC=%ERRORLEVEL%"
 
 if not "%RC%"=="0" (
   echo.
   echo   The panel did not start ^(exit code %RC%^).
   echo.
-  echo   Run this to see what is wrong:
+  echo   First-time setup ^(explicitly installs Node/dsh when needed^):
+  echo     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0dsh.ps1" -Command install -Target local
+  echo.
+  echo   Check the environment:
   echo     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0dsh.ps1" -Command doctor
   echo.
   pause

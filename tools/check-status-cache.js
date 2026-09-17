@@ -14,67 +14,28 @@
 // production hosts to test a cache would be absurd. Extracting the function also
 // removes the timing noise that made the live latency check flaky the first time
 // it was written.
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
-
-function get(p) {
-  const rt = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'state', 'app.json'), 'utf8'));
-  const base = `http://127.0.0.1:${rt.port}`;
-  return new Promise((resolve, reject) => {
-    const url = `${base}${p}${p.includes('?') ? '&' : '?'}t=${rt.token}`;
-    http.get(url, (res) => {
-      let b = '';
-      res.on('data', (d) => { b += d; });
-      res.on('end', () => resolve({ status: res.statusCode, body: b }));
-    }).on('error', reject);
-  });
-}
-
-const src = fs.readFileSync(path.join(__dirname, '..', 'app', 'server.js'), 'utf8');
-
-// The status-cache block runs from its TTL constants to the end of
-// applyStatusRows. Anchored on real text so a rename fails loudly here rather
-// than silently testing nothing.
-const start = src.indexOf('const STATUS_TTL_MS =');
-const endMarker = 'function startStatusPolling(';
-const end = src.indexOf(endMarker);
-if (start < 0 || end < 0 || end <= start) {
-  console.error('  FAIL  could not locate the status-cache block in app/server.js');
-  process.exit(1);
-}
-const block = src.slice(start, end);
-
-// applyStatusRows lives after startStatusPolling; take it separately.
-const apStart = src.indexOf('function applyStatusRows(');
-const apEnd = src.indexOf('\n}', apStart);
-if (apStart < 0 || apEnd < 0) {
-  console.error('  FAIL  could not locate applyStatusRows in app/server.js');
-  process.exit(1);
-}
-const applyBlock = src.slice(apStart, apEnd + 2);
+const { createStatusCache } = require('../app/lib/status-cache');
 
 function build() {
-  const state = { probes: 0, delayMs: 0, fail: false, rowsPerProbe: 1 };
+  const state = { probes: 0, delayMs: 0, fail: false, rowsPerProbe: 1, now: 1000 };
   const calls = { trace: [] };
-  const factory = new Function('state', 'calls', `
-    const asArray = (v) => Array.isArray(v) ? v : (v == null ? [] : [v]);
-    const show = () => ['status'];
-    const trace = (m) => calls.trace.push(m);
-    const psJson = async () => {
-      state.probes++;
-      const n = state.probes;
-      await new Promise(r => setTimeout(r, state.delayMs));
+  const cache = createStatusCache({
+    clock: () => state.now,
+    trace: message => calls.trace.push(message),
+    probe: async () => {
+      const n = ++state.probes;
+      await new Promise(resolve => setTimeout(resolve, state.delayMs));
       if (state.fail) throw new Error('probe blew up');
       return Array.from({ length: state.rowsPerProbe }, (_, i) => ({ Name: 'inst' + i, State: 'up', Probe: n }));
-    };
-    ${block}
-    ${applyBlock}
-    return { getStatus, applyStatusRows, STATUS_TTL_MS, STATUS_POLL_MS,
-             peek: () => ({ rows: statusCache.rows, at: statusCache.at,
-                            error: statusCache.error, complete: statusCache.complete }) };
-  `);
-  return { api: factory(state, calls), state, calls };
+    },
+  });
+  const api = {
+    getStatus: cache.get, applyStatusRows: cache.apply, invalidate: cache.invalidate,
+    metadata: cache.metadata, remove: cache.remove,
+    STATUS_TTL_MS: cache.ttlMs, STATUS_POLL_MS: cache.pollMs,
+    peek: () => { const s = cache.snapshot(); return { ...s, at: s.probedAt, error: s.statusError }; },
+  };
+  return { api, state, calls };
 }
 
 let pass = 0, fail = 0;
@@ -170,7 +131,7 @@ function check(label, ok, detail) {
     check('the mutated row is the one served next', inst1 && inst1.State === 'down',
       JSON.stringify(inst1));
     check('the other rows are preserved', rows.length === 3, `got ${rows.length}`);
-    check('a mutation refreshes the timestamp', api.peek().at > 0 && api.peek().error === '');
+    check('mutation preserves the complete-probe metadata', api.peek().at === state.now && api.peek().error === '');
   }
 
   console.log('\n=== 4b. a mutation must not make a partial cache look complete ===');
@@ -204,7 +165,7 @@ function check(label, ok, detail) {
     check('after the race the cache holds every instance, not just the mutated one',
       rows.length === 4, `got ${rows.length}: ${JSON.stringify(rows.map((r) => r.Name))}`);
     check('and the mutation is reflected in it',
-      rows.find((r) => r.Name === 'inst1') !== undefined &&
+      rows.find((r) => r.Name === 'inst1').State === 'down' &&
       state.probes === 1, `probes=${state.probes}`);
     check('cache is complete once a real probe has landed', api.peek().complete === true);
   }
@@ -227,29 +188,41 @@ function check(label, ok, detail) {
       `probes=${state.probes} at=${after.at === before.at}`);
   }
 
-  console.log('\n=== 5. the install preview supplies what the confirmation needs ===');
+  console.log('\n=== 5. failures never claim a new successful observation ===');
   {
-    // The dialog is built from this route, so the route has to carry the host
-    // and a plan. Read-only: GET never installs. Skipped when no backend is up,
-    // so the file stays runnable as a pure unit test in CI.
-    let rt = null;
-    try { rt = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'state', 'app.json'), 'utf8')); }
-    catch (_) { rt = null; }
-    if (!rt || !rt.port) {
-      console.log('  SKIP  no running backend (state/app.json absent)');
-    } else {
-      const r = await get('/api/instances/DuckServer/install');
-      let body = null;
-      try { body = JSON.parse(r.body); } catch (_) { body = null; }
-      check('preview answers 200', r.status === 200, true, `HTTP ${r.status}`);
-      check('preview names the ssh host', Boolean(body && body.sshHost), true,
-        body && body.sshHost);
-      check('preview carries a plan', Boolean(body && body.plan && body.plan.length > 10), true,
-        body && String(body.plan).slice(0, 60));
-      check('preview reports whether dsh is installed',
-        Boolean(body && typeof body.dshInstalled === 'boolean'), true);
-    }
+    const { api, state } = build();
+    await api.getStatus(false);
+    const successAt = api.peek().at;
+    state.now += 50000;
+    state.fail = true;
+    await api.getStatus(true);
+    check('last successful timestamp is preserved', api.peek().at === successAt);
+    check('last attempt advances separately', api.peek().attemptedAt === state.now);
+    await api.getStatus(false);
+    check('failed refreshes do not cause a request storm', state.probes === 2);
   }
+  console.log('\n=== 6. partial observations and configuration invalidation ===');
+  {
+    const { api, state } = build();
+    state.rowsPerProbe = 2;
+    await api.getStatus(false);
+    const otherAt = api.metadata('inst0').probedAt;
+    state.now += 100;
+    api.applyStatusRows([{ Name: 'inst1', State: 'down' }]);
+    check('one mutation does not freshen another instance', api.metadata('inst0').probedAt === otherAt);
+    check('the acted-on row has its own observation time', api.metadata('inst1').probedAt === state.now);
+    state.delayMs = 20;
+    const pending = api.getStatus(true);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    api.invalidate();
+    await pending;
+    check('an invalidated in-flight probe is replaced', state.probes === 3);
+    check('replacement completes the cache', api.peek().complete);
+    state.now += api.STATUS_TTL_MS + 1;
+    await api.getStatus(false);
+    check('expiry triggers a fresh probe', state.probes === 4);
+  }
+  // HTTP preview coverage belongs to check-server.js and never discovers a live panel.
 
   console.log(`\n  ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

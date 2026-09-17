@@ -27,13 +27,18 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { createProcessRunner, parseJson } = require('./lib/process-runner');
+const { createStatusCache } = require('./lib/status-cache');
+const { redact, publicUrl, createAuthorization, securityHeaders } = require('./lib/security');
+const { problem, createConfigCache, createOperationGate, mutationResult } = require('./lib/operations');
 
-const LAUNCHER_DIR = path.resolve(__dirname, '..');
-const PS1 = path.join(LAUNCHER_DIR, 'dsh.ps1');
-const RUNTIME_FILE = path.join(LAUNCHER_DIR, 'state', 'app.json');
-
-const TOKEN = crypto.randomBytes(24).toString('base64url');
+// Importing this module never starts a process, reads user state or opens a port.
+function createApp(options = {}) {
+const LAUNCHER_DIR = options.launcherDir || path.resolve(__dirname, '..');
+const RUNTIME_FILE = options.persist === false ? null : path.join(LAUNCHER_DIR, 'state', 'app.json');
+const TOKEN = options.token || crypto.randomBytes(24).toString('base64url');
 const HOST = '127.0.0.1';
+const gate = createOperationGate();
 
 /**
  * Own our log file instead of relying on stdout/stderr.
@@ -48,7 +53,7 @@ const LOG_FILE = path.join(LAUNCHER_DIR, 'logs', 'app.log');
 const LOG_MAX_BYTES = 1024 * 1024;   // trim above ~1 MB
 const LOG_KEEP_LINES = 400;
 
-try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch (_) {}
+if (!options.trace) { try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch (_) {} }
 
 /**
  * Append one line, trimming the file when it grows past LOG_MAX_BYTES.
@@ -58,6 +63,8 @@ try { fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true }); } catch (_) {}
  * trim only runs on the threshold crossing, which keeps the common path cheap.
  */
 function trace(line) {
+  line = redact(line);
+  if (options.trace) { options.trace(line); return; }
   try {
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
     const st = fs.statSync(LOG_FILE);
@@ -72,83 +79,17 @@ function trace(line) {
 
 // ---------------------------------------------------------------- utilities
 
-function psRun(args, timeoutMs = 300000) {
-  trace(`psRun ${JSON.stringify(args)}`);
-  return new Promise((resolve) => {
-    const child = spawn(
-      'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', PS1].concat(args),
-      // No stdin: nothing the launcher runs reads it, and an extra inherited
-      // pipe is one more handle a detached child can keep open.
-      { cwd: LAUNCHER_DIR, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    let out = '';
-    let err = '';
-    let settled = false;
-    let timer = null;
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      resolve({ ok: code === 0, code, out, err });
-    };
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { child.kill(); } catch (_) {}
-      resolve({ ok: false, code: -1, out, err: err + '\n[timeout]' });
-    }, timeoutMs);
-    child.stdout.on('data', (d) => { out += d.toString('utf8'); });
-    child.stderr.on('data', (d) => { err += d.toString('utf8'); });
-    child.on('error', (e) => {
-      if (settled) return;
-      err = String(e.message);
-      finish(-1);
-    });
-    // A command that starts dsh leaves the detached dsh process holding a
-    // duplicate of this child's stdout pipe, so 'close' never fires while that
-    // instance runs: start/restart looked like they hung for the whole life of
-    // the instance even though the launcher had finished and printed its JSON.
-    // The reply is written before the child exits, so its exit plus a moment for
-    // the pipes to drain is the end of the command; 'close' still wins if it
-    // arrives first.
-    child.on('exit', (code) => { setTimeout(() => finish(code), 400); });
-    child.on('close', (code) => finish(code));
-  });
-}
+const psRun = options.run || createProcessRunner({ launcherDir: LAUNCHER_DIR, trace });
 
-/**
- * dsh.ps1 -Json prints one JSON document, but for mutating commands it also
- * prints progress lines first -- and those lines start with "[ok]" / "[info]".
- * Locating the JSON by "first bracket" therefore lands on the "[" of a log
- * prefix and JSON.parse fails. Instead, try every bracket position left to
- * right and keep the first one that parses; log prefixes never parse.
- */
-function parseJson(raw) {
-  if (!raw) return null;
-  const text = raw.replace(/^\uFEFF/, '');
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch !== '[' && ch !== '{') continue;
-    // Cheap pre-filter so we do not JSON.parse on every bracket in a long log.
-    const rest = text.slice(i);
-    if (ch === '[' && !/^\[\s*[{["\]\d-]/.test(rest)) continue;
-    if (ch === '{' && !/^\{\s*"/.test(rest)) continue;
-    try {
-      return JSON.parse(rest);
-    } catch (_) {
-      // keep scanning
-    }
-  }
-  return null;
-}
-
-async function psJson(args, timeoutMs) {
-  const r = await psRun(args.concat(['-Json']), timeoutMs);
-  const data = parseJson(r.out);
-  if (data === null) {
-    const detail = (r.err || r.out || '').trim().split('\n').slice(-4).join(' ').trim();
-    throw new Error(detail || 'launcher produced no JSON');
+async function psJson(args, timeoutMs, allowPlanFailure = false) {
+  const result = await psRun(args.concat(['-Json']), timeoutMs);
+  const data = parseJson(result.out);
+  // Blocked per-instance plans are useful results; a top-level failure is not
+  // an empty successful plan and must retain its actual recovery information.
+  if (allowPlanFailure && data && Array.isArray(data.plans) && !data.error) return data;
+  if (!result.ok || result.code !== 0 || data === null || (data && data.error)) {
+    throw problem(502, result.errorCode || (data && data.errorCode) || 'LAUNCHER_FAILED',
+      redact(result.message || (data && (data.message || data.error)) || result.err || '启动器未返回有效 JSON。'));
   }
   return data;
 }
@@ -170,18 +111,8 @@ async function psJson(args, timeoutMs) {
  * (the local one), not the one just acted on. Reporting that as the result made
  * stopping a remote instance look like a failure even though it succeeded.
  */
-async function psMutate(args, timeoutMs, name) {
-  const r = await psRun(args.concat(['-Json']), timeoutMs);
-  const parsed = parseJson(r.out);
-  const rows = Array.isArray(parsed) ? parsed : null;
-  const state = rows ? (rows.find((x) => x && x.Name === name) || null) : null;
-  return {
-    code: r.code,
-    err: (r.err || '').trim(),
-    raw: (r.out || '').trim(),
-    rows,
-    state,
-  };
+async function psMutate(args, timeoutMs, name, expected) {
+  return mutationResult(await psRun(args.concat(['-Json']), timeoutMs), name, expected);
 }
 
 const show = (cmd, name, extra) =>
@@ -215,16 +146,11 @@ function asArray(value) {
  * A throw is deliberately NOT cached: a transient failure would otherwise
  * poison the panel until the backend restarted.
  */
-let configCache = null;
-
-async function loadInstances() {
-  if (configCache) return configCache;
-  configCache = asArray(await psJson(show('list'), 30000));
-  return configCache;
-}
-
+const configStore = createConfigCache(() => psJson(show('list'), 30000));
+const loadInstances = () => configStore.get();
 function invalidateConfig() {
-  configCache = null;
+  configStore.invalidate();
+  statusStore.invalidate();
 }
 
 // ------------------------------------------------------- status cache
@@ -251,84 +177,12 @@ function invalidateConfig() {
 // expired entry and paid ~1.5s for their own probe, which defeats the point.
 // At 45s the background poll (30s) always refreshes before expiry, so every read
 // is served from cache and only a genuinely dead poller makes a reader wait.
-const STATUS_TTL_MS = 45000;
-const STATUS_POLL_MS = 30000;
-
-let statusCache = { rows: null, at: 0, error: '', complete: false };
-let statusInFlight = null;
-
-function getStatus(force) {
-  const age = Date.now() - statusCache.at;
-  // `complete` matters as much as the age. A mutation can arrive before the
-  // first full probe has finished (the panel is interactive during those first
-  // seconds) and folds its own single row into the cache; without this flag that
-  // row would look like a fresh, authoritative view of the whole farm, and the
-  // panel would show one instance instead of five until the next poll. Only a
-  // real probe may declare the cache complete.
-  if (!force && statusCache.rows && statusCache.complete && age < STATUS_TTL_MS) {
-    return Promise.resolve(statusCache.rows);
-  }
-  if (statusInFlight) return statusInFlight;
-  statusInFlight = (async () => {
-    try {
-      const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
-      statusCache = { rows, at: Date.now(), error: '', complete: true };
-      trace(`status refreshed (${rows.length} instance(s))`);
-      return rows;
-    } catch (e) {
-      // Keep the last good rows: a transient probe failure should not blank the
-      // panel. The empty case is the one time we have nothing to fall back on.
-      statusCache = {
-        rows: statusCache.rows,
-        at: Date.now(),
-        error: String(e && e.message ? e.message : e),
-        complete: statusCache.complete,
-      };
-      trace(`status refresh failed: ${statusCache.error}`);
-      if (statusCache.rows) return statusCache.rows;
-      throw e;
-    } finally {
-      statusInFlight = null;
-    }
-  })();
-  return statusInFlight;
-}
-
-let statusTimer = null;
-
-function startStatusPolling() {
-  if (statusTimer) return;
-  // Unref'd so a pending timer can never hold the process open.
-  statusTimer = setInterval(() => {
-    getStatus(true).catch(() => { /* already traced */ });
-  }, STATUS_POLL_MS);
-  if (statusTimer.unref) statusTimer.unref();
-}
-
-/**
- * Fold a mutation's own result into the cache.
- *
- * The mutation command already returns the acted-on instance's new row, so
- * reusing it avoids the full re-probe the route used to trigger, and the panel's
- * very next read is already correct.
- */
-function applyStatusRows(rows) {
-  const incoming = asArray(rows);
-  if (!incoming.length) return;
-  const byName = new Map((statusCache.rows || []).map((r) => [r.Name, r]));
-  for (const r of incoming) {
-    if (r && r.Name) byName.set(r.Name, r);
-  }
-  // Preserve `complete`: folding in a mutation does not make a partial cache
-  // whole, so a cache that has only ever seen mutations keeps asking to be
-  // filled by a real probe (see getStatus).
-  statusCache = {
-    rows: [...byName.values()],
-    at: Date.now(),
-    error: '',
-    complete: statusCache.complete,
-  };
-}
+const statusStore = createStatusCache({
+  probe: async () => asArray(await psJson(show('status', null, ['-Probe']), 300000)),
+  trace,
+});
+const getStatus = force => statusStore.get(force);
+const applyStatusRows = rows => statusStore.apply(rows);
 
 async function assertKnownInstance(name) {
   const insts = await loadInstances();
@@ -350,11 +204,12 @@ function mapInstance(r, c) {
   const cfg = c || {};
   return {
     name: r.Name,
+    displayName: cfg.displayName || r.DisplayName || r.Name,
     kind: r.Kind,
     state: r.State,
     port: r.Port,
-    detail: r.Detail,
-    url: r.Url,
+    detail: redact(r.Detail),
+    url: publicUrl(r.Url),
     http: r.Http,
     sshHost: cfg.sshHost || r.SshHost || '',
     description: cfg.description || '',
@@ -369,15 +224,21 @@ function mapInstance(r, c) {
     latestVersion: r.LatestVersion || '',
     updateAvailable: Boolean(r.UpdateAvailable),
     versionDrift: Boolean(r.VersionDrift),
+    pinnedVersion: cfg.dshVersion || r.PinnedVersion || r.DshVersionPinned || '',
+    nodeVersion: r.NodeVersion || r.NodeV || '',
+    runningVersion: r.RunningVersion || '',
+    targetVersion: r.TargetVersion || cfg.dshVersion || r.LatestVersion || '',
+    autoInstall: cfg.autoInstall !== false,
+    stopRemoteService: cfg.stopRemoteService !== false,
     // Why a host is unreachable, classified by the launcher from the ssh error.
     // The panel shows the hint and a matching next step; without it a card said
     // only "unreachable", which tells the reader nothing they can act on.
     failCode: r.FailCode || '',
-    hint: r.Hint || '',
+    hint: redact(r.Hint || ''),
     // Where a local instance starts sessions. Absent for remote rows, which is
     // deliberate: the directory is on the other machine, so offering to open it
     // here would be a lie. The panel gates the reveal action on this.
-    workdir: r.Workdir || '',
+    workdir: r.Workdir || cfg.workdir || '',
   };
 }
 
@@ -388,22 +249,13 @@ function send(res, status, body, headers) {
     ? body
     : JSON.stringify(body === undefined ? {} : body);
   res.writeHead(status, Object.assign(
-    { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+    securityHeaders, { 'Content-Type': 'application/json; charset=utf-8' },
     headers || {}
   ));
   res.end(payload);
 }
 
-function authorized(req, url) {
-  // Same-origin fence first: a foreign page cannot read the token, but it could
-  // still attempt a blind request, and Origin/Host mismatch is the cheapest way
-  // to reject that class outright.
-  const host = req.headers.host || '';
-  if (host !== `${HOST}:${PORT}`) return false;
-  const origin = req.headers.origin;
-  if (origin && origin !== `http://${HOST}:${PORT}`) return false;
-  return url.searchParams.get('t') === TOKEN;
-}
+const authorization = createAuthorization({ token: TOKEN, port: () => PORT });
 
 async function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -411,12 +263,17 @@ async function readBody(req) {
     let size = 0;
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > 1e6) { reject(new Error('body too large')); req.destroy(); return; }
+      if (size > 65536) { reject(problem(413, 'BODY_TOO_LARGE', '请求内容过大。')); return; }
       data += chunk;
     });
     req.on('end', () => {
+      if (size > 65536) return;
       if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); } catch (_) { resolve({}); }
+      try {
+        const body = JSON.parse(data);
+        if (!body || Array.isArray(body) || typeof body !== 'object') throw new Error();
+        resolve(body);
+      } catch (_) { reject(problem(400, 'INVALID_JSON', '请求必须是有效 JSON 对象。')); }
     });
     req.on('error', reject);
   });
@@ -424,7 +281,32 @@ async function readBody(req) {
 
 // ---------------------------------------------------------------- routes
 
+async function planFor(name, action) {
+  if (!['start', 'install', 'upgrade'].includes(action)) throw problem(400, 'INVALID_ACTION', '不支持的计划类型。');
+  await assertKnownInstance(name);
+  const result = await psJson(show('plan', name, ['-Action', action]), 180000, true);
+  const plan = result && Array.isArray(result.plans) && result.plans.find(item => item.name === name);
+  if (!plan) throw problem(502, 'INVALID_PLAN', '启动器未返回该实例的操作计划。');
+  return { ...plan, ok: result.ok !== false && plan.ok !== false };
+}
+
+async function operate(action, name, timeoutMs) {
+  return gate.run(action === 'install' ? ['*'] : [name], async () => {
+    const cfg = (await assertKnownInstance(name)).find(item => item.name === name);
+    const up = row => row && ['up', 'up-external'].includes(row.State);
+    const stopped = row => row && (['down', 'disabled'].includes(row.State) ||
+      (cfg.kind === 'remote' && cfg.stopRemoteService === false && ['remote-only', 'unreachable'].includes(row.State)));
+    const expected = action === 'stop' ? stopped : ['start', 'restart'].includes(action) ? up : null;
+    const result = await psMutate(show(action, name, ['-NoOpen']), timeoutMs, name, expected);
+    applyStatusRows(result.rows);
+    if (action === 'install') statusStore.invalidate();
+    return { ...result, kind: cfg.kind,
+      instance: result.state ? Object.assign(mapInstance(result.state, cfg), statusStore.metadata(name)) : null };
+  });
+}
+
 const routes = {
+  'GET /api/instances/:name/plan': ctx => planFor(ctx.params.name, ctx.url.searchParams.get('action') || 'start'),
   'GET /api/instances/:name/url': async (ctx) => {
     // A freshly probed URL for one instance.
     //
@@ -443,7 +325,7 @@ const routes = {
     const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name);
     return {
       ok: Boolean(row && row.Url),
-      instance: row ? mapInstance(row, cfg) : null,
+      instance: row ? { ...mapInstance(row, cfg), url: row.Url || '' } : null,
     };
   },
 
@@ -456,22 +338,16 @@ const routes = {
     // is empty, which is the case a caller uses it for (first paint, or a
     // deliberately offline look).
     const wantNoProbe = ctx.url.searchParams.get('probe') === '0';
-    if (!wantNoProbe) {
-      const rows = await getStatus(false);
-      const cfg = await loadInstances();
-      const byName = new Map(cfg.map((c) => [c.name, c]));
-      // `probedAt` / `statusError` let the panel tell "live" apart from "last
-      // known good, because the background probe is failing". Presenting a stale
-      // row as current would be the one thing this cache must not do.
-      return rows.map((r) => Object.assign(mapInstance(r, byName.get(r.Name)), {
-        probedAt: statusCache.at,
-        statusError: statusCache.error || '',
-      }));
-    }
-    const rows = asArray(await psJson(show('status', null, ['-NoProbe']), 300000));
-    const cfg = await loadInstances();
-    const byName = new Map(cfg.map((c) => [c.name, c]));
-    return rows.map((r) => mapInstance(r, byName.get(r.Name)));
+    const force = ctx.url.searchParams.get('refresh') === '1';
+    const cfg = await configStore.get(force);
+    const byName = new Map(cfg.map(c => [c.name, c]));
+    const rows = wantNoProbe ? (statusStore.snapshot().rows || cfg.map(c => ({
+      Name: c.name, Kind: c.kind, State: c.enabled === false ? 'disabled' : 'unknown',
+      Detail: '尚未探测', Port: c.port || c.localPort || 0,
+    }))) : await getStatus(force);
+    return rows.filter(r => byName.has(r.Name)).map(r => Object.assign(mapInstance(r, byName.get(r.Name)), {
+      ...statusStore.metadata(r.Name), statusError: redact(statusStore.metadata(r.Name).statusError),
+    }));
   },
 
   'GET /api/instances/:name/logs': async (ctx) => {
@@ -485,148 +361,66 @@ const routes = {
       .filter((l) => l.trim() !== '' && !/^\s*(logs |---)/.test(l))
       .map((l) => l.replace(/^\s{2}/, ''))
       .join('\n');
-    return { name: ctx.params.name, text: text || '(no output)' };
+    return { name: ctx.params.name, ok: r.ok, text: redact(text || '(no output)') };
   },
 
-  'POST /api/instances/:name/start': async (ctx) => {
-    const cfg = await assertKnownInstance(ctx.params.name);
-    const r = await psMutate(show('start', ctx.params.name, ['-NoOpen']), 300000, ctx.params.name);
-    applyStatusRows(r.state);
-    return {
-      ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
-      state: r.state, raw: r.raw, err: r.err, code: r.code,
-      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
-    };
-  },
+  'POST /api/instances/:name/start': ctx => operate('start', ctx.params.name, 600000),
+  'POST /api/instances/:name/stop': ctx => operate('stop', ctx.params.name, 180000),
+  'POST /api/instances/:name/restart': ctx => operate('restart', ctx.params.name, 600000),
 
-  'POST /api/instances/:name/stop': async (ctx) => {
-    const cfg = await assertKnownInstance(ctx.params.name);
-    const r = await psMutate(show('stop', ctx.params.name), 180000, ctx.params.name);
-    applyStatusRows(r.state);
-    return {
-      ok: Boolean(r.state && r.state.State === 'down'),
-      state: r.state, raw: r.raw, err: r.err, code: r.code,
-      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
-    };
-  },
-
-  'POST /api/instances/:name/restart': async (ctx) => {
-    const cfg = await assertKnownInstance(ctx.params.name);
-    const r = await psMutate(show('restart', ctx.params.name), 420000, ctx.params.name);
-    applyStatusRows(r.state);
-    return {
-      ok: Boolean(r.state && (r.state.State === 'up' || r.state.State === 'up-external')),
-      state: r.state, raw: r.raw, err: r.err, code: r.code,
-      instance: r.state ? mapInstance(r.state, cfg.find((c) => c.name === ctx.params.name)) : null,
-    };
-  },
-
-  'POST /api/instances': async (ctx) => {
-    const b = ctx.body || {};
-    if (!b.sshHost || typeof b.sshHost !== 'string' || !/^[A-Za-z0-9._@:-]+$/.test(b.sshHost)) {
-      const e = new Error('sshHost is required and may only contain letters, digits, . _ @ : -');
-      e.statusCode = 400;
-      throw e;
+  'POST /api/instances': ctx => gate.run(['*'], async () => {
+    const b = ctx.body;
+    if (typeof b.sshHost !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._@:\[\]-]{0,253}$/.test(b.sshHost)) {
+      throw problem(400, 'INVALID_HOST', 'SSH 主机必须是有效别名或 user@host，不能包含空格或命令字符。');
     }
     const args = show('add', null, ['-SshHost', b.sshHost]);
     if (b.name) {
-      if (!/^[A-Za-z0-9._-]+$/.test(b.name)) {
-        const e = new Error('name may only contain letters, digits, . _ -');
-        e.statusCode = 400;
-        throw e;
+      if (typeof b.name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/.test(b.name)) {
+        throw problem(400, 'INVALID_NAME', '实例标识只能使用字母、数字、点、下划线、@ 和连字符，且须以字母或数字开头。');
       }
       args.push('-Name', b.name);
     }
-    if (b.port) args.push('-Port', String(parseInt(b.port, 10) || 3080));
-    const r = await psRun(args, 60000);
-    // The list changed: drop the cache so the next read sees the new instance.
-    invalidateConfig();
-    const insts = await loadInstances();
-    return { ok: r.ok, raw: (r.out || '').trim(), instances: insts };
-  },
-
-  'GET /api/instances/:name/install': async (ctx) => {
-    // A preview built so the confirmation can state what would actually change
-    // instead of a generic warning. For a remote host that comes from the probe
-    // the URL route already performs, because whether dsh is missing, present
-    // but broken, or already fine differs per host.
-    await assertKnownInstance(ctx.params.name);
-    const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name) || {};
-    const isLocal = (cfg.kind || 'remote') === 'local';
-
-    if (isLocal) {
-      // A local install is a different proposition and used to have no preview
-      // at all: the route described a remote deployment unconditionally, so a
-      // local card would have been told "服务器上还没有 dsh" about a machine the
-      // reader is sitting at. Nothing here touches the network or ssh.
-      return {
-        name: ctx.params.name,
-        kind: 'local',
-        sshHost: '',
-        dshInstalled: false,
-        dshVersion: '',
-        nodeVersion: '',
-        linger: '',
-        reachable: true,
-        plan: '将在这台机器上执行：npm install -g @deepseek-ai/dsh，装进 npm 的全局目录。' +
-              '不会安装 Node，也不会修改 hosts.json。',
-      };
+    if (b.displayName !== undefined) {
+      if (typeof b.displayName !== 'string' || b.displayName.length > 120) throw problem(400, 'INVALID_DISPLAY_NAME', '显示名称最多 120 个字符。');
+      args.push('-DisplayName', b.displayName);
     }
+    if (b.port !== undefined) {
+      if (!Number.isInteger(b.port) || b.port < 1 || b.port > 65535) throw problem(400, 'INVALID_PORT', '远端端口必须是 1–65535 的整数。');
+      args.push('-Port', String(b.port));
+    }
+    const result = await psMutate(args, 60000, null);
+    invalidateConfig();
+    return { ...result, instances: await loadInstances() };
+  }),
 
-    const rows = asArray(await psJson(show('status', null, ['-Probe']), 300000));
-    const row = rows.find((r) => r.Name === ctx.params.name) || {};
-    const version = row.DshVersion || '';
-    const installed = Boolean(row.DshInstalled);
-    return {
-      name: ctx.params.name,
-      sshHost: cfg.sshHost || row.SshHost || ctx.params.name,
-      kind: cfg.kind || 'remote',
-      dshInstalled: installed,
-      dshVersion: version,
-      nodeVersion: row.NodeV || '',
-      linger: row.Linger || '',
-      reachable: row.SshReady !== false,
-      plan: row.DshInstalled
-        ? `服务器上已有 dsh ${version || ''}；将更新服务定义并重新部署 systemd 单元`
-        : '服务器上还没有 dsh；将安装 Node 和 dsh，并部署 systemd 用户服务',
-    };
-  },
-
-  'POST /api/instances/:name/install': async (ctx) => {
-    // Destructive-ish either way, so the panel always confirms first and the
-    // confirm text names the target: a remote machine, or the one the reader is
-    // sitting at. Locally it installs a global npm package and nothing else -
-    // Node is never installed for you, and no config file is touched.
+  'POST /api/instances/:name/config': ctx => gate.run(['*'], async () => {
     await assertKnownInstance(ctx.params.name);
-    const cfg = (await loadInstances()).find((c) => c.name === ctx.params.name) || {};
-    const isLocal = (cfg.kind || 'remote') === 'local';
-    // The local path only runs npm, but a cold registry plus the --force retry
-    // can take minutes; the remote path provisions a whole host.
-    const r = await psRun(show('install', ctx.params.name), isLocal ? 600000 : 300000);
-    // Installation can change the reported version and service state.
-    getStatus(true).catch(() => { /* traced inside */ });
-    return { ok: r.ok, kind: isLocal ? 'local' : 'remote', raw: (r.out || '').trim() };
-  },
-
-  'GET /api/ssh-hosts': async () => {
-    const cfgFile = path.join(process.env.USERPROFILE || '', '.ssh', 'config');
-    const configured = new Set((await loadInstances()).map((i) => i.sshHost));
-    if (!fs.existsSync(cfgFile)) return { hosts: [], configPath: cfgFile };
-    const hosts = [];
-    for (const line of fs.readFileSync(cfgFile, 'utf8').split(/\r?\n/)) {
-      const m = /^\s*Host\s+(.+)$/i.exec(line);
-      if (!m) continue;
-      for (const alias of m[1].trim().split(/\s+/)) {
-        if (!alias || /[*?]/.test(alias)) continue;
-        if (hosts.includes(alias)) continue;
-        hosts.push(alias);
+    const fields = new Set(['displayName', 'description', 'workdir', 'enabled', 'dshVersion', 'autoInstall', 'stopRemoteService']);
+    if (!Object.keys(ctx.body).length || Object.keys(ctx.body).some(key => !fields.has(key))) throw problem(400, 'INVALID_PATCH', '配置修改包含不支持的字段或没有任何修改。');
+    for (const [key, value] of Object.entries(ctx.body)) {
+      if (['enabled', 'autoInstall', 'stopRemoteService'].includes(key) ? typeof value !== 'boolean' : typeof value !== 'string') {
+        throw problem(400, 'INVALID_FIELD', '配置字段类型不正确。');
       }
     }
-    return {
-      configPath: cfgFile,
-      hosts: hosts.map((h) => ({ name: h, configured: configured.has(h) })),
-    };
+    const result = await psMutate(show('edit', ctx.params.name, ['-Patch', JSON.stringify(ctx.body)]), 60000, ctx.params.name);
+    invalidateConfig();
+    return { ...result, instances: await loadInstances() };
+  }),
+
+  'POST /api/instances/:name/remove': ctx => gate.run(['*'], async () => {
+    await assertKnownInstance(ctx.params.name);
+    const result = await psMutate(show('remove', ctx.params.name), 60000, ctx.params.name);
+    if (result.ok) statusStore.remove(ctx.params.name);
+    invalidateConfig();
+    return { ...result, instances: await loadInstances() };
+  }),
+
+  'GET /api/instances/:name/install': async ctx => {
+    const plan = await planFor(ctx.params.name, 'install');
+    return { ...plan, plan: plan.summary };
   },
+  'POST /api/instances/:name/install': ctx => operate('install', ctx.params.name, 600000),
+  'GET /api/ssh-hosts': () => psJson(show('ssh-hosts'), 30000),
 
   'GET /api/tray': async () => {
     // The launcher owns tray process management, so ask it rather than tracking
@@ -663,11 +457,11 @@ const routes = {
     } catch (_) { /* fall through to the raw output */ }
     const running = Boolean(status && status.running);
     return {
-      ok: stop ? !running : running,
+      ok: Boolean(status && r.ok && (stop ? !running : running)),
       running,
       pid: (status && status.pid) || 0,
       action,
-      raw: (r.out || '').trim(),
+      raw: redact(r.out),
     };
   },
 
@@ -676,26 +470,21 @@ const routes = {
     return { instances: await psJson(show('check'), 180000) };
   },
 
-  'POST /api/upgrade': async (ctx) => {
-    // Upgrading restarts dsh on the target, which ends any session in flight, so
-    // this is only ever reached by an explicit click -- never by a poll, and
-    // never by starting an instance.
+  'GET /api/upgrade': async ctx => {
     const name = ctx.url.searchParams.get('name') || '';
-    const dryRun = ctx.url.searchParams.get('dry') === '1';
-    const args = show('upgrade', name || null, dryRun ? ['-DryRun'] : []);
-    const r = await psRun(args, 900000);
-    // A slow npm install can outlive the child's stdout, so re-read status to
-    // report what actually happened rather than trusting the command's own word.
-    let after = null;
-    try { after = await psJson(show('check'), 180000); } catch (_) { }
-    return {
-      ok: r.code === 0,
-      dryRun,
-      name: name || '(all)',
-      versions: after && after.instances ? after.instances : after,
-      raw: (r.out || '').trim(),
-    };
+    if (name) await assertKnownInstance(name);
+    return psJson(show('plan', name || null, ['-Action', 'upgrade']), 180000, true);
   },
+  'POST /api/upgrade': ctx => gate.run(['*'], async () => {
+    const name = ctx.url.searchParams.get('name') || '';
+    if (name) await assertKnownInstance(name);
+    const dryRun = ctx.url.searchParams.get('dry') === '1';
+    if (dryRun) return { ...await psJson(show('plan', name || null, ['-Action', 'upgrade']), 180000, true), dryRun: true };
+    const result = await psMutate(show('upgrade', name || null, ['-NoOpen']), 900000, name || null);
+    applyStatusRows(result.rows);
+    statusStore.invalidate();
+    return { ...result, dryRun: false, name: name || '(all)' };
+  }),
 
   'GET /api/balance': async (ctx) => {
     // Read-only. Cached for 5 minutes inside the launcher, so a 20s panel poll
@@ -706,7 +495,7 @@ const routes = {
 
   'GET /api/doctor': async () => {
     const r = await psRun(show('doctor'), 300000);
-    return { text: (r.out || '').replace(/\r/g, '') };
+    return { ok: r.ok, text: redact(r.out).replace(/\r/g, '') };
   },
 
   'POST /api/reveal': async (ctx) => {
@@ -729,10 +518,11 @@ const routes = {
     }
 
     if (/^https?:\/\//i.test(raw)) {
-      // Only an http(s) URL may be opened as a URL, and only those two schemes.
-      const { spawn: sp } = require('child_process');
-      sp('rundll32.exe', ['url.dll,FileProtocolHandler', raw],
-        { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      const target = new URL(raw);
+      if (target.protocol !== 'http:' || target.hostname !== HOST || target.username || target.password) {
+        throw problem(400, 'INVALID_URL', '这里只能打开本机 loopback 上的实例地址。');
+      }
+      await launchDesktop('rundll32.exe', ['url.dll,FileProtocolHandler', raw]);
       return { ok: true, opened: 'url' };
     }
 
@@ -750,12 +540,19 @@ const routes = {
     }
     // `explorer.exe <dir>` opens the folder itself and reuses an existing
     // window; url.dll would instead try to *execute* the target.
-    const { spawn: sp } = require('child_process');
-    sp('explorer.exe', [resolved],
-      { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    await launchDesktop('explorer.exe', [resolved]);
     return { ok: true, opened: 'directory' };
   },
 };
+
+async function launchDesktop(command, args) {
+  if (options.launchDesktop) return options.launchDesktop(command, args);
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.once('error', () => reject(problem(502, 'OPEN_FAILED', '无法启动桌面应用。')));
+    child.once('spawn', () => { child.unref(); resolve(); });
+  });
+}
 
 // ---------------------------------------------------------------- dispatcher
 
@@ -781,82 +578,95 @@ function matchRoute(method, pathname) {
 
 let PORT = 0;
 
+const assets = new Map([
+  ['/assets/panel.css', ['panel.css', 'text/css; charset=utf-8']],
+  ['/assets/panel.mjs', ['panel.mjs', 'text/javascript; charset=utf-8']],
+  ['/assets/model.mjs', ['model.mjs', 'text/javascript; charset=utf-8']],
+]);
+const uiDir = options.uiDir || path.join(__dirname, 'ui');
 const server = http.createServer(async (req, res) => {
-  let url;
   try {
-    url = new URL(req.url, `http://${HOST}:${PORT}`);
-  } catch (_) {
-    return send(res, 400, { error: 'bad request' });
-  }
-  const pathname = url.pathname;
-
-  // The UI shell itself is served with the token injected so the page can call
-  // the API; every other route requires the token.
-  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-    if (!authorized(req, url)) return send(res, 403, { error: 'forbidden' }, { 'Content-Type': 'text/plain' });
-    const html = fs.readFileSync(path.join(__dirname, 'ui', 'index.html'), 'utf8')
-      .replace(/__TOKEN__/g, TOKEN);
-    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8' });
-  }
-
-  if (!pathname.startsWith('/api/')) return send(res, 404, { error: 'not found' });
-  if (!authorized(req, url)) return send(res, 403, { error: 'forbidden' });
-
-  const m = matchRoute(req.method, pathname);
-  if (!m) return send(res, 404, { error: 'no such endpoint' });
-
-  try {
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    const pathname = url.pathname;
+    if (!authorization.sameOrigin(req)) return send(res, 403, { error: '请求来源不允许。', errorCode: 'FORBIDDEN' });
+    if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+      return send(res, 200, fs.readFileSync(path.join(uiDir, 'index.html')), { 'Content-Type': 'text/html; charset=utf-8' });
+    }
+    if (req.method === 'GET' && assets.has(pathname)) {
+      const [file, type] = assets.get(pathname);
+      return send(res, 200, fs.readFileSync(path.join(uiDir, file)), { 'Content-Type': type });
+    }
+    if (!pathname.startsWith('/api/')) return send(res, 404, { error: '未找到该资源。' });
+    if (!authorization.authenticated(req)) return send(res, 403, { error: '面板凭据已失效，请重新打开 Start.exe。', errorCode: 'UNAUTHORIZED' });
+    if (req.method === 'POST' && pathname === '/api/session') {
+      await readBody(req);
+      return send(res, 200, { ok: true }, { 'Set-Cookie': authorization.sessionCookie() });
+    }
+    // Decode and dispatch inside the error boundary: malformed percent escapes
+    // must answer 400, not become an unhandled rejection that kills the panel.
+    const route = matchRoute(req.method, pathname);
+    if (!route) return send(res, 404, { error: '未找到该接口。' });
     const body = req.method === 'POST' ? await readBody(req) : null;
-    const result = await m.handler({ url, params: m.params, body });
-    send(res, 200, result);
-  } catch (err) {
-    send(res, err.statusCode || 500, {
-      error: String(err && err.message ? err.message : err),
+    send(res, 200, await route.handler({ url, params: route.params, body }));
+  } catch (error) {
+    send(res, error instanceof URIError ? 400 : error.statusCode || 500, {
+      ok: false, errorCode: error.errorCode || (error instanceof URIError ? 'INVALID_PATH' : 'REQUEST_FAILED'),
+      error: redact(error instanceof URIError ? '请求路径编码不正确。' : error.message || '请求失败。'),
     });
   }
 });
+server.requestTimeout = 30000;
+server.headersTimeout = 10000;
+server.on('error', error => trace('HTTP server error: ' + error.code));
+const startedAt = new Date().toISOString();
 
-server.listen(0, HOST, () => {
-  PORT = server.address().port;
-  const publicUrl = `http://${HOST}:${PORT}/?t=${TOKEN}`;
-  try {
-    fs.mkdirSync(path.dirname(RUNTIME_FILE), { recursive: true });
-    fs.writeFileSync(RUNTIME_FILE, JSON.stringify({
-      pid: process.pid, port: PORT, token: TOKEN, url: publicUrl,
-      startedAt: new Date().toISOString(),
-    }, null, 2), 'utf8');
-  } catch (e) {
-    trace(`warning: could not write ${RUNTIME_FILE}: ${e.message}`);
-  }
-  trace(`ready on port ${PORT}`);
-  // Best effort: harmless when stdout is a pipe, and wrapped so a detached
-  // process with no stdout cannot die here.
-  try { process.stdout.write(`DSH_APP_READY ${JSON.stringify({ port: PORT, token: TOKEN, url: publicUrl })}\n`); } catch (_) {}
-
-  // Warm the config cache now, while nobody is waiting. Populating it lazily
-  // would make whichever request arrived first pay ~1s, and the panel's very
-  // first paint is exactly that request.
-  loadInstances()
-    .then((n) => trace(`config cache warmed (${n.length} instance(s))`))
-    .catch((e) => trace(`config cache warm-up failed (will retry on demand): ${e.message}`));
-
-  // Probe once now, then keep refreshing in the background. Callers read the
-  // cache and never wait on ssh, so the first panel paint is served from it too.
-  getStatus(true)
-    .then((rows) => trace(`initial status probe done (${rows.length} instance(s))`))
-    .catch((e) => trace(`initial status probe failed: ${e.message}`));
-  startStatusPolling();
-});
-
-server.on('error', (e) => {
-  trace(`app server error: ${e.message}`);
-  try { process.stderr.write(`app server error: ${e.message}\n`); } catch (_) {}
-  process.exit(1);
-});
-
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    try { fs.unlinkSync(RUNTIME_FILE); } catch (_) {}
-    process.exit(0);
+function start() {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, HOST, () => {
+      server.removeListener('error', reject);
+      PORT = server.address().port;
+      try {
+        if (RUNTIME_FILE) {
+          fs.mkdirSync(path.dirname(RUNTIME_FILE), { recursive: true, mode: 0o700 });
+          const staging = RUNTIME_FILE + '.' + process.pid + '.tmp';
+          fs.writeFileSync(staging, JSON.stringify({
+            pid: process.pid, port: PORT, token: TOKEN, url: `http://${HOST}:${PORT}/#t=${TOKEN}`, startedAt,
+            configPath: process.env.DSH_LAUNCHER_CONFIG || '', sshConfigPath: process.env.DSH_SSH_CONFIG || '',
+          }), { encoding: 'utf8', mode: 0o600 });
+          fs.renameSync(staging, RUNTIME_FILE);
+        }
+      } catch (_) {
+        server.close();
+        reject(new Error('无法安全保存面板运行文件，请检查目录权限。'));
+        return;
+      }
+      trace('ready on port ' + PORT);
+      if (options.poll !== false) {
+        loadInstances().catch(() => trace('config warm-up failed'));
+        getStatus(true).catch(() => trace('initial status probe failed'));
+        statusStore.start();
+      }
+      resolve({ port: PORT });
+    });
   });
+}
+async function close() {
+  statusStore.stop();
+  if (server.listening) await new Promise(resolve => server.close(resolve));
+  if (RUNTIME_FILE) {
+    try {
+      const current = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
+      if (current.pid === process.pid && current.startedAt === startedAt && current.port === PORT) fs.unlinkSync(RUNTIME_FILE);
+    } catch (_) {}
+  }
+}
+return { server, start, close, statusStore };
+}
+
+module.exports = { createApp };
+if (require.main === module) {
+  const app = createApp();
+  app.start().catch(error => { process.stderr.write(redact(error.message) + '\n'); process.exitCode = 1; });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { app.close().then(() => process.exit(0)); });
 }

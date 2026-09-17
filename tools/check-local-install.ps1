@@ -38,6 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'check-launcher-contracts.ps1') -HelpersOnly
 
 if ($env:OS -ne 'Windows_NT') {
   Write-Host '  SKIP  needs a Windows PowerShell launcher'
@@ -51,7 +52,7 @@ if (-not (Test-Path $srcLauncher)) { Write-Host "  FAIL  no launcher at $srcLaun
 $pass = 0; $fail = 0
 function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
   if ($Ok) { $script:pass++; Write-Host ("  PASS  {0}" -f $Name) }
-  else     { $script:fail++; Write-Host ("  FAIL  {0}  {1}" -f $Name, $Detail) }
+  else     { $script:fail++; Write-Host ("  FAIL  {0}" -f $Name) }
 }
 
 $scratch = Join-Path $env:TEMP ("dshdeck-localinst-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -76,6 +77,7 @@ try {
     Copy-Item -Path (Join-Path $repoRoot $item) -Destination $clone -Recurse -Force
   }
   Copy-Item -Path $srcLauncher -Destination (Join-Path $clone 'dsh.ps1') -Force
+  Copy-LauncherTestModules $srcLauncher $clone
 
   # The config. A local instance on a port nothing uses, starting in a scratch
   # directory, so a start attempt in section 2 cannot disturb anything real.
@@ -86,10 +88,14 @@ try {
 {
   "version": 1,
   "instances": [
-    { "name": "local", "kind": "local", "port": 39217, "workdir": "$($workdir -replace '\\', '\\')" }
+    { "name": "local", "kind": "local", "port": 39217, "dshVersion": "0.1.0-rc.6", "workdir": "$($workdir -replace '\\', '\\')" }
   ]
 }
 "@ | Set-Content -Path $config -Encoding UTF8
+
+  # A current synthetic cache keeps doctor offline even when it reports latest.
+  New-Item -ItemType Directory -Path (Join-Path $clone 'state') -Force | Out-Null
+  [IO.File]::WriteAllText((Join-Path $clone 'state\latest-version.json'), ('{"version":"0.1.0-rc.6","checkedAt":"' + (Get-Date).ToString('o') + '"}'), (New-Object Text.UTF8Encoding($false)))
 
   # The npm stub. Compiled, not a .cmd: see the header.
   #
@@ -111,7 +117,7 @@ public class NpmStub {
     // the machine's REAL npm prefix and finds the REAL dsh - which is how an
     // earlier version of this test stopped testing "dsh is missing" and started
     // measuring the host.
-    if (args.Length >= 2 && args[0] == "root" && args[1] == "-g") {
+    if (args.Length >= 2 && ((args[0] == "root" && args[1] == "-g") || (args[0] == "prefix" && args[1] == "-g"))) {
       Console.WriteLine(Environment.GetEnvironmentVariable("DSH_STUB_NPM_PREFIX") ?? "");
       return 0;
     }
@@ -166,6 +172,8 @@ using System;
 public class NodeStub {
   public static int Main(string[] args) {
     string mode = Environment.GetEnvironmentVariable("DSH_STUB_NODE_MODE");
+    if (args.Length > 0 && args[0] == "-") { Console.In.ReadToEnd(); Console.WriteLine(mode == "ok" ? "NODE_OK" : "BROKEN"); return 0; }
+    if (args.Length > 0 && System.IO.File.Exists(args[0]) && System.IO.File.ReadAllText(args[0]).Contains("dsh-probe")) { Console.WriteLine(mode == "ok" ? "NODE_OK v22.22.0" : "BROKEN"); return 0; }
     if (args.Length > 0 && (args[0] == "-v" || args[0] == "--version")) {
       Console.WriteLine(mode == "ok" ? "v22.22.0" : "v18.20.4");
       return 0;
@@ -193,8 +201,9 @@ public class NodeStub {
     # for finding dsh, so with a real npm on PATH the sandbox found the machine's
     # REAL global prefix and the REAL dsh, and every "dsh is missing" assertion
     # was quietly measuring this host instead.
-    $path = "$fakeBin;$env:WINDIR\System32;$env:WINDIR"
-    if ($WithSystemPath) { $path = "$fakeBin;$env:PATH" }
+    Set-LauncherTestEnvironment $psi $scratch $clone
+    $path = "$fakeBin;$env:WINDIR\System32;$env:WINDIR;$env:WINDIR\System32\WindowsPowerShell\v1.0"
+    if ($WithSystemPath) { throw 'real PATH is forbidden in this sandbox' }
     # -NoNodePath drops the node stub as well, for the sections about a machine
     # with no Node at all.
     if ($NoNodePath) { $path = "$env:WINDIR\System32;$env:WINDIR" }
@@ -245,11 +254,7 @@ public class NodeStub {
   # LOCALAPPDATA plus an empty DSH_NODE_MIRROR prevents it; this assertion proves
   # the faking works instead of trusting it.
   Write-Host "`n=== 0. the sandbox holds: no stray managed-Node directory ==="
-  $realManaged = Join-Path $env:LOCALAPPDATA 'dsh-deck\node'
-  $managedBefore = @(if (Test-Path $realManaged) { Get-ChildItem $realManaged -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } })
-  if ($managedBefore.Count) {
-    Write-Host "  note  $realManaged already exists with: $($managedBefore -join ', ')"
-  }
+  # Only sandbox metadata is inspected; never enumerate the real managed runtime.
   Check 'the managed-Node root is inside the sandbox' `
     ((Join-Path $fakeLocalAppData 'dsh-deck\node') -like "$scratch*") "got: $(Join-Path $fakeLocalAppData 'dsh-deck\node')"
 
@@ -299,8 +304,7 @@ public class NodeStub {
     Check 'the refusal names dsh and the exact install command' ($s.Text -match 'dsh not found' -and $s.Text -match 'npm i -g @deepseek-ai/dsh') $s.Text.Trim()
   } else {
     Check 'doctor names where it found dsh' ($r.Text -match 'dsh\s*:\s*\S') $r.Text.Trim()
-    Write-Host '  SKIP  this host has a dsh that survives PATH/APPDATA isolation (npm prefix cache),'
-    Write-Host '        so the refusal cannot be reproduced here; sections 1 and 3 cover that state.'
+    Check 'fixture must never resolve a real dsh installation' $false
   }
 
   # -------------------------------------------------------------------------
@@ -354,24 +358,16 @@ public class NodeStub {
   # -------------------------------------------------------------------------
   # 4. the success path, where dsh genuinely exists
   # -------------------------------------------------------------------------
-  Write-Host "`n=== 4. with a real dsh present, install is a true no-op ==="
-  $realDsh = Get-Command dsh -ErrorAction SilentlyContinue
-  if (-not $realDsh) {
-    Write-Host '  SKIP  no dsh on this machine to install against'
-  } else {
-    # -Json is deliberately NOT passed here: it sets -Quiet, which suppresses the
-    # "already installed" line, and asserting on a message that quiet mode
-    # removes was the first version of this check failing for the wrong reason.
-    #
-    # -WithSystemPath brings the real PATH back, and with it the machine's real
-    # dsh; the fake home and APPDATA still point Find-DshLocal at the sandbox
-    # first, so the run below is a genuine "already installed" only because the
-    # system PATH is what supplies it.
-    $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -WithSystemPath -NodeMode 'ok'
-    Check 'install succeeds when dsh is already there' ($r.Code -eq 0) "exit=$($r.Code) $($r.Text.Trim())"
-    Check 'it says so rather than pretending to install' ($r.Text -match 'already installed') $r.Text.Trim()
-    Check 'it reports the version it found' ($r.Text -match '\d+\.\d+') $r.Text.Trim()
-  }
+  Write-Host "`n=== 4. a synthetic installed dsh makes install a no-op ==="
+  $syntheticDsh = Join-Path $fakeAppData 'npm\node_modules\@deepseek-ai\dsh\lib'
+  New-Item -ItemType Directory -Path $syntheticDsh -Force | Out-Null
+  Set-Content -LiteralPath (Join-Path $syntheticDsh 'bin.js') -Encoding ASCII -Value '// synthetic dsh entry point'
+  Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+  $r = Invoke-Launcher @('-Command', 'install', '-Target', 'local', '-Config', $config) $null -NodeMode 'ok'
+  Check 'install succeeds when synthetic dsh is already there' ($r.Code -eq 0)
+  Check 'it says already installed rather than replacing it' ($r.Text -match 'already installed')
+  $reuseCalls = if (Test-Path -LiteralPath $marker) { @(Get-Content -LiteralPath $marker) } else { @() }
+  Check 'existing package is not sent to npm install' (@($reuseCalls | Where-Object { $_ -match '^install\s' }).Count -eq 0)
 
   # -------------------------------------------------------------------------
   # 4b. present but silent - installed, and unable to run
@@ -434,7 +430,7 @@ public class NodeStub {
   Check 'it sets about providing a Node' $attemptedNode $text.Trim()
   Check 'and says why it stopped, when it has to' `
     ($attemptedNode -and ($text -match 'cannot be verified' -or $text -match 'could not provide a Node runtime' -or $text -match 'installed')) $text.Trim()
-  Check 'and npm is never invoked' ($calls.Count -eq 0) "npm calls: $($calls.Count) -> $($calls -join ' | ')"
+  Check 'and npm install is never invoked' (@($calls | Where-Object { $_ -match '^install\s' }).Count -eq 0)
 
   # The human-readable path must carry the verdict too. It used to discard it
   # ("it already printed the detail") and exit 0, so a caller could not tell a
@@ -461,9 +457,23 @@ public class NodeStub {
   # no longer does, so $nodeExe was empty and Start-Process rejected it.
   $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
   if (-not $nodeExe) { Write-Host '  SKIP  node not found, cannot start a backend'; }
-  $env:DSH_LAUNCHER_CONFIG = $config
-  $backend = Start-Process -FilePath $nodeExe -ArgumentList @((Join-Path $clone 'app\server.js')) `
-               -WorkingDirectory $clone -WindowStyle Hidden -PassThru
+  if (-not $nodeExe) { throw 'real Node executable is required for the isolated HTTP fixture' }
+  $backendPsi = New-Object Diagnostics.ProcessStartInfo
+  $backendPsi.FileName = $nodeExe
+  $backendPsi.Arguments = Join-LauncherTestArguments @((Join-Path $clone 'app\server.js'))
+  $backendPsi.WorkingDirectory = $clone
+  $backendPsi.UseShellExecute = $false; $backendPsi.CreateNoWindow = $true
+  $backendPsi.RedirectStandardOutput = $true; $backendPsi.RedirectStandardError = $true
+  Set-LauncherTestEnvironment $backendPsi $scratch $clone
+  $backendPsi.EnvironmentVariables['PATH'] = "$fakeBin;$env:WINDIR\System32;$env:WINDIR\System32\WindowsPowerShell\v1.0"
+  $backendPsi.EnvironmentVariables['DSH_LAUNCHER_CONFIG'] = $config
+  $backendPsi.EnvironmentVariables['APPDATA'] = $fakeAppData
+  $backendPsi.EnvironmentVariables['LOCALAPPDATA'] = $fakeLocalAppData
+  $backendPsi.EnvironmentVariables['USERPROFILE'] = $fakeHome
+  $backendPsi.EnvironmentVariables['DSH_STUB_NPM_PREFIX'] = $fakeNpm
+  $backendPsi.EnvironmentVariables['DSH_STUB_NODE_MODE'] = 'old'
+  $backend = [Diagnostics.Process]::Start($backendPsi)
+  $backendOut = $backend.StandardOutput.ReadToEndAsync(); $backendErr = $backend.StandardError.ReadToEndAsync()
   $runtimeFile = Join-Path $clone 'state\app.json'
   $deadline = (Get-Date).AddSeconds(25)
   while ((Get-Date) -lt $deadline -and -not (Test-Path $runtimeFile)) { Start-Sleep -Milliseconds 250 }
@@ -475,41 +485,32 @@ public class NodeStub {
   if ($rt -and $rt.port) {
     $base = "http://127.0.0.1:$($rt.port)"
     try {
-      $preview = Invoke-WebRequest -Uri "$base/api/instances/local/install?t=$($rt.token)" -UseBasicParsing -TimeoutSec 60
+      $headers = @{ Authorization = ('Bearer ' + [string]$rt.token) }
+      $preview = Invoke-WebRequest -Uri "$base/api/instances/local/plan?action=install" -Headers $headers -UseBasicParsing -TimeoutSec 60
       $pv = $preview.Content | ConvertFrom-Json
-      Check 'the preview answers 200 for a local instance' ($preview.StatusCode -eq 200) "HTTP $($preview.StatusCode)"
-      Check 'it says kind=local' ($pv.kind -eq 'local') "got: $($pv.kind)"
-      Check 'it does NOT claim to deploy a systemd unit' ($pv.plan -notmatch 'systemd') "plan: $($pv.plan)"
-      Check 'it names the npm global install it will do' ($pv.plan -match 'npm install -g @deepseek-ai/dsh') "plan: $($pv.plan)"
-      Check 'it says Node is not installed for you' ($pv.plan -match '不会安装 Node') "plan: $($pv.plan)"
-      Check 'it carries no ssh host' (-not $pv.sshHost) "got: $($pv.sshHost)"
+      Check 'the preview answers 200 for a local instance' ($preview.StatusCode -eq 200)
+      Check 'it says kind=local' ($pv.kind -eq 'local')
+      Check 'it does NOT claim to deploy a systemd unit' (-not $pv.changesServiceDefinition)
+      Check 'it names the npm global install it will do' (($pv.steps -join ' ') -match 'npm install -g @deepseek-ai/dsh')
+      Check 'it reports missing Node preparation honestly' ($pv.installsNode -eq $true)
+      Check 'install plan never starts the service' ($pv.startsService -eq $false)
     } catch {
       Check 'the preview answers 200 for a local instance' $false $_.Exception.Message
     }
   }
-  Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue
-  Remove-Item Env:\DSH_LAUNCHER_CONFIG -ErrorAction SilentlyContinue
-
-  # -------------------------------------------------------------------------
-  # 6. the card the reader actually sees
-  # -------------------------------------------------------------------------
-  Write-Host "`n=== 6. the panel card is wired for a local install ==="
-  $html = Get-Content (Join-Path $repoRoot 'app\ui\index.html') -Raw
-  Check 'a local card with no dsh gets an install action' ($html -match "kind === ""local""[\s\S]{0,300}install")
-  Check 'the hint row is shown for a local card, not only unreachable ones' ($html -match 'hintRow')
-  Check 'the confirmation distinguishes a local install from a remote deploy' ($html -match 'preview\.kind')
+  if ($backend -and -not $backend.HasExited) { $backend.Kill(); $backend.WaitForExit(5000) | Out-Null }
+  # UI wiring is covered by the UI owner's JavaScript tests, not source regexes here.
 
   # -------------------------------------------------------------------------
   # 7. and nothing was installed on this machine
   # -------------------------------------------------------------------------
   Write-Host "`n=== 7. the host is unchanged ==="
-  $managedAfter = @(if (Test-Path $realManaged) { Get-ChildItem $realManaged -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } })
-  Check 'no managed Node appeared in the real LOCALAPPDATA' `
-    ($managedAfter.Count -eq $managedBefore.Count) "before=[$($managedBefore -join ',')] after=[$($managedAfter -join ',')]"
+  Check 'sandbox backend did not inherit an account key' (-not $backendPsi.EnvironmentVariables.ContainsKey('DEEPSEEK_API_KEY'))
   Check 'the sandbox managed-Node root was left empty too (nothing was downloaded)' `
     (-not (Test-Path (Join-Path $fakeLocalAppData 'dsh-deck\node'))) `
     "found: $(Join-Path $fakeLocalAppData 'dsh-deck\node')"
 } finally {
+  if (Get-Variable backend -ErrorAction SilentlyContinue) { if ($backend -and -not $backend.HasExited) { $backend.Kill(); $backend.WaitForExit(5000) | Out-Null } }
   Remove-Scratch
 }
 

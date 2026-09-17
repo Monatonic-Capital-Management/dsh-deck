@@ -35,6 +35,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'check-launcher-contracts.ps1') -HelpersOnly
 
 if ($env:OS -ne 'Windows_NT') {
   Write-Host '  SKIP  the managed Node is Windows-only (zip + %LOCALAPPDATA%)'
@@ -48,7 +49,7 @@ if (-not (Test-Path $srcLauncher)) { Write-Host "  FAIL  no launcher at $srcLaun
 $pass = 0; $fail = 0
 function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
   if ($Ok) { $script:pass++; Write-Host ("  PASS  {0}" -f $Name) }
-  else     { $script:fail++; Write-Host ("  FAIL  {0}  {1}" -f $Name, $Detail) }
+  else     { $script:fail++; Write-Host ("  FAIL  {0}" -f $Name) }
 }
 
 $scratch = Join-Path $env:TEMP ("dshdeck-nodeboot-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -145,6 +146,7 @@ try {
   Write-Host "  launcher under test: $srcLauncher"
   New-Item -ItemType Directory -Force -Path $clone, $mirror | Out-Null
   Copy-Item $srcLauncher (Join-Path $clone 'dsh.ps1') -Force
+  Copy-LauncherTestModules $srcLauncher $clone
   $goodZip = New-FakeDistribution $mirror
   Write-Sums $mirror $goodZip
   Get-ChildItem $mirror | ForEach-Object { "  mirror: $($_.Name)  $($_.Length) bytes" }
@@ -163,6 +165,7 @@ try {
     # System32 only: no node and no npm from this machine. Adding the real PATH
     # would let the host satisfy the very thing under test, which is how an
     # earlier version of this suite ended up measuring the host.
+    Set-LauncherTestEnvironment $psi $LocalAppData $clone
     $psi.EnvironmentVariables['PATH'] = "$env:WINDIR\System32;$env:WINDIR"
     $psi.EnvironmentVariables['LOCALAPPDATA'] = $LocalAppData
     $psi.EnvironmentVariables['APPDATA'] = (Join-Path $LocalAppData 'Roaming')
@@ -175,8 +178,7 @@ try {
     $proc.WaitForExit(300000) | Out-Null
     $json = $null
     try {
-      $line = $out.Trim() -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -First 1
-      if ($line) { $json = $line | ConvertFrom-Json }
+      $json = ConvertFrom-Json -InputObject $out.Trim()
     } catch { }
     return [pscustomobject]@{ Code = $proc.ExitCode; Out = $out; Err = $err; Text = ($out + $err); Json = $json }
   }

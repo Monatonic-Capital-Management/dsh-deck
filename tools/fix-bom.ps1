@@ -8,17 +8,26 @@
 #
 # Usage: powershell -File tools\fix-bom.ps1
 [CmdletBinding()]
-param([switch]$Quiet)
+param([switch]$Quiet, [switch]$Check)
 
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
-$files = @(Get-ChildItem $root -Filter '*.ps1' -Recurse -ErrorAction SilentlyContinue |
-           Where-Object { $_.FullName -notlike '*\browser-profile\*' })
+# Runtime/user directories are never source inputs, even when they contain PS1.
+$files = @(Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File)
+foreach ($relative in @('launcher','tools')) {
+  $directory = Join-Path $root $relative
+  if (Test-Path -LiteralPath $directory) { $files += @(Get-ChildItem -LiteralPath $directory -Filter '*.ps1' -File -Recurse) }
+}
 
-$fixed = 0
+$fixed = 0; $missing = 0
 foreach ($f in $files) {
   $bytes = [IO.File]::ReadAllBytes($f.FullName)
   if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    continue
+  }
+  if ($Check) {
+    $missing++
+    Write-Host "  MISSING BOM: $($f.FullName.Replace($root, '.'))"
     continue
   }
   # Decode as UTF-8 explicitly, then rewrite WITH the BOM.
@@ -41,13 +50,13 @@ foreach ($f in $files) {
     $broken += $f
     Write-Host "  PARSE ERROR: $($f.FullName.Replace($root, '.'))" -ForegroundColor Red
     $errors | Select-Object -First 3 | ForEach-Object {
-      Write-Host ("    line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) -ForegroundColor Red
+      Write-Host ("    line {0}: {1}" -f $_.Extent.StartLineNumber, $_.ErrorId) -ForegroundColor Red
     }
   }
 }
 
 if (-not $Quiet) {
-  Write-Host ("  {0} file(s) checked, {1} re-encoded, {2} unparseable" -f $files.Count, $fixed, $broken.Count)
+  Write-Host ("  {0} file(s) checked, {1} re-encoded, {2} unparseable, {3} missing BOM" -f $files.Count, $fixed, $broken.Count, $missing)
 }
-if ($broken.Count -gt 0) { exit 1 }
+if ($broken.Count -gt 0 -or $missing -gt 0) { exit 1 }
 exit 0

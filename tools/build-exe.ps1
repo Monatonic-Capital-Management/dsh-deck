@@ -24,14 +24,9 @@ $source = Join-Path $PSScriptRoot 'exe\DshDeck.cs'
 $outExe = Join-Path $root 'Start.exe'
 $icon   = Join-Path $root 'app\icon\dsh-deck.ico'
 
-# The payload embedded into the binary: exactly what dsh.ps1 and app\server.js
-# need to run, so the exe stays ~250 KB instead of carrying docs and tests.
-$payloadFiles = @(
-  'dsh.ps1',
-  'app\server.js',
-  'app\ui\index.html',
-  'app\icon\dsh-deck.ico'
-)
+. (Join-Path $PSScriptRoot 'payload.ps1')
+$payloadFiles = @(Get-PayloadFiles $root)
+$resources = Get-PackageResources $root
 
 function Get-Csc {
   # Framework64 first: the 64-bit compiler produces a 64-bit exe. AnyCPU would
@@ -57,16 +52,15 @@ foreach ($f in $inputs) {
   if (-not (Test-Path $f)) { Write-Host "  missing input: $f"; exit 1 }
 }
 
-# Rebuild only when something it is built from has changed.
-if (-not $Force -and (Test-Path $outExe)) {
-  $exeTime = (Get-Item $outExe).LastWriteTimeUtc
-  $changed = @($inputs | Where-Object { (Get-Item $_).LastWriteTimeUtc -gt $exeTime })
-  if ($changed.Count -eq 0) {
-    Write-Host '  Start.exe is up to date (-Force to rebuild)'
-    if (-not $Verify) { exit 0 }
-  } else {
-    Write-Host "  newer than the exe: $(($changed | ForEach-Object { Split-Path -Leaf $_ }) -join ', ')"
+# Content equality, not timestamps: a fresh checkout can make stale binaries
+# look newer than their sources. Build metadata also covers this compiler script.
+if (-not $Force) {
+  $current = Test-Package $root $outExe $Version
+  if ($current.ok) {
+    Write-Host "  Start.exe matches all $($current.checked) resources (content verified)"
+    exit 0
   }
+  Write-Host "  rebuild required: $($current.mismatches.Count) resource/version mismatch(es)"
 }
 
 Write-Host "  compiler: $csc"
@@ -94,12 +88,12 @@ $cscArgs = @(
   "/out:`"$outExe`"",
   "/win32icon:`"$icon`""
 )
-foreach ($rel in $payloadFiles) {
-  $cscArgs += "/resource:`"$(Join-Path $root $rel)`",payload/$($rel -replace '\\', '/')"
+foreach ($resourceName in $resources.Keys) {
+  $cscArgs += "/resource:`"$($resources[$resourceName])`",$resourceName"
 }
 
-# Version stamp: the exe extracts into a per-version cache directory, so this is
-# what makes a stale cache impossible after a payload change.
+# Assembly version names the extraction directory. Resource hashes, not the
+# version stamp alone, detect changed or damaged cached payload files.
 $asmInfo = Join-Path $env:TEMP ("dshdeck-asm-" + [guid]::NewGuid().ToString('N').Substring(0, 6) + ".cs")
 @"
 using System.Reflection;
@@ -138,27 +132,10 @@ if ($Verify) {
   Write-Host '  verifying the binary...'
   $ok = $true
 
-  # Loaded read-only for inspection; this never executes the exe.
-  try {
-    $asm = [Reflection.Assembly]::LoadFile($outExe)
-    $names = @($asm.GetManifestResourceNames())
-    foreach ($rel in $payloadFiles) {
-      # Verbatim, matching what DshDeck.cs searches for. The first version of
-      # this check asserted a namespace-prefixed form and failed against a
-      # correct binary - which was the useful outcome, because the check now
-      # pins the names the C# actually needs instead of a theory about them.
-      $wanted = 'payload/' + ($rel -replace '\\', '/')
-      $hit = $names -contains $wanted
-      if (-not $hit) { $ok = $false }
-      Write-Host ("    {0}  {1}" -f $(if ($hit) { 'ok  ' } else { 'FAIL' }), $wanted)
-    }
-    $ver = $asm.GetName().Version.ToString()
-    if ($ver -ne $Version) { $ok = $false }
-    Write-Host ("    {0}  assembly version {1}" -f $(if ($ver -eq $Version) { 'ok  ' } else { 'FAIL' }), $ver)
-  } catch {
-    $ok = $false
-    Write-Host "    FAIL  could not inspect the assembly: $($_.Exception.Message)"
-  }
+  $verification = Test-Package $root $outExe $Version
+  $ok = $verification.ok
+  foreach ($mismatch in $verification.mismatches) { Write-Host "    FAIL  $mismatch" }
+  Write-Host "    resources checked: $($verification.checked); content matches: $ok"
 
   # The icon a shortcut reads as IconLocation '<exe>,0'. Extracted rather than
   # assumed, because "the flag was passed" is not "the resource is there".
@@ -169,7 +146,8 @@ if ($Verify) {
     else { Write-Host '    FAIL  the binary carries no icon'; $ok = $false }
     if ($ic) { $ic.Dispose() }
   } catch {
-    Write-Host "    WARN  could not extract the icon: $($_.Exception.Message)"
+    Write-Host '    FAIL  could not extract the embedded icon'
+    $ok = $false
   }
 
   if (-not $ok) { Write-Host '  VERIFICATION FAILED'; exit 1 }

@@ -47,6 +47,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'check-launcher-contracts.ps1') -HelpersOnly
 
 if ($env:OS -ne 'Windows_NT') {
   Write-Host '  SKIP  app -Stop is Windows-only (taskkill); nothing to check here'
@@ -59,7 +60,7 @@ if (-not (Test-Path $srcLauncher)) { Write-Host "  FAIL  no launcher at $srcLaun
 $pass = 0; $fail = 0
 function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
   if ($Ok) { $script:pass++; Write-Host ("  PASS  {0}" -f $Name) }
-  else     { $script:fail++; Write-Host ("  FAIL  {0}  {1}" -f $Name, $Detail) }
+  else     { $script:fail++; Write-Host ("  FAIL  {0}" -f $Name) }
 }
 
 $realTaskkill = Join-Path $env:WINDIR 'System32\taskkill.exe'
@@ -98,10 +99,37 @@ try {
   Write-Host "`n=== setup: throwaway launcher in $scratch ==="
   Write-Host "  launcher under test: $srcLauncher"
   $null = New-Item -ItemType Directory -Force -Path $clone
-  foreach ($item in @('app', 'dsh.cmd')) {
+  foreach ($item in @('dsh.cmd')) {
     Copy-Item -Path (Join-Path $repoRoot $item) -Destination $clone -Recurse -Force
   }
   Copy-Item -Path $srcLauncher -Destination (Join-Path $clone 'dsh.ps1') -Force
+  Copy-LauncherTestModules $srcLauncher $clone
+  New-Item -ItemType Directory -Path (Join-Path $clone 'app') -Force | Out-Null
+  $fakeServer = @'
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const root = path.resolve(__dirname, '..');
+const scratch = path.dirname(root);
+if (process.env.DSH_TEST_APP_MODE === 'exit') process.exit(7);
+const server = http.createServer((req, res) => { res.writeHead(200); res.end('isolated fixture'); });
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port;
+  const token = crypto.randomBytes(24).toString('hex');
+  fs.mkdirSync(path.join(root, 'state'), {recursive:true});
+  fs.writeFileSync(path.join(root, 'state', 'app.json'), JSON.stringify({pid:process.pid,port,token,url:`http://127.0.0.1:${port}/#t=${token}`,startedAt:new Date().toISOString(),configPath:process.env.DSH_LAUNCHER_CONFIG||'',sshConfigPath:process.env.DSH_SSH_CONFIG||''}));
+  fs.writeFileSync(path.join(scratch, 'context-check.json'), JSON.stringify({config:process.env.DSH_LAUNCHER_CONFIG===path.join(scratch,'hosts.json'),ssh:process.env.DSH_SSH_CONFIG===path.join(scratch,'ssh-config'),noAccountKey:!process.env.DEEPSEEK_API_KEY}));
+});
+'@
+  [IO.File]::WriteAllText((Join-Path $clone 'app\server.js'), $fakeServer, (New-Object Text.UTF8Encoding($false)))
+  $nodeCommand = Get-Command node -ErrorAction Stop
+  $testNodeDir = Join-Path $scratch 'node'
+  New-Item -ItemType Directory -Path $testNodeDir -Force | Out-Null
+  Copy-Item -LiteralPath $nodeCommand.Source -Destination (Join-Path $testNodeDir 'node.exe')
+  $envSetup = New-Object Diagnostics.ProcessStartInfo
+  Set-LauncherTestEnvironment $envSetup $scratch $clone
+  [IO.File]::WriteAllText((Join-Path $scratch 'hosts.json'), '{"version":1,"instances":[]}', (New-Object Text.UTF8Encoding($true)))
 
   $realPathFile = Join-Path $stubDir 'real-taskkill.txt'
   Set-Content -Path $realPathFile -Value $realTaskkill -Encoding ASCII
@@ -142,6 +170,9 @@ public class TaskKillShim {
       return 1;
     }
 
+    string allowed = File.ReadAllText(Path.Combine(dir, "allowed-pid.txt")).Trim();
+    int index = Array.FindIndex(args, delegate(string a) { return a.Equals("/PID", StringComparison.OrdinalIgnoreCase); });
+    if (index < 0 || index + 1 >= args.Length || args[index + 1] != allowed || allowed == "0") return 5;
     string real = File.ReadAllText(Path.Combine(dir, "real-taskkill.txt")).Trim();
     int code = 0;
     try {
@@ -200,7 +231,7 @@ public class TaskKillShim {
   # Run the launcher in a separate process with the stub on PATH, so the test
   # reads the real exit code and the real stdout/stderr instead of capture
   # artefacts of its own shell.
-  function Invoke-Launcher([string[]]$Arguments, [string]$StubMode) {
+  function Invoke-Launcher([string[]]$Arguments, [string]$StubMode, [string]$AppMode) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $clone 'dsh.ps1')`"") + $Arguments) -join ' '
@@ -208,8 +239,14 @@ public class TaskKillShim {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.EnvironmentVariables['PATH'] = "$stubDir;$env:PATH"
+    Set-LauncherTestEnvironment $psi $scratch $clone
+    $psi.EnvironmentVariables['PATH'] = "$stubDir;$testNodeDir;$env:WINDIR\System32;$env:WINDIR\System32\WindowsPowerShell\v1.0"
+    $psi.Arguments += ' -NoOpen'
+    $runtime = Read-Runtime
+    $allowedPid = if ($runtime) { [int]$runtime.pid } else { 0 }
+    [IO.File]::WriteAllText((Join-Path $stubDir 'allowed-pid.txt'), [string]$allowedPid)
     if ($StubMode) { $psi.EnvironmentVariables['DSH_STUB_TASKKILL_MODE'] = $StubMode }
+    if ($AppMode) { $psi.EnvironmentVariables['DSH_TEST_APP_MODE'] = $AppMode }
     $proc = [System.Diagnostics.Process]::Start($psi)
     $out = $proc.StandardOutput.ReadToEnd()
     $err = $proc.StandardError.ReadToEnd()
@@ -222,13 +259,26 @@ public class TaskKillShim {
   # -------------------------------------------------------------------------
   Write-Host "`n=== 0. the interception is in place ==="
   Remove-Item $marker -Force -ErrorAction SilentlyContinue
-  $r = Invoke-Launcher @('-Command', 'app') $null
-  Check 'app starts on a clean checkout' ($r.Code -eq 0) "exit=$($r.Code) $($r.Err.Trim())"
+  $r = Invoke-Launcher @('-Command', 'app', '-Json') $null
+  Check 'app starts on a clean checkout' ($r.Code -eq 0)
+  if ($r.Code -ne 0) {
+    $failure = Read-LauncherTestJson $r.Out
+    if ($failure) { Write-Host ('  startup failure: ' + $failure.message) }
+    throw 'isolated app setup failed; dependent stop checks not run'
+  }
   $rt = Read-Runtime
-  Check 'a runtime file records the backend pid' ([bool]($rt -and $rt.pid)) "app.json: $($rt | ConvertTo-Json -Compress)"
+  Check 'a runtime file records the backend pid' ([bool]($rt -and $rt.pid))
   $backendPid = 0
   if ($rt -and $rt.pid) { $backendPid = [int]$rt.pid }
   Check 'the recorded pid is actually running' (Test-Alive $backendPid) "pid=$backendPid"
+  $context = Get-Content -LiteralPath (Join-Path $scratch 'context-check.json') -Raw | ConvertFrom-Json
+  Check 'config and SSH context reach backend environment' ($context.config -and $context.ssh)
+  Check 'account keys were not inherited by the fixture backend' $context.noAccountKey
+  Check 'NoOpen did not create a browser profile' (-not (Test-Path -LiteralPath (Join-Path $clone 'browser-profile')))
+  $alternate = Join-Path $scratch 'alternate.json'
+  [IO.File]::WriteAllText($alternate, '{"version":1,"instances":[]}', (New-Object Text.UTF8Encoding($true)))
+  $different = Invoke-Launcher @('-Command','app','-Json','-Config',$alternate) $null
+  Check 'different config context is not silently reused' ($different.Code -ne 0 -and (Test-Alive $backendPid))
 
   # -------------------------------------------------------------------------
   # 1. the original defect: taskkill kills the backend AND complains on stderr
@@ -291,6 +341,8 @@ public class TaskKillShim {
   $r = Invoke-Launcher @('-Command', 'app', '-Stop') $null
   Check 'stopping an app that is not running exits zero' ($r.Code -eq 0) "exit=$($r.Code)"
   Check 'and says it was not running' ($r.Text -match 'was not running') $r.Text.Trim()
+  $r = Invoke-Launcher @('-Command','app','-Json') $null 'exit'
+  Check 'backend exiting before ready makes app fail nonzero' ($r.Code -ne 0 -and (Read-LauncherTestJson $r.Out).ok -eq $false)
 } finally {
   Remove-Scratch
 }

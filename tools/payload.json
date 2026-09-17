@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "files": [
+    "dsh.ps1",
+    "app/server.js",
+    "app/icon/dsh-deck.ico",
+    "remote/dsh-web-service.sh"
+  ],
+  "directories": {
+    "launcher": [".ps1"],
+    "app/lib": [".js"],
+    "app/ui": [".html", ".css", ".mjs"]
+  }
+}

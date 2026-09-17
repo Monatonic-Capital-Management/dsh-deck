@@ -34,10 +34,8 @@
 // Every check reports pass/fail honestly. If a future refactor moves or renames
 // what these look for, they fail loudly rather than passing against nothing -
 // silence would be worse than a red build, which is the whole point here.
-const fs = require('fs');
-const path = require('path');
-
-const src = fs.readFileSync(path.join(__dirname, '..', 'dsh.ps1'), 'utf8');
+const { readLauncherSource } = require('./launcher-source');
+const src = readLauncherSource();
 const fn = src.indexOf('function Stop-App');
 if (fn < 0) { console.error('  FAIL  Stop-App not found in dsh.ps1'); process.exit(1); }
 const block = src.slice(fn);
@@ -45,11 +43,14 @@ const block = src.slice(fn);
 const endMatch = /\n(?:function \w|\/\/ -{10})/.exec(block);
 const body = endMatch ? block.slice(0, endMatch.index) : block;
 
-const killIdx = body.indexOf('taskkill.exe');
-const eapIdx = body.indexOf("$ErrorActionPreference = 'Continue'");
-const tableIdx = body.indexOf('Test-ProcessAlive');
-const removeIdx = body.indexOf('Remove-Item $runtimeFile');
-const exitIdx = src.indexOf('if (-not (Stop-App)) { exit 1 }');
+const ownedStart = src.indexOf('function Stop-OwnedProcess(');
+const ownedEnd = src.indexOf('\nfunction ', ownedStart + 1);
+const owned = src.slice(ownedStart, ownedEnd < 0 ? undefined : ownedEnd);
+const killIdx = owned.indexOf('taskkill.exe');
+const eapIdx = owned.indexOf("$ErrorActionPreference = 'Continue'");
+const tableIdx = owned.indexOf('return (-not (Test-ProcessAlive');
+const removeIdx = body.indexOf('foreach ($file in @((Join-Path $StateDir');
+const exitIdx = src.indexOf('if (-not $ok) { $script:ExitCode = 1 }');
 
 let pass = 0, fail = 0;
 function check(label, ok, detail) {
@@ -57,16 +58,16 @@ function check(label, ok, detail) {
   else { console.log(`  FAIL  ${label}${detail ? '  ' + detail : ''}`); fail++; }
 }
 
-check('the kill is the taskkill the launcher may have to survive',
-  killIdx > 0, 'no taskkill.exe call inside Stop-App');
+check('Stop-App delegates termination to the shared owned-process helper',
+  killIdx > 0 && body.includes('Stop-OwnedProcess'), 'termination is not delegated');
 check('stderr is tolerated for the kill (Continue before the call)',
   eapIdx > 0 && killIdx > 0 && eapIdx < killIdx,
   eapIdx < 0 ? "no $ErrorActionPreference = 'Continue'" : 'Continue comes after taskkill');
 check('the verdict is the process table, not taskkill',
   tableIdx > 0, 'no Test-ProcessAlive call inside Stop-App');
-check('the runtime file is removed conditionally',
-  removeIdx > 0 && body.slice(removeIdx - 200, removeIdx).includes('Test-ProcessAlive'),
-  'Remove-Item $runtimeFile is not guarded by a liveness check');
+check('a surviving process returns before runtime records are removed',
+  removeIdx > 0 && body.indexOf('return $false') > 0 && body.indexOf('return $false') < removeIdx,
+  'runtime cleanup can run before the survivor verdict');
 check('a surviving backend makes app -Stop exit non-zero',
   exitIdx > 0, 'dispatcher does not act on Stop-App\'s verdict');
 
@@ -77,11 +78,11 @@ check('a surviving backend makes app -Stop exit non-zero',
 check('a survivor is reported as a failure',
   body.includes('did not stop'), 'no "did not stop" message');
 check('the survivor report hands over a manual command',
-  /stop it by hand with: taskkill \/PID/.test(body), 'no copy-pasteable remedy');
+  /stop it manually: taskkill \/PID/.test(body), 'no copy-pasteable remedy');
 // The lie itself. "was not running" is correct only when nothing was running,
 // and Stop-App guards it with `$survivorPid -eq 0`.
 check('"was not running" is guarded against a survivor',
-  /\$survivorPid -eq 0/.test(body), 'unconditional "was not running"');
+  body.includes('if ($wasRunning)') && body.includes("} else { Write-Info 'app backend was not running' }"), 'unconditional "was not running"');
 
 console.log(`\n  ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

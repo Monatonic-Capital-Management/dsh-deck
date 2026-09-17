@@ -23,7 +23,7 @@
 //
 // NOT A SINGLE-FILE PANEL. Node.js is still required, and the panel backend is
 // still app/server.js run by node. Bundling a Node runtime is a different and
-// much larger promise, and README's "What it needs" section says so.
+// much larger promise; see the runtime requirements in README.md.
 //
 // BUILD IT WITH tools/build-exe.ps1, which uses the C# compiler that ships with
 // Windows - no SDK, no Visual Studio, no NuGet.
@@ -34,6 +34,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Security.Cryptography;
 
 namespace DshDeck
 {
@@ -71,7 +72,9 @@ namespace DshDeck
                         Console.Error.WriteLine();
                         Console.Error.WriteLine("  The panel did not start (exit code " + p.ExitCode + ").");
                         Console.Error.WriteLine();
-                        Console.Error.WriteLine("  See what is wrong with:");
+                        Console.Error.WriteLine("  First-time setup (explicitly installs Node/dsh when needed):");
+                        Console.Error.WriteLine("    powershell -NoProfile -ExecutionPolicy Bypass -File \"" + launcher + "\" -Command install -Target local");
+                        Console.Error.WriteLine("  Then check the environment with:");
                         Console.Error.WriteLine("    powershell -NoProfile -ExecutionPolicy Bypass -File \"" + launcher + "\" -Command doctor");
                         Console.Error.WriteLine();
                         Console.Error.WriteLine("  Press any key to close.");
@@ -94,12 +97,22 @@ namespace DshDeck
         private static string JoinArgs(string[] args)
         {
             List<string> parts = new List<string>();
-            foreach (string a in args)
-            {
-                if (a.IndexOf(' ') >= 0) { parts.Add("\"" + a + "\""); }
-                else { parts.Add(a); }
-            }
+            foreach (string a in args) { parts.Add(QuoteArgument(a)); }
             return string.Join(" ", parts.ToArray());
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            StringBuilder result = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char c in value)
+            {
+                if (c == '\\') { slashes++; continue; }
+                result.Append('\\', c == '"' ? slashes * 2 + 1 : slashes);
+                result.Append(c); slashes = 0;
+            }
+            result.Append('\\', slashes * 2).Append('"');
+            return result.ToString();
         }
 
         /// <summary>
@@ -123,13 +136,25 @@ namespace DshDeck
             foreach (string root in roots)
             {
                 if (string.IsNullOrEmpty(root)) { continue; }
-                if (File.Exists(Path.Combine(root, "dsh.ps1")) &&
-                    File.Exists(Path.Combine(root, "app", "server.js")))
+                if (HasCompletePayload(root))
                 {
                     return root;
                 }
             }
             return ExtractEmbedded();
+        }
+
+        private static bool HasCompletePayload(string root)
+        {
+            int count = 0;
+            foreach (string name in Assembly.GetExecutingAssembly().GetManifestResourceNames())
+            {
+                if (!name.StartsWith("payload/", StringComparison.Ordinal)) { continue; }
+                count++;
+                string relative = name.Substring("payload/".Length).Replace('/', Path.DirectorySeparatorChar);
+                if (!File.Exists(Path.Combine(root, relative))) { return false; }
+            }
+            return count > 0;
         }
 
         /// <summary>
@@ -151,7 +176,13 @@ namespace DshDeck
             string root = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "dsh-deck", version);
+            return ExtractEmbeddedTo(root);
+        }
 
+        // The destination is explicit so extraction can be tested in a scratch
+        // directory without launching the panel or touching the real user cache.
+        private static string ExtractEmbeddedTo(string root)
+        {
             Assembly asm = Assembly.GetExecutingAssembly();
             string[] names = asm.GetManifestResourceNames();
 
@@ -182,7 +213,8 @@ namespace DshDeck
                 foreach (string n in files)
                 {
                     string rel = n.Substring("payload/".Length).Replace('/', Path.DirectorySeparatorChar);
-                    if (!File.Exists(Path.Combine(root, rel))) { complete = false; break; }
+                    string cached = Path.Combine(root, rel);
+                    if (!File.Exists(cached) || !MatchesResource(asm, n, cached)) { complete = false; break; }
                 }
                 if (complete) { return root; }
             }
@@ -198,36 +230,35 @@ namespace DshDeck
                 // Write beside the target and move into place, so an interrupted
                 // extraction cannot leave a half-written dsh.ps1 that then fails
                 // to parse on the next launch.
-                string staging = target + ".new";
+                string staging = target + ".new-" + Guid.NewGuid().ToString("N");
                 using (Stream src = asm.GetManifestResourceStream(n))
                 using (FileStream dst = new FileStream(staging, FileMode.Create, FileAccess.Write))
                 {
                     src.CopyTo(dst);
                 }
-                // A file the running panel holds open makes the replace fail; the
-                // extracted copy is still the right one, so continue.
                 try
                 {
-                    if (File.Exists(target)) { File.Delete(target); }
-                    File.Move(staging, target);
+                    if (File.Exists(target)) { File.Replace(staging, target, null); }
+                    else { File.Move(staging, target); }
                 }
-                catch (IOException)
+                finally
                 {
-                    try { File.Delete(staging); } catch { }
+                    // Only this invocation's exact staging file is ours to remove.
+                    if (File.Exists(staging)) { File.Delete(staging); }
+                }
+                if (!MatchesResource(asm, n, target))
+                {
+                    throw new IOException("payload verification failed; close the panel and retry");
                 }
             }
-            SweepStaging(root);
-            try { File.WriteAllText(stampFile, stamp); } catch { }
+            File.WriteAllText(stampFile, stamp);
 
             return root;
         }
 
         /// <summary>
-        /// A fingerprint of the embedded payload: the binary's version plus each
-        /// resource's length and write time. Length and timestamp come from the
-        /// resource table, so nothing is read or hashed here - and since the
-        /// build stamps resources as it embeds them, a rebuilt payload always
-        /// differs.
+        /// A content fingerprint, independent of checkout/executable timestamps.
+        /// Equal-length resource edits must invalidate the cache too.
         /// </summary>
         private static string PayloadStamp(Assembly asm, List<string> files)
         {
@@ -237,29 +268,28 @@ namespace DshDeck
             StringBuilder sb = new StringBuilder(version);
             foreach (string n in files)
             {
-                sb.Append('|').Append(n);
-                try
+                sb.Append('|').Append(n).Append(':');
+                using (Stream s = asm.GetManifestResourceStream(n))
+                using (SHA256 sha = SHA256.Create())
                 {
-                    using (Stream s = asm.GetManifestResourceStream(n))
-                    {
-                        sb.Append(':').Append(s == null ? -1 : s.Length);
-                    }
-                    sb.Append('@').Append(File.GetLastWriteTimeUtc(asm.Location).Ticks);
+                    if (s == null) { throw new IOException("missing embedded resource"); }
+                    sb.Append(Convert.ToBase64String(sha.ComputeHash(s)));
                 }
-                catch { sb.Append(":?"); }
             }
-            return sb.ToString();
+            using (SHA256 sha = SHA256.Create())
+            {
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(sb.ToString()))).Replace("-", "").ToLowerInvariant();
+            }
         }
 
-        /// <summary>Remove staging files left by an interrupted extraction.</summary>
-        private static void SweepStaging(string root)
+        private static bool MatchesResource(Assembly asm, string resource, string target)
         {
-            try
+            using (Stream embedded = asm.GetManifestResourceStream(resource))
+            using (Stream cached = File.OpenRead(target))
+            using (SHA256 sha = SHA256.Create())
             {
-                string[] stale = Directory.GetFiles(root, "*.new", SearchOption.AllDirectories);
-                foreach (string f in stale) { try { File.Delete(f); } catch { } }
+                return embedded != null && Convert.ToBase64String(sha.ComputeHash(embedded)) == Convert.ToBase64String(sha.ComputeHash(cached));
             }
-            catch { }
         }
     }
 }

@@ -17,6 +17,7 @@
       "description": "Training box; needs a jump host and a different user",
       "sshHost": "gpu",
       "sshUser": "ml",
+      "sshPort": 22,
       "identityFile": "~/.ssh/gpu_ed25519",
       "jumpHost": "bastion",
       "remotePort": 3080
@@ -39,6 +40,7 @@
   "instances": [
     {
       "name": "local",
+      "displayName": "本机工作台",
       "kind": "local",
       "enabled": true,
       "port": 3080,
@@ -46,13 +48,18 @@
     },
     {
       "name": "prod",
+      "displayName": "生产环境",
       "profile": "prod",
       "enabled": true,
+      "autoInstall": false,
+      "stopRemoteService": false,
+      "dshVersion": "0.1.5-rc.1",
       "localPort": 3099,
       "description": "dsh web in production, reached over an SSH tunnel"
     },
     {
       "name": "gpu",
+      "displayName": "GPU 训练机",
       "profile": "gpu-box",
       "enabled": false,
       "localPort": 3100,

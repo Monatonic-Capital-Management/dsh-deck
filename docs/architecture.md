@@ -1,166 +1,54 @@
-# Architecture
+# 架构与关键约束
 
-## The shape of the problem
+[首页](../README.md) · [配置](configuration.md) · [操作契约](operations.md) · [实施状态](implementation-plan.md)
 
-`dsh web` is a local web server that serves the harness UI. Two properties of it
-dictate this project's entire design:
+## 系统边界
 
-1. **It binds loopback only.** `--host` accepts just `127.0.0.1` and `0.0.0.0`,
-   and the CLI refuses `0.0.0.0` outright, with the message that it "would expose
-   remote code execution to the network". So reaching a remote dsh over a network
-   is not a configuration problem to solve — a tunnel is the supported path.
-2. **Recent versions print a one-time authenticated URL.** `/` answers `401` until
-   that token is redeemed, and redemption returns a signed cookie bound to the
-   authority the request arrived on.
+dsh-deck 管理“如何到达可用的 dsh”，不管理 dsh 的内部会话数据。桌面控制面只监听 loopback；远端服务仍在远端 loopback，由 SSH 建立访问路径。
 
-Everything below follows from those two facts.
+启动链是 `Start.exe / Start.cmd → dsh.ps1 app → Node 后端 → 浏览器界面`。操作链是 `界面 → 本地 API → dsh.ps1 → Windows 进程或 SSH/systemd`。
 
-```
-┌─ browser ─┐
-│  dsh UI   │  own window, chromeless (Chrome/Edge --app)
-└─────┬─────┘
-      │ http://127.0.0.1:3099/?token=...      ← token rewritten to the tunnel port
-┌─────▼──────────────────────────────┐
-│ ssh -N -L 3099:127.0.0.1:3080      │  owned by the launcher, one per instance
-└─────┬──────────────────────────────┘
-      │ (encrypted, authenticated by ssh)
-┌─────▼──────────────────────────────┐
-│ server: 127.0.0.1:3080             │
-│ systemd --user  dsh-web.service    │  survives logout (linger)
-│   └─ dsh-web-service.sh            │  publishes the token URL to a file
-│        └─ dsh web --port 3080      │
-└────────────────────────────────────┘
-```
+## 职责划分
 
-## Components
-
-| File | Runs where | Responsibility |
+| 位置 | 职责 | 不应承担 |
 | --- | --- | --- |
-| `dsh.ps1` | your machine | **all** dsh logic: start/stop, tunnels, status, provisioning, diagnosis |
-| `app/server.js` | your machine | panel backend; a thin HTTP wrapper over `dsh.ps1` |
-| `app/ui/index.html` | browser | the interface; one self-contained file, no build step |
-| `remote/dsh-web-service.sh` | server | systemd entry point; publishes the startup URL |
+| `dsh.ps1` | 参数、初始化、命令调度与退出码 | 再复制一套 UI 业务逻辑 |
+| `launcher/` | 配置规范化、运行时、实例生命周期、升级与诊断 | HTTP 和 DOM |
+| `app/server.js` | HTTP 路由、鉴权与依赖组合 | 独立决定如何安装或启动 dsh |
+| `app/lib/` | 进程调用、状态缓存、操作约束及脱敏 | 启动时偷偷操作真实主机 |
+| `app/ui/` | 任务、计划、状态与实例维护界面；纯模型单独测试 | 从 HTTP 200 推断业务成功 |
+| `remote/dsh-web-service.sh` | systemd 服务入口、日志与认证地址发布 | 跨用户管理或公网暴露 |
+| `tools/` | 测试、资源打包与开发辅助 | 把现场状态当作默认测试夹具 |
 
-### Why the launcher holds all the logic
+启动器进一步分为 `Core`、`Config`、`Runtime`、`Local`、`Ssh`、`Remote`、`Desktop`、`Commands`；各模块顶层只定义函数，不在导入时产生副作用。后端和 UI 通过直接导入及注入替身测试，不用正则摘取函数作为主要测试手段。
 
-`app/server.js` deliberately contains **no** dsh knowledge. Every action shells
-out to `dsh.ps1 -Json` and relays the result. That means the panel and the CLI can
-never disagree about what "start" does, and there is exactly one place to fix a
-bug. The cheaper-looking alternative — reimplement status checks in JavaScript —
-would have produced two implementations drifting apart within weeks.
+## 数据与操作契约
 
-### Why the UI talks to a local HTTP server
+- 配置只解析一次规则：路径选择、校验、profile 与用户覆盖合并后，交给所有入口使用。
+- 稳定标识 `name` 与可读名称 `displayName` 分开；端口、名称、版本和布尔开关在边界验证。
+- 计划与执行共用目标版本和环境判断。计划说明下载、部署、重启和限制，不把字符串说明当作权限系统。
+- 变更命令返回逐实例结果及总体成功状态；失败退出非零。API 与 UI 继续传播这个结果。
+- 状态缓存记录最后成功与最近尝试时间；旧探测不得覆盖更新的操作结果，失败时保留历史但明确标为历史。
+- 实例操作需要服务端与启动器层的并发约束；按钮禁用只负责交互反馈。
 
-The interface could have been a PowerShell WinForms window, avoiding Node
-entirely. It is a local web app instead for three reasons:
+## 所有权与生命周期
 
-- **zero install**: no compiler, no package manager, no runtime beyond Node which
-  dsh already requires;
-- a **real window** with a taskbar entry, via the browser's `--app` mode;
-- the whole UI is one HTML file that can be iterated on without a build step.
+重复 start 必须保留健康实例。只有证明属于该实例的进程才能接管或停止：远端根据 systemd 服务归属，而非 shell 与 node 的 PID 是否相等；本地不能仅凭 `node` 名称或 HTTP 200 识别 dsh。
 
-The cost is a local server process, which is why it is fenced as described below.
+`stopRemoteService:false` 将停止范围限制为隧道。进程未能停止时必须保留必要记录，不可通过删除状态文件制造“已停止”的假象。
 
-## Security model
+进程超时清理受控的本机子进程树，并说明远端动作是否仍可能已生效。不提供未经实现的取消或回滚保证。
 
-The backend can start servers and open SSH tunnels, so it is treated as
-privileged even though it only listens on loopback.
+## 认证与存储
 
-| Control | Why |
-| --- | --- |
-| Binds `127.0.0.1`, OS-assigned port | Not reachable from the network |
-| Per-launch random token on every request | A local process cannot drive the API by guessing a port |
-| Origin **and** Host must match | A web page you visit cannot reach the API through your browser |
-| Instance names validated against config | Nothing user-supplied is concatenated into a command line |
-| Body size caps, method routing | Ordinary hardening |
-| dsh never bound beyond loopback | The upstream CLI's own safety position |
+界面入口携带短期启动凭据，页面及时移除地址中的凭据。API 使用内存中的请求头或同源 HttpOnly 会话凭据，Host/Origin 必须符合控制面地址。静态界面不包含服务器注入的秘密。
 
-There is no credential storage. Config references keys (`identityFile`); it never
-contains key material. `ssh` handles authentication using the user's existing
-setup.
+配置不保存长期 key；认证运行文件、实例地址和服务日志仍需当作敏感资料保护。日志和任务输出默认脱敏，显示/复制地址不含认证参数。具体保存位置及外联边界见[安全与隐私](security.md)。
 
-## Provisioning flow
+## 交付与验证
 
-`install` (and `start`, when needed) runs this sequence:
+EXE 是入口与资源载体，不内置 Node。资源清单必须覆盖 `launcher/`、后端模块、UI 静态资源和远端脚本，并以内容检查一致性。
 
-```
-1  ssh reachable?            ── no ─►  classify the failure and explain it
-2  facts: os, arch, systemd,
-   node, npm prefix, disk    (one round trip)
-3  node present AND >= 22.19.0?  ── no ─►  install Node into ~/.local/node
-4  dsh present AND runnable?     ── no ─►  npm install -g into the host's prefix
-5  deploy service + unit, enable linger
-6  start, then wait for the port to actually listen
-7  open a tunnel, fetch the token URL, rewrite the port, hand it over
-```
+验证分为纯逻辑、隔离 HTTP、Windows 沙箱、浏览器、真实 SSH/systemd 五层；后一层不能由前一层代替。默认检查离线且不读取用户运行状态，EXE 提取测试只写入一次性目录，不启动面板或访问真实用户缓存。
 
-Steps 3 and 4 are separate on purpose. "Node is installed" and "dsh runs" are
-different conditions, and conflating them produced a silent failure that took a
-while to find — see [lessons.md](lessons.md) #5 and #6.
-
-Nothing requires `sudo`. `loginctl enable-linger` may want privileges and is
-optional; without it the service works for the current session.
-
-## The token, precisely
-
-```
-dsh web: http://127.0.0.1:3080/?token=<TOKEN>
-```
-
-- The URL is printed once, after the plugin tree settles, so it doubles as a
-  readiness signal.
-- `GET /` without it → `401`. With it → `303` + `Set-Cookie`.
-- The cookie payload names the authority it was issued for:
-
-  ```json
-  {"version":1,"authority":"127.0.0.1:3099","issuedAt":...,"expiresAt":...}
-  ```
-
-  30-day expiry, `HttpOnly`, `SameSite=Strict`.
-- Because the authority is the **local tunnel port**, rewriting `3080` → `3099`
-  before opening the browser is not a hack; it is what makes the cookie valid.
-
-Older builds (≤ 0.1.1) print no token and serve `/` as `200`. Both shapes are
-handled by reading the URL out of the log with
-`dsh web:\s+(http://[^\s()]+)`.
-
-## Remote service lifecycle
-
-`remote/dsh-web-service.sh` is a wrapper rather than `ExecStart=dsh web` for
-reasons that are all about visibility:
-
-- **systemd has no terminal**, so the startup URL would be lost. The wrapper runs
-  a small publisher that greps the log and writes the URL to
-  `~/.dsh/remote-web.url` for the launcher to read over ssh.
-- **The log is rotated each start** so a stale token can never be mistaken for the
-  current one.
-- **The exit status is captured and reported.** A bare service that dies
-  instantly otherwise shows up as `status=0/SUCCESS`, which is how a broken dsh
-  once looked perfectly healthy.
-- **PATH is prepared explicitly.** `dsh`'s shebang is `#!/usr/bin/env node`, so
-  the wrapper puts `~/.local/node/bin` first — otherwise a too-old system node
-  makes dsh exit 0 with no output.
-
-## Status states
-
-| State | Meaning |
-| --- | --- |
-| `up` | local server serving, or remote unit active + listening + tunnel up |
-| `up-external` | the port was already served by a dsh the launcher did not start; it adopts it so `stop` still works |
-| `remote-only` | server healthy, tunnel down |
-| `tunnel-only` | tunnel up, server not running |
-| `down` | nothing running |
-| `port-busy` | port held by an unrelated process |
-| `unreachable` | ssh failed, with a classified reason |
-| `disabled` | `enabled: false` in config |
-
-## Known limitations
-
-- **Windows only, today.** The backend and remote script are portable; the
-  launcher is PowerShell and uses `Get-NetTCPConnection`, `taskkill` and
-  `Get-CimInstance`. Porting it to a Node CLI is on the roadmap.
-- **Remote hosts must be Linux with systemd** for provisioning. Other unixes
-  would need a different service manager.
-- **SSH connection multiplexing is unavailable on Windows OpenSSH**
-  (`ControlMaster` fails with "getsockname failed: Not a socket"), so each probe
-  is a fresh connection. Probes are therefore batched into single round trips.
+更多背景见[历史架构](archive/2026-09-16-architecture.md)，历史观察不作为当前上游兼容性保证。

@@ -28,9 +28,9 @@ jobs:
             $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
             if ($errors -and $errors.Count -gt 0) {
               $failed += $f.FullName
-              Write-Host "::error file=$($f.FullName)::$($errors[0].Message)"
+              Write-Host "::error file=$($f.FullName)::$($errors[0].ErrorId)"
               $errors | Select-Object -First 5 | ForEach-Object {
-                Write-Host "  line $($_.Extent.StartLineNumber): $($_.Message)"
+                Write-Host "  line $($_.Extent.StartLineNumber): $($_.ErrorId)"
               }
             } else {
               Write-Host "ok  $($f.Name)"
@@ -65,9 +65,7 @@ jobs:
       - name: Shellcheck the remote service script
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning remote/dsh-web-service.sh || {
-            echo "::warning::shellcheck reported warnings (see above)";
-          }
+          shellcheck --severity=warning remote/dsh-web-service.sh
 
       - name: Validate JSON files
         run: |
@@ -75,35 +73,20 @@ jobs:
             node -e "JSON.parse(require('fs').readFileSync('$f','utf8')); console.log('ok  $f')"
           done
 
-      - name: Verify the launcher documents every command it implements
-        shell: pwsh
-        run: |
-          # Cheap drift guard: every ValidateSet verb must appear in the README.
-          $src = Get-Content dsh.ps1 -Raw
-          $m = [regex]::Match($src, "ValidateSet\(([^)]+)\)")
-          if (-not $m.Success) { throw "could not find the Command ValidateSet in dsh.ps1" }
-          $verbs = $m.Groups[1].Value -replace "['\s]", '' -split ','
-          $readme = Get-Content README.md -Raw
-          $missing = @($verbs | Where-Object { $_ -and $readme -notmatch [regex]::Escape($_) })
-          Write-Host "commands: $($verbs -join ', ')"
-          if ($missing.Count -gt 0) {
-            Write-Host "::warning::commands missing from README: $($missing -join ', ')"
-          }
+      - name: Documentation links, examples and public command reference
+        run: node tools/check-docs.js
 
-      - name: Panel rendering logic (hint commands, action gating)
-        # Extracts the shipped FAIL_STEP and card() from index.html, so the checks
-        # track the real rendering logic instead of a copy of it. Runs on every
-        # push and needs no Windows.
+      - name: HTTP, authentication, process runner and operation contracts
+        run: node tools/check-server.js
+
+      - name: Panel models and fake-DOM user workflows
+        # Imports the shipped modules: no copied rendering implementation and
+        # no connection to a developer's browser or live panel.
         run: node tools/check-ui.js
 
       - name: Status cache guarantees
-        # Extracts getStatus/applyStatusRows from app/server.js and runs them
-        # against a stubbed probe, so single-flight, the TTL and mutation-folding
-        # are verified by counting probes rather than by timing a real ssh
-        # handshake. The live latency assertions in tools/check-panel.ps1 cannot
-        # run here (they need a running backend and reachable hosts), and they
-        # cannot prove deduplication at all without a destructive install, which
-        # is why this is a unit test on the extracted functions.
+        # Tests the real cache factory with controlled clocks/probes, including
+        # mutation races, invalidation and failed-observation freshness.
         run: node tools/check-status-cache.js
 
       - name: Stop-App contract (the verdict, not taskkill's exit code)
@@ -128,7 +111,7 @@ jobs:
           $raw = & ./dsh.ps1 -Command list -Json -Config ./.dshproj.example.json 2>$null
           $text = ($raw | Out-String).Trim()
           if (-not $text) { throw "list -Json produced no output" }
-          if ($text -notmatch '^\[') { throw "stdout does not start with a JSON array: $text" }
+          if ($text -notmatch '^\[') { throw "stdout does not start with a JSON array" }
           $parsed = $text | ConvertFrom-Json
           if ($parsed.Count -lt 1) { throw "expected at least one instance, got $($parsed.Count)" }
           Write-Host "ok  list -Json parsed $($parsed.Count) instance(s) with no chatter on stdout"
@@ -144,14 +127,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: PowerShell 5.1 BOM and parse gate (read-only)
+        shell: powershell
+        run: powershell -NoProfile -File tools/fix-bom.ps1 -Check
+
+      - name: Source gate never rewrites or stages user work
+        run: node tools/check-source.js
+
+      - name: Launcher module and CLI contracts (offline)
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-launcher-contracts.ps1
+
+      - name: Committed EXE contains the exact runtime resources
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-package.ps1
+
       - name: app -Stop actually stops the panel
         # Starts a real panel from a throwaway copy of this checkout, then
         # intercepts taskkill with a compiled shim that emits the exact stderr
         # line that caused the defect. Asserts the verdict comes from the
         # process table: a backend that died is reported as stopped, a backend
         # that survived is reported as a failure and keeps its runtime file.
-        shell: pwsh
-        run: pwsh -File tools/check-app-stop.ps1
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-app-stop.ps1
 
       - name: A local instance with no dsh says so, and can fix itself
         # The gap this closes: `start` reported "dsh not found" only to a log and
@@ -160,8 +158,8 @@ jobs:
         # controllable exit code, so npm is never asked to install anything for
         # real - every assertion is about what the launcher REPORTS, including
         # that a stub which exits 0 while dsh is still missing is not a success.
-        shell: pwsh
-        run: pwsh -File tools/check-local-install.ps1
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-local-install.ps1
 
       - name: The Node runtime can be provided, and only when verified
         # Serves a synthetic nodejs.org from a local directory, so this downloads
@@ -169,16 +167,16 @@ jobs:
         # are the refusals: a checksum mismatch, a zip the checksum list does not
         # cover, and a checksum list that cannot be fetched at all - none of which
         # can be produced against the real nodejs.org without breaking it.
-        shell: pwsh
-        run: pwsh -File tools/check-node-bootstrap.ps1
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-node-bootstrap.ps1
 
       # Git Bash stands in for a remote Linux host: it ships sha256sum, awk, curl
       # and tar, which is everything the provisioning script touches. GitHub's
       # windows runners have it, so the checksum logic is checked for real rather
       # than only parsed.
       - name: Provisioning a host verifies the Node it installs
-        shell: pwsh
-        run: pwsh -File tools/check-remote-node.ps1
+        shell: powershell
+        run: powershell -NoProfile -File tools/check-remote-node.ps1
 
   # ---------------------------------------------------------------------------
   # The app backend is dependency-free, which is a promise worth enforcing: a
@@ -189,17 +187,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Assert the backend uses only Node builtins
-        run: |
-          node -e '
-            const fs = require("fs");
-            const src = fs.readFileSync("app/server.js", "utf8");
-            const builtins = new Set(require("module").builtinModules);
-            const reqs = [...src.matchAll(/require\(["\x27]([^"\x27]+)["\x27]\)/g)].map(m => m[1]);
-            const external = reqs.filter(r => !builtins.has(r) && !r.startsWith("."));
-            console.log("requires:", [...new Set(reqs)].join(", ") || "(none)");
-            if (external.length) {
-              console.error("external dependencies found: " + external.join(", "));
-              process.exit(1);
-            }
-            console.log("ok: no external dependencies");
-          '
+        run: node tools/check-no-deps.js

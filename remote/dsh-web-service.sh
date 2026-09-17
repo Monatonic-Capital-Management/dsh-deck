@@ -1,34 +1,21 @@
 #!/usr/bin/env bash
-# dsh-web-service.sh - run `dsh web` on a remote host under systemd --user.
-#
-# Why this exists (rather than ExecStart=dsh web directly):
-#
-#   1. Recent dsh prints a ONE-TIME authenticated URL at startup
-#      (`dsh web: http://127.0.0.1:3080/?token=...`). That token is the only way
-#      to obtain the browser's signed cookie. Under systemd there is no terminal
-#      to read it from, so stdout is captured here and the URL is republished to
-#      a file that the local launcher reads over SSH.
-#
-#   2. Older dsh (<= 0.1.1) prints no token and does not fence `/`. This script
-#      must work with both, so every step below tolerates the token being absent.
-#
-#   3. `exec` keeps the node process as systemd's main process, so
-#      `systemctl --user stop` signals the server itself rather than a wrapper
-#      shell that outlived it.
-#
-# Usage: dsh-web-service.sh
-# Env overrides: DSH_BIN, DSH_HOME, DSH_LOG_FILE, DSH_URL_FILE,
-#                DSH_RUNTIME_DIR, DSH_PORT, DSH_WORKDIR
-
+# Private URL publication and sanitized application logs for systemd --user.
+# Env: DSH_BIN, DSH_HOME, DSH_LOG_FILE, DSH_URL_FILE, DSH_RUNTIME_DIR,
+#      DSH_PORT, DSH_WORKDIR. systemd owns the whole service cgroup.
 set -o pipefail
+umask 077
 
 DSH_BIN="${DSH_BIN:-$HOME/.local/bin/dsh}"
-DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 LOG_FILE="${DSH_LOG_FILE:-$DSH_HOME/remote-web.log}"
 URL_FILE="${DSH_URL_FILE:-$DSH_HOME/remote-web.url}"
 RUNTIME_DIR="${DSH_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/dsh-web}"
 PORT="${DSH_PORT:-3080}"
 WORKDIR="${DSH_WORKDIR:-$HOME}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo 'dsh-web-service: invalid DSH_PORT' >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$URL_FILE")" "$RUNTIME_DIR"
 
@@ -75,42 +62,37 @@ cd "$WORKDIR" || exit 1
 [ -s "$LOG_FILE" ] && mv -f "$LOG_FILE" "$LOG_FILE.1"
 rm -f "$URL_FILE" "$RUNTIME_DIR/ready"
 
-# Publish dsh's URL (token or plain) as soon as it appears.
-publish_url() {
-  local i url
-  for i in $(seq 1 600); do
-    if [ -s "$LOG_FILE" ]; then
-      url="$(grep -oE 'https?://[^[:space:]]+' "$LOG_FILE" | head -n 1)"
-      if [ -n "$url" ]; then
-        printf '%s\n' "$url" > "$URL_FILE.tmp" && mv -f "$URL_FILE.tmp" "$URL_FILE"
-        : > "$RUNTIME_DIR/ready"
-        return 0
-      fi
+: > "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+VERSION_FILE="$DSH_HOME/remote-web.version"
+version="$("$DSH_BIN" --version 2>/dev/null | head -1)"
+if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$ ]]; then
+  version_tmp="$(mktemp "$VERSION_FILE.XXXXXX")" || exit 1
+  printf '%s\n' "$version" > "$version_tmp" && mv -f "$version_tmp" "$VERSION_FILE"
+else
+  rm -f "$VERSION_FILE"
+fi
+
+capture_output() {
+  local line url temp_file
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ dsh\ web:[[:space:]]+(http://127\.0\.0\.1:[0-9]+/[^[:space:]\(\)]*) ]]; then
+      url="${BASH_REMATCH[1]}"
+      case "$url" in
+        "http://127.0.0.1:$PORT/"*)
+          temp_file="$(mktemp "$URL_FILE.XXXXXX")" || return 1
+          printf '%s\n' "$url" > "$temp_file" && mv -f "$temp_file" "$URL_FILE"
+          : > "$RUNTIME_DIR/ready"
+          ;;
+      esac
     fi
-    sleep 0.2
+    printf '%s\n' "$line" | sed -E \
+      -e 's|(https?://[^?#[:space:]]*)[?#][^[:space:]]*|\1?[redacted]|g' \
+      -e 's/([Bb]earer[[:space:]]+)[^[:space:]]+/\1[redacted]/g' \
+      -e 's/((token|api[_-]?key|password|secret|cookie|authorization)"?[[:space:]]*[:=][[:space:]]*)("[^"]*"|[^[:space:]]+)/\1[redacted]/Ig' \
+      -e 's/sk-[A-Za-z0-9_-]+/[redacted]/g' >> "$LOG_FILE"
   done
-  return 1
 }
 
-publish_url &
-
-# exec: systemd tracks the real server process; its stdout lands in LOG_FILE.
-#
-# The subshell above is what makes reporting tricky: with a bare `exec`, systemd
-# sees only the exit status of the server, which is right, but a wrapper that
-# dies before reaching `exec` would be reported as success. So the exit code is
-# captured explicitly and a failure is written to the log AND propagated, rather
-# than letting a silent 0 pretend the service started.
-"$DSH_BIN" web --port "$PORT" --no-open >>"$LOG_FILE" 2>&1
-code=$?
-
-if [ "$code" -ne 0 ]; then
-  {
-    echo "dsh-web-service: dsh exited with status $code"
-    echo "dsh-web-service: dsh binary was $DSH_BIN"
-    echo "dsh-web-service: node is $(command -v node || echo 'not on PATH') $(node -v 2>/dev/null)"
-    echo "dsh-web-service: run it by hand to see the real error --"
-    echo "  $DSH_BIN web --port $PORT --no-open"
-  } >>"$LOG_FILE" 2>&1
-  exit "$code"
-fi
+# Process substitution stays in the service cgroup; systemd tracks dsh itself.
+exec "$DSH_BIN" web --port "$PORT" --no-open > >(capture_output) 2>&1
