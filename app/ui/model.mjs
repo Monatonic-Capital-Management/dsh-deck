@@ -2,16 +2,31 @@
 export const HISTORY_LIMIT = 30;
 export const STALE_AFTER_MS = 90_000;
 export const STATE_TEXT = Object.freeze({
-  up: '运行中', 'up-external': '运行中（外部进程）', 'remote-only': '仅远端服务',
-  'tunnel-only': '仅隧道', down: '已停止', disabled: '已停用',
+  up: '运行中', 'up-external': '运行中（外部进程）', 'remote-only': '未连接',
+  'tunnel-only': '远端未就绪', down: '已停止', disabled: '已停用',
   unreachable: '无法连接', 'port-busy': '端口被占用', unhealthy: '服务未就绪',
   unknown: '尚未探测', 'not-probed': '尚未探测',
 });
 export const ACTION_TEXT = Object.freeze({
-  start: '启动', stop: '停止', restart: '重启', install: '安装准备', upgrade: '升级',
-  config: '保存配置', remove: '移除登记', add: '添加实例', open: '打开实例',
-  'open-system': '用系统浏览器打开', reveal: '打开工作目录', doctor: '环境自检',
-  versions: '检查版本', tray: '切换托盘监控',
+  start: '启动', stop: '停止', restart: '重启', install: '安装', upgrade: '升级',
+  config: '保存设置', remove: '移除登记', add: '添加远端', open: '打开',
+  'open-system': '在系统浏览器中打开', reveal: '打开工作目录', doctor: '环境自检',
+  versions: '检查版本', tray: '切换托盘图标',
+});
+export const BUSY_TEXT = Object.freeze({
+  start: '正在启动', stop: '正在停止', restart: '正在重启', install: '正在安装', upgrade: '正在升级',
+  config: '正在保存', remove: '正在移除', add: '正在添加', open: '正在打开', 'open-system': '正在打开',
+  reveal: '正在打开目录', doctor: '正在自检', versions: '正在检查版本', tray: '正在切换',
+});
+export const DONE_TEXT = Object.freeze({
+  start: '已启动', stop: '已停止', restart: '已重启', install: '安装完成', upgrade: '升级完成',
+  config: '设置已保存', remove: '已移除登记', add: '已添加远端', tray: '托盘图标已更新',
+});
+// Opening a window or folder is navigation, not an operation worth a history entry.
+export const QUIET_ACTIONS = Object.freeze(['open', 'open-system', 'reveal']);
+export const TASK_STATUS_TEXT = Object.freeze({
+  running: '进行中', confirming: '待确认', success: '成功', failed: '失败', partial: '部分失败',
+  cancelled: '已取消', preview: '预览', report: '报告', empty: '无目标',
 });
 export const isUp = state => state === 'up' || state === 'up-external';
 export const isActive = state => isUp(state) || ['remote-only', 'tunnel-only', 'unhealthy'].includes(state);
@@ -25,8 +40,13 @@ export function isExceptional(it) {
   return ['unreachable', 'port-busy', 'remote-only', 'tunnel-only', 'unhealthy'].includes(it.state);
 }
 
-export function instanceMatches(it, query, exceptionsOnly = false) {
-  if (exceptionsOnly && !isExceptional(it)) return false;
+export const isDisabled = it => it.enabled === false || it.state === 'disabled';
+
+// mode: 'all' | 'up' | 'attention' | 'disabled'; a boolean true still means attention.
+export function instanceMatches(it, query, mode = 'all') {
+  if ((mode === true || mode === 'attention') && !isExceptional(it)) return false;
+  if (mode === 'up' && !isUp(it.state)) return false;
+  if (mode === 'disabled' && !isDisabled(it)) return false;
   const needles = String(query || '').trim().toLowerCase().split(/[\s,]+/).filter(Boolean);
   const haystack = [it.name, it.displayName, it.sshHost, it.description, it.kind]
     .filter(Boolean).join(' ').toLowerCase();
@@ -77,6 +97,18 @@ function timestamp(value) {
   if (value === null || value === undefined || value === '') return null;
   const result = typeof value === 'number' ? value : Date.parse(value);
   return Number.isFinite(result) && result > 0 ? result : null;
+}
+
+export function relativeTime(value, now) {
+  const at = timestamp(value);
+  if (at === null) return '';
+  const seconds = Math.round((now - at) / 1000);
+  if (seconds < -30) return new Date(at).toLocaleString('zh-CN', { hour12: false });
+  if (seconds < 10) return '刚刚';
+  if (seconds < 60) return `${seconds} 秒前`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return new Date(at).toLocaleString('zh-CN', { hour12: false });
 }
 
 export function probeFreshness(it, now, maxAge = STALE_AFTER_MS) {
@@ -219,22 +251,27 @@ export function normalizePlan(plan, name, action, clean = redactText) {
 }
 
 export function stopScope(it) {
-  if (it.kind === 'local') return '停止本机受管 dsh 服务；不会接管其他进程';
+  if (it.kind === 'local') return '停止本机受管 dsh 服务，不会接管其他进程';
   return it.stopRemoteService === false
-    ? '仅断开本机 SSH 隧道；保留远端 dsh 服务'
+    ? '仅断开本机 SSH 隧道，保留远端 dsh 服务'
     : '断开本机 SSH 隧道，并停止远端 dsh 服务';
 }
 
+const CONFIRM_VERB = Object.freeze({ start: '启动', stop: '停止', restart: '重启', install: '安装', upgrade: '升级', remove: '移除' });
+
 export function confirmationFor(action, instances, plans = []) {
-  const lines = instances.map(it => `${displayName(it)}（标识：${it.name}）：${
-    ['stop', 'restart'].includes(action) ? stopScope(it) : it.kind === 'local' ? '本机' : `远端 ${it.sshHost || it.name}`}`);
-  if (['stop', 'restart'].includes(action)) lines.push('连接将中断，正在进行的会话可能中断。请先保存工作。');
-  if (action === 'restart') lines.push('停止后重新启动；远端启动是否变更软件见下方计划。');
-  if (action === 'remove') lines.push('只移除登记，不停止进程、不卸载软件、不删除用户数据。存在受管进程时后端会拒绝；不会自动替你停止。未保存的编辑不会生效。');
-  if (action === 'install') lines.push('准备可用运行时、dsh 和所需服务定义，不自动启动服务。Node 的安装或复用范围以下方计划为准。');
-  if (action === 'upgrade') lines.push('目标版本遵守固定版本配置；服务重启会中断连接或会话。不保证原子回滚。');
-  return { title: `确认${ACTION_TEXT[action] || action}${instances.length > 1 ? ` ${instances.length} 个实例` : ''}？`,
-    lines, plans };
+  const scoped = ['stop', 'restart'].includes(action);
+  const lines = instances.length === 1
+    ? (scoped ? [`${stopScope(instances[0])}。`] : [])
+    : instances.map(it => `${displayName(it)}（${it.name}）：${scoped ? stopScope(it) : it.kind === 'local' ? '本机' : `远端 ${it.sshHost || it.name}`}`);
+  if (scoped) lines.push('连接将中断，进行中的会话可能受影响。请先保存工作。');
+  if (action === 'restart') lines.push('停止后重新启动；远端是否变更软件见下方计划。');
+  if (action === 'remove') lines.push('只移除登记，不停止进程、不卸载软件、不删除用户数据。仍有受管进程时会被拒绝，请先停止。');
+  if (action === 'install') lines.push('准备运行时、dsh 和所需服务定义，不会自动启动服务。是否安装或复用 Node 以下方计划为准。');
+  if (action === 'upgrade') lines.push('目标版本遵守固定版本设置。服务会重启并中断连接，不保证原子回滚。');
+  const verb = CONFIRM_VERB[action] || ACTION_TEXT[action] || action;
+  return { title: instances.length === 1 ? `${verb}「${displayName(instances[0])}」？` : `${verb} ${instances.length} 个实例？`,
+    lines, plans, verb, danger: ['stop', 'remove'].includes(action) };
 }
 
 export function requiresApproval(action, plans) {

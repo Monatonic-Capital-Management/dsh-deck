@@ -4,117 +4,234 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>dsh-deck · 实例控制台</title>
+<meta name="color-scheme" content="light dark">
+<title>dsh-deck</title>
 <link rel="stylesheet" href="/assets/panel.css">
 </head>
 <body>
-<a class="skip-link" href="#main">跳到实例与任务</a>
-<div id="app">
-  <header class="titlebar">
-    <div class="brand"><h1>dsh-deck</h1><p>本地与 SSH 实例控制台 · dsh 会在独立窗口打开</p></div>
-    <nav class="toolbar" aria-label="面板操作">
-      <button type="button" id="btn-balance" data-action="balance" hidden>DeepSeek 余额</button>
-      <button type="button" id="btn-refresh" data-action="refresh" title="重新读取后端状态快照，不等于强制探测">重新读取状态</button>
-      <button type="button" id="btn-start-all" data-action="start-all" hidden disabled>启动可用实例</button>
-      <button type="button" id="btn-add" data-action="add" disabled>添加远端</button>
-      <button type="button" id="btn-tasks" data-action="tasks" aria-controls="task-panel">任务与结果</button>
-      <button type="button" id="btn-more" data-action="more" aria-haspopup="dialog">工具与批量操作</button>
-    </nav>
-  </header>
+<a class="skip-link" href="#main">跳到实例页面</a>
+<div id="app" data-view="list">
+  <nav class="sidebar" aria-labelledby="instances-heading">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><h1>dsh-deck</h1></div>
+    <div class="sidebar-head">
+      <h2 id="instances-heading">实例</h2><span id="count" class="count"></span>
+      <button type="button" id="btn-refresh" class="subtle icon" data-action="refresh" data-icon="refresh" aria-label="重新探测" title="重新探测全部实例"></button>
+    </div>
+    <div id="filter" class="search" hidden>
+      <label class="sr-only" for="flt-q">搜索实例</label>
+      <input type="search" id="flt-q" placeholder="搜索实例" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="list" class="sidebar-list">
+      <div id="loading" class="skeleton-list" role="status" aria-label="正在读取实例"><span></span><span></span><span></span></div>
+      <div id="cards" class="instance-list" role="list" aria-label="实例列表"></div>
+      <p id="empty-filter" class="list-empty" hidden>没有匹配的实例。<button type="button" class="link" data-action="clear-filter">清除搜索</button></p>
+    </div>
+    <button type="button" id="btn-add" class="nav-row" data-action="add" data-icon="add" disabled>添加远端</button>
+    <div class="sidebar-foot">
+      <button type="button" id="btn-tasks" class="nav-row" data-action="tasks" data-icon="history" aria-haspopup="dialog" aria-controls="activity-dialog">活动<span id="task-indicator" class="indicator" aria-hidden="true"></span></button>
+      <div class="menu-host">
+        <button type="button" id="btn-tools" class="nav-row" data-action="menu" data-menu="tools-menu" data-icon="tools" aria-haspopup="menu" aria-expanded="false" aria-controls="tools-menu">工具</button>
+        <div id="tools-menu" class="menu menu-up" role="menu" aria-label="工具" hidden>
+          <div id="batch-group" class="menu-group" role="group" aria-label="批量操作">
+            <button type="button" role="menuitem" id="btn-start-all" data-action="start-all" data-icon="play" disabled>全部启动</button>
+            <button type="button" role="menuitem" id="btn-stop-all" data-action="stop-all" data-icon="stop" disabled>全部停止…</button>
+            <button type="button" role="menuitem" id="btn-upgrade-all" data-action="upgrade-all" data-icon="upgrade" disabled>全部升级…</button>
+          </div>
+          <div class="menu-group" role="group" aria-label="诊断">
+            <button type="button" role="menuitem" id="btn-doctor" data-action="doctor" data-icon="diagnostic" disabled>环境自检</button>
+            <button type="button" role="menuitem" id="btn-versions" data-action="versions" data-icon="list" disabled>检查版本</button>
+          </div>
+          <div class="menu-group" role="group" aria-label="系统">
+            <button type="button" role="menuitemcheckbox" id="btn-tray" data-action="tray" aria-checked="false" disabled>托盘图标</button>
+          </div>
+        </div>
+      </div>
+      <button type="button" id="btn-balance" class="nav-row" data-action="balance" data-icon="wallet" hidden>余额<span id="balance-amount" class="nav-value"></span></button>
+      <p id="sb-updated" class="caption" role="status"></p>
+    </div>
+  </nav>
+
   <main id="main" class="content" tabindex="-1">
-    <noscript><p class="banner">dsh-deck 需要启用 JavaScript。请通过 Start.exe 打开面板。</p></noscript>
-    <div id="notice" role="status" aria-live="polite" aria-atomic="true"></div>
-    <div id="backend-error" class="banner" role="alert" hidden><p id="backend-error-text"></p><button type="button" data-action="refresh">重试读取</button></div>
-    <section aria-labelledby="instances-heading">
-      <div class="section-head"><h2 id="instances-heading">实例</h2><span id="count" class="muted"></span></div>
-      <div id="filter" class="filter" hidden>
-        <label class="sr-only" for="flt-q">按显示名称、机器标识、主机或描述筛选</label>
-        <input type="search" id="flt-q" placeholder="名称 / 标识 / 主机 / 描述" autocomplete="off" spellcheck="false">
-        <button type="button" id="flt-errors" data-action="exceptions" aria-pressed="false">只看异常</button>
-        <span id="flt-hits" class="muted" aria-live="polite"></span>
+    <noscript><p class="noscript">dsh-deck 需要启用 JavaScript。请通过 Start.exe 打开面板。</p></noscript>
+    <div id="backend-error" class="infobar" data-tone="critical" role="alert" hidden>
+      <span class="infobar-icon" aria-hidden="true"></span>
+      <div class="infobar-text"><strong>无法读取实例状态</strong><p id="backend-error-text"></p></div>
+      <div class="infobar-actions"><button type="button" data-action="refresh">重试</button></div>
+    </div>
+    <div id="empty-config" class="welcome" hidden>
+      <span class="welcome-mark" aria-hidden="true"></span>
+      <h2>还没有实例</h2>
+      <p>添加一台已能通过 SSH 登录的机器。只保存登记，不会安装软件、修改 SSH 配置或启动服务。</p>
+      <button type="button" data-action="add" data-priority="primary" data-icon="add">添加远端</button>
+    </div>
+
+    <section id="detail" class="detail" aria-labelledby="detail-title" hidden>
+      <button type="button" id="btn-back" class="subtle back" data-action="back" data-icon="back">全部实例</button>
+      <header class="detail-head">
+        <span class="avatar large" aria-hidden="true"><span class="badge"></span></span>
+        <div class="detail-heading">
+          <h2 id="detail-title" tabindex="-1"></h2>
+          <p class="detail-meta"><span id="detail-state" class="state-text"></span><span id="detail-identity"></span><span id="detail-probe"></span></p>
+        </div>
+        <div id="detail-actions" class="command-bar" role="toolbar" aria-label="实例操作">
+          <button type="button" data-action="open" data-icon="open">打开 dsh</button>
+          <button type="button" data-action="start" data-icon="play">启动</button>
+          <button type="button" data-action="install" data-icon="install" data-role="install">安装 dsh…</button>
+          <button type="button" data-action="restart" data-icon="restart">重启…</button>
+          <button type="button" data-action="stop" data-icon="stop">停止…</button>
+          <div class="menu-host">
+            <button type="button" id="detail-more" class="icon" data-action="menu" data-menu="detail-menu" data-icon="more" aria-haspopup="menu" aria-expanded="false" aria-controls="detail-menu" aria-label="更多实例操作" title="更多操作"></button>
+            <div id="detail-menu" class="menu menu-end" role="menu" aria-label="更多实例操作" hidden>
+              <button type="button" role="menuitem" data-action="restart" data-icon="restart">重启…</button>
+              <button type="button" role="menuitem" data-action="upgrade" data-icon="upgrade">升级…</button>
+              <button type="button" role="menuitem" data-action="open-system" data-icon="globe">在系统浏览器中打开</button>
+              <button type="button" role="menuitem" data-action="copy-url" data-icon="copy">复制地址</button>
+              <button type="button" role="menuitem" data-action="reveal" data-icon="folder">打开工作目录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div id="detail-progress" class="progress" hidden><span class="progress-track" aria-hidden="true"></span><p id="detail-phase" role="status"></p></div>
+      <div id="detail-alert" class="infobar" data-role="hint-row" data-tone="warning" hidden>
+        <span class="infobar-icon" aria-hidden="true"></span>
+        <div class="infobar-text"><strong data-role="summary"></strong><p data-role="hint"></p></div>
+        <div class="infobar-actions"><button type="button" data-action="copy-step" data-role="step" data-icon="copy"></button><button type="button" data-action="copy-install" data-role="manual" data-icon="copy">复制安装命令</button></div>
       </div>
-      <div id="list">
-        <p id="loading" class="empty" role="status">正在连接后端并读取实例快照…</p>
-        <div id="cards" class="grid"></div>
-        <div id="empty-config" class="empty" hidden><p>尚无登记的实例。首次本机配置通常由 Start.exe 创建；若本机缺少依赖，卡片会引导查看安装准备计划。远端需使用已有 SSH 连接。</p><button type="button" data-action="add">添加远端实例</button></div>
-        <div id="empty-filter" class="empty" hidden><p>没有匹配的实例。正常停止和停用不算故障。</p><button type="button" data-action="clear-filter">清除筛选条件</button></div>
+      <div id="detail-update" class="infobar" data-role="update-row" data-tone="info" hidden>
+        <span class="infobar-icon" aria-hidden="true"></span>
+        <div class="infobar-text"><strong>有可用更新</strong><p id="detail-update-text" data-role="update"></p></div>
+        <div class="infobar-actions"><button type="button" data-action="upgrade" data-role="upgrade-label" data-icon="upgrade">升级…</button></div>
       </div>
-      <p class="legend">正常停止与停用不是故障。状态超过 90 秒未成功探测会标记过期；重新读取缓存不会更新时间为「刚探测成功」。</p>
+
+      <div class="tabs" role="tablist" aria-label="实例页面">
+        <button type="button" role="tab" id="tab-overview" data-action="tab" data-tab="overview" aria-selected="true" aria-controls="panel-overview">概览</button>
+        <button type="button" role="tab" id="tab-settings" data-action="tab" data-tab="settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">设置</button>
+        <button type="button" role="tab" id="tab-logs" data-action="tab" data-tab="logs" aria-selected="false" aria-controls="panel-logs" tabindex="-1">日志</button>
+      </div>
+
+      <div id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
+        <dl class="props">
+          <div id="detail-url-row"><dt>地址</dt><dd><span id="detail-url"></span><button type="button" class="subtle small" data-action="copy-url" data-icon="copy">复制</button></dd></div>
+          <div><dt>连接</dt><dd id="detail-connection"></dd></div>
+          <div id="detail-wd-row"><dt>工作目录</dt><dd><span id="detail-workdir"></span><button type="button" class="subtle small" data-action="reveal" data-icon="folder">打开</button></dd></div>
+          <div><dt>dsh 版本</dt><dd id="detail-version"></dd></div>
+          <div id="detail-node-row"><dt>Node</dt><dd id="detail-node"></dd></div>
+          <div><dt>最近成功探测</dt><dd id="detail-probed"></dd></div>
+          <div id="detail-attempt-row"><dt>最近尝试</dt><dd id="detail-attempted"></dd></div>
+          <div id="detail-backend-row"><dt>后端说明</dt><dd id="detail-backend"></dd></div>
+          <div id="detail-desc-row"><dt>描述</dt><dd id="detail-description"></dd></div>
+        </dl>
+        <section id="detail-task" class="recent" aria-labelledby="detail-task-heading" hidden>
+          <h3 id="detail-task-heading" class="group-title" tabindex="-1">最近操作</h3>
+          <div id="detail-task-body" class="task task-card" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <div id="panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <form id="config-form" class="settings" novalidate>
+          <h3 class="group-title">常规</h3>
+          <div class="setting">
+            <div class="setting-text"><label for="cfg-display-name">显示名称</label><p class="help">只在 dsh-deck 中显示，不影响机器标识。</p></div>
+            <div class="setting-control"><input type="text" id="cfg-display-name" autocomplete="off" aria-describedby="cfg-display-name-error"><p id="cfg-display-name-error" class="error"></p></div>
+          </div>
+          <div class="setting stacked">
+            <div class="setting-text"><label for="cfg-description">描述</label></div>
+            <div class="setting-control"><textarea id="cfg-description" rows="2" aria-describedby="cfg-description-error"></textarea><p id="cfg-description-error" class="error"></p></div>
+          </div>
+          <div class="setting" id="local-config">
+            <div class="setting-text"><label for="cfg-workdir">工作目录</label><p id="cfg-workdir-help" class="help">新会话的默认目录，重启后生效。</p></div>
+            <div class="setting-control"><input type="text" id="cfg-workdir" class="mono" autocomplete="off" spellcheck="false" aria-describedby="cfg-workdir-help cfg-workdir-error"><p id="cfg-workdir-error" class="error"></p></div>
+          </div>
+          <div class="setting">
+            <div class="setting-text"><label for="cfg-version">固定 dsh 版本</label><p id="cfg-version-help" class="help">留空则跟随最新版本。修改后需升级才会生效。</p></div>
+            <div class="setting-control"><input type="text" id="cfg-version" placeholder="跟随最新" autocomplete="off" spellcheck="false" aria-describedby="cfg-version-help cfg-version-error"><p id="cfg-version-error" class="error"></p></div>
+          </div>
+          <h3 class="group-title">行为</h3>
+          <div class="setting">
+            <div class="setting-text"><label for="cfg-enabled">启用此实例</label><p id="cfg-enabled-help" class="help">停用后不参与“全部启动”，也不会停止正在运行的服务。</p></div>
+            <div class="setting-control"><input type="checkbox" class="switch" id="cfg-enabled" aria-describedby="cfg-enabled-help"><p id="cfg-enabled-error" class="error"></p></div>
+          </div>
+          <div id="remote-config">
+            <div class="setting">
+              <div class="setting-text"><label for="cfg-auto-install">启动时自动准备环境</label><p id="cfg-auto-install-help" class="help">缺少 Node 或 dsh 时，先展示计划，确认后再安装。</p></div>
+              <div class="setting-control"><input type="checkbox" class="switch" id="cfg-auto-install" aria-describedby="cfg-auto-install-help"><p id="cfg-auto-install-error" class="error"></p></div>
+            </div>
+            <div class="setting">
+              <div class="setting-text"><label for="cfg-stop-remote">停止时同时停止远端服务</label><p id="cfg-stop-remote-help" class="help">关闭后，“停止”只断开本机隧道，远端服务继续运行。</p></div>
+              <div class="setting-control"><input type="checkbox" class="switch" id="cfg-stop-remote" aria-describedby="cfg-stop-remote-help"><p id="cfg-stop-remote-error" class="error"></p></div>
+            </div>
+          </div>
+          <div class="form-actions"><p id="config-dirty" role="status"></p><p id="config-feedback" role="status" aria-live="polite"></p><button type="submit" id="btn-save-config" data-priority="primary">保存</button></div>
+        </form>
+        <h3 class="group-title">登记</h3>
+        <div class="setting">
+          <div class="setting-text"><strong>移除登记</strong><p class="help">从 dsh-deck 中移除此实例。不会停止进程、卸载软件或删除数据。</p></div>
+          <div class="setting-control"><button type="button" id="btn-remove" class="danger" data-action="remove" data-icon="delete">移除…</button></div>
+        </div>
+      </div>
+
+      <div id="panel-logs" class="tab-panel" role="tabpanel" aria-labelledby="tab-logs" hidden>
+        <div class="log-toolbar">
+          <p class="caption">最近 200 行，已脱敏；仍可能包含主机名和路径。</p>
+          <button type="button" id="btn-logs" class="subtle" data-action="logs" data-icon="refresh">刷新</button>
+          <button type="button" class="subtle" data-action="copy-log" data-icon="copy">复制</button>
+        </div>
+        <pre id="detail-log" class="logbox" tabindex="0" aria-label="实例日志（已脱敏）"></pre>
+      </div>
     </section>
-    <details id="task-panel" class="tasks" open>
-      <summary id="tasks-summary" tabindex="0">任务与结果 <span id="task-count" class="muted">0 条</span></summary>
-      <p class="help">仅保留当前窗口最近 30 条任务，不写入浏览器存储。关闭或刷新页面会清空记录，但不会取消后端已收到的任务。原始输出和认证链接不会进入任务记录。</p>
-      <p id="tasks-empty" class="muted">暂无任务。安装与升级计划、逐项结果和失败原因会持续显示在这里。</p>
-      <div id="task-list" class="task-list" aria-live="polite" aria-relevant="additions text"></div>
-    </details>
   </main>
-  <footer class="statusbar"><span id="sb-text" role="status">正在连接…</span><span id="sb-updated"></span></footer>
+
+  <div id="toasts" class="toasts"></div>
+  <p id="notice" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
 </div>
 
 <dialog id="add-dialog" aria-labelledby="add-title" aria-describedby="add-description">
-  <div class="dialog-head"><h2 id="add-title">添加远端实例</h2><button type="button" data-action="close-dialog" aria-label="关闭添加远端对话框">关闭</button></div>
   <form id="add-form" novalidate>
     <div class="dialog-body">
-      <p id="add-description" class="help">这里只保存登记，不安装软件、不启动服务。显示名称可使用中文；机器标识用于 API、CLI 与状态文件。</p>
-      <div class="field"><label for="in-host">SSH 别名或 user@host <span aria-hidden="true">*</span></label><input type="text" id="in-host" list="ssh-hosts" required autocomplete="off" spellcheck="false" aria-describedby="host-hint in-host-error"><datalist id="ssh-hosts"></datalist><p id="host-hint" class="help"></p><p id="in-host-error" class="error"></p></div>
-      <div class="field"><label for="in-display-name">显示名称（可选，支持中文）</label><input type="text" id="in-display-name" placeholder="例如：开发服务器" autocomplete="off" aria-describedby="in-display-name-error"><p id="in-display-name-error" class="error"></p></div>
-      <div class="field"><label for="in-name">机器标识（可选，留空由后端生成）</label><input type="text" id="in-name" placeholder="例如：dev-server" autocomplete="off" spellcheck="false" aria-describedby="in-name-hint in-name-error"><p id="in-name-hint" class="help">使用英文、数字及 . _ -；保存后不在面板内改名。</p><p id="in-name-error" class="error"></p></div>
-      <div class="field"><label for="in-port">远端服务端口</label><input type="number" id="in-port" value="3080" min="1" max="65535" step="1" inputmode="numeric" aria-describedby="in-port-hint in-port-error"><p id="in-port-hint" class="help">远端 dsh 的 loopback 监听端口，不是 SSH 端口。默认 3080。</p><p id="in-port-error" class="error"></p></div>
+      <h2 id="add-title">添加远端</h2>
+      <p id="add-description" class="dialog-lead">只保存登记，不会安装软件、修改 SSH 配置或启动服务。</p>
+      <div class="field"><label for="in-host">SSH 别名或 user@host</label><input type="text" id="in-host" list="ssh-hosts" required autocomplete="off" spellcheck="false" aria-describedby="host-hint in-host-error"><datalist id="ssh-hosts"></datalist><p id="host-hint" class="help"></p><p id="in-host-error" class="error"></p></div>
+      <div class="form-grid">
+        <div class="field"><label for="in-display-name">显示名称</label><input type="text" id="in-display-name" placeholder="例如：开发服务器" autocomplete="off" aria-describedby="in-display-name-error"><p id="in-display-name-error" class="error"></p></div>
+        <div class="field"><label for="in-name">机器标识</label><input type="text" id="in-name" placeholder="留空自动生成" autocomplete="off" spellcheck="false" aria-describedby="in-name-hint in-name-error"><p id="in-name-hint" class="help">英文、数字及 . _ -，保存后不可改。</p><p id="in-name-error" class="error"></p></div>
+      </div>
+      <div class="field"><label for="in-port">远端服务端口</label><input type="number" id="in-port" value="3080" min="1" max="65535" step="1" inputmode="numeric" aria-describedby="in-port-hint in-port-error"><p id="in-port-hint" class="help">远端 dsh 在 loopback 上的监听端口（不是 SSH 端口）。</p><p id="in-port-error" class="error"></p></div>
       <p id="add-feedback" class="error" role="status" aria-live="polite"></p>
     </div>
-    <div class="dialog-foot"><button type="button" data-action="close-dialog">关闭（不会取消已提交的任务）</button><button type="submit" id="btn-add-ok" class="primary">保存登记</button></div>
+    <div class="dialog-foot"><button type="submit" id="btn-add-ok" data-priority="primary">保存</button><button type="button" data-action="close-dialog">取消</button></div>
   </form>
 </dialog>
 
-<dialog id="more-dialog" aria-labelledby="more-title">
-  <div class="dialog-head"><h2 id="more-title">工具与批量操作</h2><button type="button" data-action="close-dialog" aria-label="关闭工具对话框">关闭</button></div>
+<dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-lines">
   <div class="dialog-body">
-    <p class="help">报告和计划会打开「任务与结果」面板。预览不会安装或升级软件。批量停止会先列出各目标的停止范围。</p>
-    <div class="tool-grid">
-      <button type="button" id="btn-stop-all" data-action="stop-all" class="danger" hidden disabled>停止活动实例（含服务或隧道）</button>
-      <button type="button" id="btn-upgrade-all" data-action="upgrade-all" hidden disabled>预览全部已安装实例的升级计划</button>
-      <button type="button" id="btn-doctor" data-action="doctor" disabled>环境自检报告</button>
-      <button type="button" id="btn-versions" data-action="versions" disabled>检查版本</button>
-      <button type="button" id="btn-tray" data-action="tray" aria-pressed="false" disabled>查询托盘状态</button>
-    </div>
+    <h2 id="confirm-title">确认操作</h2>
+    <div id="confirm-lines" class="dialog-lead"></div>
+    <div id="confirm-plans"></div>
   </div>
+  <div class="dialog-foot"><button type="button" id="confirm-proceed" data-action="confirm-proceed" data-tone="accent">确认</button><button type="button" id="confirm-cancel" data-action="confirm-cancel" autofocus>取消</button></div>
 </dialog>
 
-<dialog id="detail-dialog" aria-labelledby="detail-title" aria-describedby="detail-identity">
-  <div class="dialog-head"><h2 id="detail-title">实例详情与配置</h2><button type="button" data-action="tasks" aria-controls="detail-task">查看任务</button><button type="button" data-action="close-detail" aria-label="关闭实例详情">关闭</button></div>
+<dialog id="report-dialog" class="wide" aria-labelledby="report-title" aria-describedby="report-status">
   <div class="dialog-body">
-    <p id="detail-identity" class="mono muted"></p><p id="detail-status" class="muted"></p>
-    <div id="detail-actions" class="actions" aria-label="当前实例操作">
-      <button type="button" data-action="start">启动</button><button type="button" data-action="open">打开 dsh</button><button type="button" data-action="open-system">系统浏览器打开</button>
-      <button type="button" data-action="stop" class="danger">停止</button><button type="button" data-action="restart" class="danger">重启</button><button type="button" data-action="install">安装准备（先看计划）</button>
-      <button type="button" data-action="preview-install">查看安装计划</button><button type="button" data-action="preview-upgrade">查看升级计划</button><button type="button" id="btn-logs" data-action="logs">载入日志</button>
-    </div>
-    <form id="config-form" novalidate>
-      <h3>登记配置</h3><p class="help">保存配置不会自动停止或重启实例。变更工作目录或固定版本后，应先核对计划和运行状态。后台刷新不会覆盖正在编辑的内容。</p>
-      <div class="form-grid">
-        <div class="field"><label for="cfg-display-name">显示名称</label><input type="text" id="cfg-display-name" autocomplete="off" aria-describedby="cfg-display-name-error"><p id="cfg-display-name-error" class="error"></p></div>
-        <div class="field"><label for="cfg-version">固定 dsh 版本（可留空）</label><input type="text" id="cfg-version" placeholder="例如：0.1.5-rc.1" autocomplete="off" spellcheck="false" aria-describedby="cfg-version-help cfg-version-error"><p id="cfg-version-help" class="help">留空取消固定。这里不是当前已安装版本；保存不代表已经安装此版本。</p><p id="cfg-version-error" class="error"></p></div>
-        <div class="field wide"><label for="cfg-description">描述</label><textarea id="cfg-description" rows="3" aria-describedby="cfg-description-error"></textarea><p id="cfg-description-error" class="error"></p></div>
-      </div>
-      <div id="local-config" class="field"><label for="cfg-workdir">本机工作目录</label><input type="text" id="cfg-workdir" autocomplete="off" spellcheck="false" aria-describedby="cfg-workdir-help cfg-workdir-error"><p id="cfg-workdir-help" class="help">只适用于本机。保存后不会改变已经运行的会话。</p><p id="cfg-workdir-error" class="error"></p></div>
-      <div class="field"><label class="check" for="cfg-enabled"><input type="checkbox" id="cfg-enabled" aria-describedby="cfg-enabled-help"><span>启用此登记</span></label><p id="cfg-enabled-help" class="help">停用只影响默认目标选择，不会停止已有服务或隧道。</p><p id="cfg-enabled-error" class="error"></p></div>
-      <fieldset id="remote-config"><legend>远端生命周期策略</legend>
-        <div class="field"><label class="check" for="cfg-auto-install"><input type="checkbox" id="cfg-auto-install" aria-describedby="cfg-auto-install-help"><span>允许远端启动时准备缺少的软件和服务</span></label><p id="cfg-auto-install-help" class="help">即使允许，面板仍先展示需要确认的计划。关闭后仍可显式选择安装或升级。</p><p id="cfg-auto-install-error" class="error"></p></div>
-        <div class="field"><label class="check" for="cfg-stop-remote"><input type="checkbox" id="cfg-stop-remote" aria-describedby="cfg-stop-remote-help"><span>停止时同时停止远端 dsh 服务</span></label><p id="cfg-stop-remote-help" class="help">关闭后「停止」仅断开本机 SSH 隧道，远端服务继续运行。</p><p id="cfg-stop-remote-error" class="error"></p></div>
-      </fieldset>
-      <p id="config-dirty" class="help" role="status"></p><p id="config-feedback" role="status" aria-live="polite"></p>
-      <div class="actions"><button type="submit" class="primary" id="btn-save-config">保存配置</button><button type="button" class="danger" id="btn-remove" data-action="remove">移除登记…</button></div>
-      <p class="help">移除只取消登记，不停止、不卸载、不删除用户数据；存在受管进程时后端会拒绝。</p>
-    </form>
-    <section id="detail-task" class="detail-task" aria-labelledby="detail-task-heading" hidden><h3 id="detail-task-heading" tabindex="-1">此实例的最近任务与计划</h3><div id="detail-task-body" aria-live="polite"></div></section>
-    <details><summary>日志（按需载入）</summary><pre id="detail-log" class="logbox" tabindex="0" aria-label="已脱敏的实例日志"></pre></details>
+    <h2 id="report-title">报告</h2>
+    <p id="report-status" class="dialog-lead" role="status"></p>
+    <pre id="report-text" class="logbox" tabindex="0" aria-label="已脱敏的报告" hidden></pre>
   </div>
+  <div class="dialog-foot"><button type="button" data-action="copy-report" data-icon="copy">复制</button><button type="button" data-action="close-dialog" data-priority="primary">完成</button></div>
 </dialog>
 
-<dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-help">
-  <div class="dialog-head"><h2 id="confirm-title">确认影响范围</h2></div>
-  <div class="dialog-body"><p id="confirm-help" class="help">请核对目标和实际计划。确认后请求可能持续数分钟；关闭窗口不会取消后端任务。</p><div id="confirm-lines"></div><div id="confirm-plans"></div></div>
-  <div class="dialog-foot"><button type="button" id="confirm-cancel" data-action="confirm-cancel" autofocus>取消，不执行</button><button type="button" class="danger" data-action="confirm-proceed">确认并继续</button></div>
+<dialog id="activity-dialog" class="sheet" aria-labelledby="tasks-heading">
+  <div class="sheet-inner">
+    <div class="sheet-head">
+      <h2 id="tasks-heading" tabindex="-1">活动</h2><span id="task-count" class="count"></span>
+      <button type="button" id="btn-clear-tasks" class="subtle small" data-action="clear-tasks" hidden>清除已结束</button>
+      <button type="button" class="subtle icon" data-action="close-dialog" data-icon="close" aria-label="关闭活动"></button>
+    </div>
+    <p id="tasks-empty" class="sheet-empty">还没有活动。启动、停止、升级等操作的结果会显示在这里。</p>
+    <div id="task-list" class="task-list" aria-live="polite" aria-relevant="additions text"></div>
+    <p class="sheet-foot caption">保留本次会话最近 30 条，关闭面板后清空。关闭此面板不会取消进行中的操作。</p>
+  </div>
 </dialog>
 
 <script type="module" src="/assets/panel.mjs"></script>

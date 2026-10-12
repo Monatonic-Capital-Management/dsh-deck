@@ -159,7 +159,7 @@ async function main() {
         api.calls.push({ url, ...options });
         const result = await handler(url, options);
         if (result !== undefined) return result;
-        if (url === '/api/instances' && options.method !== 'POST') return structuredClone(api.rows);
+        if (['/api/instances', '/api/instances?refresh=1'].includes(url) && options.method !== 'POST') return structuredClone(api.rows);
         if (url === '/api/tray') return { running: false };
         if (url.startsWith('/api/balance')) return { ok: false };
         if (url === '/api/ssh-hosts') return { hosts: [], exists: false, configPath: 'fixture-ssh-config' };
@@ -203,10 +203,10 @@ async function main() {
     ['remote unreachable', { dshInstalled: false, state: 'unreachable' }, false],
   ]) test(`deploy action: ${label}`, () => assert.equal(m.availableActions(base(over)).includes('install'), wanted));
   test('local setup is an installation action, never labelled remote deployment', async () => {
-    const fixture = await panelFixture([base({ kind: 'local', dshInstalled: false, dshVersion: '' })]);
-    const card = fixture.$('.card');
-    assert.match(card.querySelector('[data-role="install"]').textContent, /安装准备/);
-    assert.doesNotMatch(card.querySelector('[data-role="install"]').textContent, /远程/);
+    const { $ } = await panelFixture([base({ kind: 'local', dshInstalled: false, dshVersion: '' })]);
+    const install = $('#detail-actions').querySelector('[data-role="install"]');
+    assert.equal(install.hidden, false); assert.equal(install.dataset.priority, 'primary');
+    assert.match(install.textContent, /安装 dsh/); assert.doesNotMatch(install.textContent, /远程|部署/);
   });
   for (const installed of [false, true]) test(`local install/start are mutually exclusive: installed=${installed}`, () => {
     const actions = m.availableActions(base({ kind: 'local', dshInstalled: installed }));
@@ -245,6 +245,18 @@ async function main() {
     ['failed probe of stopped instance', { state: 'down', statusError: 'probe failed' }, '', true, true],
     ['intentional remote-only', { state: 'remote-only', stopRemoteService: false }, '', true, false],
   ]) test(`filter: ${label}`, () => assert.equal(m.instanceMatches({ ...filterBase, ...over }, query, errors), wanted));
+  test('status filter modes select running and disabled instances; all keeps everything', () => {
+    assert.equal(m.instanceMatches(base({ state: 'up' }), '', 'up'), true);
+    assert.equal(m.instanceMatches(base({ state: 'down' }), '', 'up'), false);
+    assert.equal(m.instanceMatches(base({ enabled: false }), '', 'disabled'), true);
+    assert.equal(m.instanceMatches(base({ state: 'unreachable' }), '', 'attention'), true);
+    assert.equal(m.instanceMatches(base({ state: 'down' }), '', 'all'), true);
+  });
+  test('relative probe time is compact and never invents a time', () => {
+    assert.equal(m.relativeTime(null, NOW), ''); assert.equal(m.relativeTime(NOW - 3_000, NOW), '刚刚');
+    assert.equal(m.relativeTime(NOW - 42_000, NOW), '42 秒前'); assert.equal(m.relativeTime(NOW - 5 * 60_000, NOW), '5 分钟前');
+    assert.equal(m.relativeTime(NOW - 2 * 3_600_000, NOW), '2 小时前');
+  });
   test('filter and editing form are outside the replaceable list', () => {
     const document = new FakeDocument();
     assert.ok(!document.querySelector('#list').contains(document.querySelector('#flt-q')));
@@ -253,6 +265,41 @@ async function main() {
   test('single-instance UI hides unnecessary filters and batch actions', async () => {
     const { $ } = await panelFixture([base()]);
     assert.equal($('#filter').hidden, true); assert.equal($('#btn-start-all').hidden, true);
+  });
+  test('instance list marks each state with a tone and short status text', async () => {
+    const { $, document } = await panelFixture([base({ state: 'up' }), base({ name: 'attention', state: 'unreachable' }), base({ name: 'paused', state: 'disabled', enabled: false })]);
+    const items = Object.fromEntries(document.querySelectorAll('.instance-item').map(node => [node.dataset.name, node]));
+    assert.deepEqual(Object.keys(items), ['host', 'attention', 'paused']); assert.equal($('#count').textContent, '3');
+    assert.equal(items.host.dataset.tone, 'ok'); assert.equal(items.attention.dataset.tone, 'bad'); assert.equal(items.paused.dataset.tone, 'off');
+    assert.match(items.attention.querySelector('[data-role="state"]').textContent, /无法连接/);
+  });
+  test('manual re-probe asks the backend for fresh status and reports the result', async () => {
+    const { $, api } = await panelFixture([base({ state: 'up' }), base({ name: 'other' })]);
+    $('#btn-refresh').click(); await tick(); await tick();
+    assert.ok(api.calls.some(call => call.url === '/api/instances?refresh=1'));
+    assert.match($('#notice').textContent, /探测完成：1 \/ 2/); assert.equal($('#btn-refresh').disabled, false);
+  });
+  test('recovery hints stay visible outside the collapsed connection details', async () => {
+    const { $ } = await panelFixture([base({ state: 'unreachable', failCode: 'auth', hint: 'SSH 认证失败' })]);
+    assert.equal($('[data-role="hint-row"]').closest('details'), null);
+    assert.equal($('[data-role="hint-row"]').hidden, false); assert.match($('[data-role="hint"]').textContent, /认证失败/);
+    assert.doesNotMatch($('[data-role="summary"]').textContent, /认证失败/);
+  });
+  test('finished tasks can be cleared without dropping active work', async () => {
+    const gate = deferred();
+    const { app, $ } = await panelFixture([base({ name: 'a', state: 'up' }), base({ name: 'b', state: 'up' })], url => url.endsWith('/a/stop') ? { ok: true } : url.endsWith('/b/stop') ? gate.promise : undefined);
+    await app.controller.run('stop', ['a']); const pending = app.controller.run('stop', ['b']); await tick();
+    assert.equal($('#btn-clear-tasks').hidden, false); $('#btn-clear-tasks').click();
+    assert.deepEqual(app.controller.state.tasks.map(task => task.targetNames[0]), ['b']);
+    gate.resolve({ ok: true }); await pending;
+  });
+  test('the instance page presents one contextual primary action while keeping stop discoverable', async () => {
+    const { $ } = await panelFixture([base({ state: 'up' })]);
+    const bar = $('#detail-actions');
+    const primary = bar.querySelectorAll('[data-priority="primary"]').filter(button => !button.hidden);
+    assert.equal(primary.length, 1); assert.equal(primary[0].dataset.action, 'open');
+    assert.equal(bar.querySelector('[data-action="stop"]').hidden, false);
+    assert.equal($('[data-role="quick"]').hidden, false); assert.equal($('[data-role="quick"]').dataset.action, 'open');
   });
   test('stop targets include remote-only, tunnel-only and active disabled registrations', () => {
     const instances = ['up', 'up-external', 'remote-only', 'tunnel-only', 'unhealthy', 'down', 'disabled'].map((state, index) => base({ name: String(index), state, enabled: false }));
@@ -434,6 +481,42 @@ async function main() {
     const task = await pending; assert.equal(task.status, 'preview'); assert.equal(task.plans.length, 2);
     assert.ok(!api.calls.some(call => call.method === 'POST' || call.url.includes('dry=')));
   });
+  test('upgrade reads the plan, confirms with it, then POSTs only instances that change', async () => {
+    const events = [];
+    const { controller, api } = await controllerFixture([base({ name: 'a' }), base({ name: 'b' })], (url, options) => {
+      if (url === '/api/upgrade?name=a' && options.method !== 'POST') return { ok: true, plans: [plan('a', 'upgrade', { changesSoftware: true, requiresConfirmation: true })] };
+      if (url === '/api/upgrade?name=b' && options.method !== 'POST') return { ok: true, plans: [plan('b', 'upgrade')] };
+      if (url === '/api/upgrade?name=a') { events.push('post-a'); return { ok: true, message: '已升级' }; }
+      return undefined;
+    }, { confirm: async data => { events.push('confirm'); assert.deepEqual(data.plans.map(item => item.name), ['a']); assert.match(data.title, /升级/); return true; } });
+    const task = await controller.run('upgrade', ['a', 'b']);
+    assert.deepEqual(events, ['confirm', 'post-a']); assert.equal(task.status, 'success');
+    assert.ok(!api.calls.some(call => call.method === 'POST' && call.url === '/api/upgrade?name=b'));
+    assert.match(task.results.find(result => result.name === 'b').message, /已是目标版本/);
+  });
+  test('upgrade with nothing to change and cancelled upgrade both send no mutation', async () => {
+    let confirmations = 0;
+    const { controller, api } = await controllerFixture([base()], url => url === '/api/upgrade?name=host' ? { ok: true, plans: [plan('host', 'upgrade')] } : undefined,
+      { confirm: async () => { confirmations++; return false; } });
+    const noop = await controller.run('upgrade', ['host']);
+    assert.equal(noop.status, 'success'); assert.equal(confirmations, 0);
+    const { controller: second, api: secondApi } = await controllerFixture([base()], url => url === '/api/upgrade?name=host' ? { ok: true, plans: [plan('host', 'upgrade', { changesSoftware: true })] } : undefined,
+      { confirm: async () => false });
+    const cancelled = await second.run('upgrade', ['host']);
+    assert.equal(cancelled.status, 'cancelled'); assert.equal(cancelled.results.length, 0);
+    assert.ok(![...api.calls, ...secondApi.calls].some(call => call.method === 'POST'));
+  });
+  test('list and instance page expose an executable upgrade entry, not just a preview', async () => {
+    const { app, $, document } = await panelFixture([base({ state: 'up', dshVersion: '0.1.5', updateAvailable: true, targetVersion: '0.1.6' })],
+      url => url === '/api/upgrade?name=host' ? { ok: true, plans: [plan('host', 'upgrade', { changesSoftware: true })] } : undefined, { confirm: async () => false });
+    const pageButton = $('[data-role="update-row"]').querySelector('[data-action="upgrade"]');
+    assert.equal($('[data-role="update-row"]').hidden, false); assert.equal(pageButton.disabled, false);
+    assert.equal($('[data-role="update-badge"]').hidden, false);
+    assert.equal(document.querySelectorAll('[data-action="preview-upgrade"]').length, 0);
+    assert.equal($('#detail-menu').querySelector('[data-action="upgrade"]').hidden, false);
+    pageButton.click(); await tick(); await tick();
+    assert.equal(app.controller.state.tasks.at(-1).action, 'upgrade');
+  });
   test('late poll cannot overwrite a completed mutation', async () => {
     const old = deferred(); let reads = 0;
     const { controller } = await controllerFixture([base({ kind: 'local' })], (url, options) => {
@@ -466,12 +549,13 @@ async function main() {
     assert.match(confirmation.lines.join(' '), /不停止进程、不卸载软件、不删除用户数据/);
     assert.equal(api.calls.filter(call => call.method === 'POST').length, 1); assert.equal(controller.state.instances.length, 1);
   });
-  test('fresh URL opens with noopener; null is not reported as blocked; tokens stay out of the DOM/history', async () => {
+  test('fresh URL opens through the frameless app-window endpoint; tokens stay out of the DOM/history', async () => {
     const freshURL = 'http://127.0.0.1:3080/?t=fixture-fresh-url';
-    const { app, opened, document } = await panelFixture([base({ state: 'up', url: 'http://127.0.0.1:3080/?token=fixture-old-url' })], url => url.endsWith('/url') ? { ok: true, url: freshURL } : undefined);
+    const { app, api, opened, document } = await panelFixture([base({ state: 'up', url: 'http://127.0.0.1:3080/?token=fixture-old-url' })], url => url.endsWith('/url') ? { ok: true, url: freshURL } : url === '/api/open-window' ? { ok: true, appWindow: true } : undefined);
     const task = await app.controller.openInstance('host');
-    assert.equal(opened[0][0], freshURL); assert.match(opened[0][2], /noopener/); assert.equal(task.status, 'success');
-    assert.doesNotMatch(task.phase, /拦截/); assert.match(task.results[0].message, /已请求/);
+    const call = api.calls.find(item => item.url === '/api/open-window');
+    assert.equal(call.method, 'POST'); assert.equal(call.body.url, freshURL); assert.equal(opened.length, 0); assert.equal(task.status, 'success');
+    assert.match(task.results[0].message, /无边框窗口/);
     assert.ok(!JSON.stringify(app.controller.state.tasks).includes('fixture-fresh-url'));
     assert.ok(!document.textContent.includes('fixture-old-url'));
     for (const node of document.querySelectorAll('*')) assert.ok(!JSON.stringify([node.attrs, node.dataset, node.title]).includes('fixture-old-url'));
@@ -479,6 +563,12 @@ async function main() {
   test('fresh URL failure never falls back to the cached link', async () => {
     const { app, opened } = await panelFixture([base({ state: 'up', url: 'http://localhost:3080/?t=fixture-old' })], url => { if (url.endsWith('/url')) throw new Error('probe unavailable'); });
     const task = await app.controller.openInstance('host'); assert.equal(task.status, 'failed'); assert.equal(opened.length, 0); assert.match(task.phase, /没有回退/);
+  });
+  test('app-window fallback to the default browser is reported, and backend refusal is a failure', async () => {
+    const { controller } = await controllerFixture([base({ state: 'up' })], url => url.endsWith('/url') ? { ok: true, url: 'http://127.0.0.1:3080/' } : url === '/api/open-window' ? { ok: true, appWindow: false } : undefined);
+    const task = await controller.openInstance('host'); assert.equal(task.status, 'success'); assert.match(task.results[0].message, /系统默认浏览器/);
+    const { controller: refused } = await controllerFixture([base({ state: 'up' })], url => url.endsWith('/url') ? { ok: true, url: 'http://127.0.0.1:3080/' } : url === '/api/open-window' ? { ok: false, message: 'refused' } : undefined);
+    assert.equal((await refused.openInstance('host')).status, 'failed');
   });
   test('explicit system browser fallback re-fetches the address before reveal', async () => {
     const freshURL = 'http://localhost:3080/?token=fixture-new';
@@ -490,42 +580,75 @@ async function main() {
     const { $, copied } = await panelFixture([base({ state: 'up', url: 'http://localhost:3080/?token=fixture-copy#fixture-hash' })]);
     $('[data-action="copy-url"]').click(); await tick(); assert.deepEqual(copied, ['http://localhost:3080/']);
   });
-  test('upgrade preview opens the persistent results and is visible inside an open detail dialog', async () => {
+  test('upgrade preview stays on the instance page and never pops the activity sheet', async () => {
     const { app, $ } = await panelFixture([base()], url => url.startsWith('/api/upgrade?') ? { ok: true, plans: [plan('host', 'upgrade', { changesSoftware: true, steps: ['安装目标 0.1.6'], warnings: ['现有连接会中断'] })] } : undefined);
-    app.openDetail('host'); $('#task-panel').open = false;
+    app.selectInstance('host');
     const task = await app.controller.run('upgrade', ['host'], { preview: true });
-    assert.equal(task.status, 'preview'); assert.equal($('#task-panel').open, true); assert.equal($('#detail-task').hidden, false);
-    assert.equal($('#detail-task').wasScrolled, true);
+    assert.equal(task.status, 'preview'); assert.equal($('#detail-task').hidden, false);
     assert.match($('#detail-task-body').textContent, /安装目标 0\.1\.6/); assert.match($('#detail-task-body').textContent, /现有连接会中断/);
-    assert.equal($('#detail-dialog').open, true);
+    assert.equal($('#activity-dialog').open, false);
   });
-  test('polling preserves search/caret, detail edits, checkbox values and focused card node identity', async () => {
+  test('operations never pop the activity sheet; a failure toasts with a link to its record', async () => {
+    const { $, document } = await panelFixture([base({ state: 'up' })], (url, options) => url.endsWith('/host/stop') && options.method === 'POST' ? { ok: false, message: 'fixture refused' } : undefined);
+    $('#detail-actions').querySelector('[data-action="stop"]').click();
+    for (let i = 0; i < 12; i++) await tick();
+    assert.equal($('#activity-dialog').open, false); assert.equal($('#task-indicator').dataset.state, 'attention');
+    const toast = $('#toasts').querySelector('.toast');
+    assert.equal(toast.dataset.tone, 'critical'); assert.match(toast.textContent, /fixture refused/);
+    toast.querySelector('[data-action="view-task"]').click(); await tick();
+    assert.equal($('#activity-dialog').open, true); assert.equal($('#toasts').children.length, 0);
+    assert.equal($('#task-indicator').dataset.state, 'idle'); assert.ok(document.activeElement.closest('#activity-dialog'));
+  });
+  test('one-pane layout moves between the list and the instance page and restores focus on back', async () => {
+    const { $, document } = await panelFixture([base(), base({ name: 'other' })]);
+    assert.equal($('#app').dataset.view, 'list');
+    const item = document.querySelectorAll('.instance-item').find(node => node.dataset.name === 'other'), main = item.querySelector('[data-role="name"]');
+    main.click(); await tick();
+    assert.equal($('#app').dataset.view, 'detail'); assert.equal(item.dataset.selected, 'true'); assert.equal(main.getAttribute('aria-current'), 'true');
+    $('#btn-back').click(); await tick();
+    assert.equal($('#app').dataset.view, 'list'); assert.equal(document.activeElement, main);
+  });
+  test('tabs follow arrow keys; menus focus their first item and Escape returns to the trigger', async () => {
+    const { $, document } = await panelFixture([base({ state: 'up', url: 'http://127.0.0.1:3099/' })]);
+    const key = (target, value) => target.dispatchEvent({ type: 'keydown', key: value, bubbles: true });
+    $('#tab-overview').focus(); key($('#tab-overview'), 'ArrowRight');
+    assert.equal($('#tab-settings').getAttribute('aria-selected'), 'true'); assert.equal(document.activeElement, $('#tab-settings'));
+    assert.equal($('#panel-settings').hidden, false); assert.equal($('#panel-overview').hidden, true);
+    $('#detail-more').click(); await tick();
+    assert.equal($('#detail-menu').hidden, false); assert.equal($('#detail-more').getAttribute('aria-expanded'), 'true');
+    assert.equal(document.activeElement.getAttribute('role'), 'menuitem'); assert.ok($('#detail-menu').contains(document.activeElement));
+    key(document.activeElement, 'Escape');
+    assert.equal($('#detail-menu').hidden, true); assert.equal(document.activeElement, $('#detail-more'));
+  });
+  test('polling preserves search/caret, settings edits, checkbox values and focused list item node identity', async () => {
     const { app, api, $, document } = await panelFixture([base(), base({ name: 'other' })]);
     const search = $('#flt-q'); search.value = 'host'; search.selectionStart = 2; search.selectionEnd = 2; search.focus();
     api.rows[0].probedAt = NOW + 1; await app.controller.refresh(); assert.equal(document.activeElement, search); assert.equal(search.selectionStart, 2);
     const cardButton = $('[data-role="name"]'); cardButton.focus(); api.rows[0].probedAt++;
     await app.controller.refresh(); assert.equal(document.activeElement, cardButton); assert.equal($('[data-role="name"]'), cardButton);
-    app.openDetail('host'); const field = $('#cfg-display-name'); field.value = '未保存的中文'; field.selectionStart = 3; field.focus(); $('#cfg-auto-install').checked = false;
+    app.selectInstance('host'); app.setTab('settings'); const field = $('#cfg-display-name'); field.value = '未保存的中文'; field.selectionStart = 3; field.focus(); $('#cfg-auto-install').checked = false;
     api.rows[0].displayName = '后端旧名称'; await app.controller.refresh();
     assert.equal(document.activeElement, field); assert.equal(field.value, '未保存的中文'); assert.equal(field.selectionStart, 3); assert.equal($('#cfg-auto-install').checked, false);
   });
   test('batch DOM busy covers queued targets and configuration controls', async () => {
     const gate = deferred();
     const { app, $, document } = await panelFixture([base({ name: 'a', state: 'up' }), base({ name: 'b', state: 'tunnel-only' })], url => url.endsWith('/a/stop') ? gate.promise : url.endsWith('/b/stop') ? { ok: false } : undefined);
-    app.openDetail('b'); const pending = app.controller.run('stop', ['a', 'b']); await tick();
+    app.selectInstance('b'); const pending = app.controller.run('stop', ['a', 'b']); await tick();
     assert.equal($('#btn-save-config').disabled, true); assert.equal($('#btn-remove').disabled, true); assert.equal($('#cfg-description').disabled, true);
-    for (const card of document.querySelectorAll('.card')) assert.equal(card.querySelector('[data-action="stop"]').disabled, true);
+    assert.equal($('#detail-actions').querySelector('[data-action="stop"]').disabled, true);
+    for (const item of document.querySelectorAll('.instance-item')) { assert.equal(item.getAttribute('aria-busy'), 'true'); assert.equal(item.querySelector('[data-role="quick"]').disabled, true); }
     gate.resolve({ ok: true }); await pending; assert.equal($('#btn-save-config').disabled, false);
   });
   test('field errors are local and invalid configuration never sends a POST', async () => {
     const { app, $, api, document } = await panelFixture([base()]);
-    app.openDetail('host'); $('#cfg-version').value = 'latest'; await app.saveConfig();
+    app.selectInstance('host'); $('#cfg-version').value = 'latest'; await app.saveConfig();
+    assert.equal($('#tab-settings').getAttribute('aria-selected'), 'true');
     assert.equal($('#cfg-version').getAttribute('aria-invalid'), 'true'); assert.match($('#cfg-version-error').textContent, /明确版本/);
     assert.equal(document.activeElement, $('#cfg-version')); assert.ok(!api.calls.some(call => call.method === 'POST'));
   });
   test('a failed config save leaves the typed draft and visible reason intact', async () => {
     const { app, $ } = await panelFixture([base()], url => url.endsWith('/config') ? { ok: false, message: 'fixture save failure' } : undefined);
-    app.openDetail('host'); $('#cfg-display-name').value = '未保存草稿'; await app.saveConfig();
+    app.selectInstance('host'); $('#cfg-display-name').value = '未保存草稿'; await app.saveConfig();
     assert.equal($('#cfg-display-name').value, '未保存草稿'); assert.match($('#config-feedback').textContent, /fixture save failure/);
     assert.equal($('#detail-task').hidden, false);
   });
@@ -536,11 +659,12 @@ async function main() {
     assert.equal($('#confirm-dialog').open, true); assert.equal(document.activeElement, $('#confirm-cancel'));
     $('#confirm-dialog').close(''); assert.equal(await pending, false); assert.equal(document.activeElement, opener);
   });
-  test('Escape cannot silently discard a dirty detail draft', async () => {
-    const { app, $ } = await panelFixture([base()], undefined, { confirm: async () => false });
-    app.openDetail('host'); $('#cfg-display-name').value = '草稿';
-    const event = { type: 'cancel' }; $('#detail-dialog').dispatchEvent(event); await tick();
-    assert.equal(event.defaultPrevented, true); assert.equal($('#detail-dialog').open, true); assert.equal($('#cfg-display-name').value, '草稿');
+  test('switching instances cannot silently discard a dirty settings draft', async () => {
+    const asked = [];
+    const { app, $ } = await panelFixture([base(), base({ name: 'other', displayName: '另一台' })], undefined, { confirm: async data => { asked.push(data.title); return false; } });
+    await app.selectInstance('host'); $('#cfg-display-name').value = '草稿';
+    assert.equal(await app.selectInstance('other'), false); assert.match(asked[0], /未保存/);
+    assert.equal($('#detail-title').textContent, '开发主机'); assert.equal($('#cfg-display-name').value, '草稿');
   });
   test('diagnostics are reports, not a false all-checks-passed result', async () => {
     const { controller } = await controllerFixture([base()], url => url === '/api/doctor' ? { text: 'failed\nAuthorization: Bearer fixture-report\nhttp://localhost/?t=fixture-log' } : undefined);
@@ -554,23 +678,23 @@ async function main() {
     const [it] = m.mergeSnapshot([base({ state: 'up' })], [base({ state: 'down', probedAt: NOW - 100, attemptedAt: NOW + 100, statusError: 'latest failure' })]);
     assert.equal(it.state, 'up'); assert.equal(it.probedAt, NOW); assert.equal(it.statusError, 'latest failure');
   });
-  test('config retry inside the detail dialog does not discard the failed draft', async () => {
+  test('config retry from the instance page does not discard the failed draft', async () => {
     const { app, $ } = await panelFixture([base()], url => url.endsWith('/config') ? { ok: false, message: 'save rejected' } : undefined);
-    app.openDetail('host'); $('#cfg-display-name').value = '失败后保留的草稿'; await app.saveConfig();
+    app.selectInstance('host'); $('#cfg-display-name').value = '失败后保留的草稿'; await app.saveConfig();
     $('#detail-task-body').querySelector('[data-action="retry-task"]').click(); await tick();
     assert.equal($('#cfg-display-name').value, '失败后保留的草稿'); assert.match($('#config-feedback').textContent, /草稿已保留/);
   });
   test('nested dialog close falls back inside the still-open dialog, not the inert page', () => {
     const document = new FakeDocument(), dialogs = p.createDialogManager(document);
-    const detail = document.querySelector('#detail-dialog'), confirm = document.querySelector('#confirm-dialog');
-    dialogs.open(detail); const action = document.querySelector('#btn-save-config'); action.focus(); dialogs.open(confirm); action.disabled = true;
+    const sheet = document.querySelector('#activity-dialog'), confirm = document.querySelector('#confirm-dialog');
+    dialogs.open(sheet); const action = document.querySelector('#btn-clear-tasks'); action.hidden = false; action.focus(); dialogs.open(confirm); action.disabled = true;
     dialogs.close(confirm);
-    assert.ok(detail.contains(document.activeElement)); assert.equal(document.activeElement.disabled, false);
+    assert.ok(sheet.contains(document.activeElement)); assert.equal(document.activeElement.disabled, false);
   });
-  test('loading logs opens their disclosure and redacts text before display', async () => {
+  test('loading logs switches to the log tab and redacts text before display', async () => {
     const { app, $ } = await panelFixture([base()], url => url.includes('/logs?') ? { text: 'http://localhost/?token=fixture-log-secret' } : undefined);
-    app.openDetail('host'); $('#btn-logs').click(); await tick();
-    assert.equal($('#detail-log').closest('details').open, true); assert.ok(!$('#detail-log').textContent.includes('fixture-log-secret'));
+    app.selectInstance('host'); $('#btn-logs').click(); await tick();
+    assert.equal($('#panel-logs').hidden, false); assert.equal($('#tab-logs').getAttribute('aria-selected'), 'true'); assert.ok(!$('#detail-log').textContent.includes('fixture-log-secret'));
   });
   test('rendered task escapes markup and exposes explicit retry/plan actions', () => {
     const task = { id: 1, action: 'stop', title: '<img src=x>', targetLabels: ['a'], targetNames: ['a'], startedAt: NOW,
@@ -581,7 +705,11 @@ async function main() {
     const document = new FakeDocument();
     for (const dialog of document.querySelectorAll('dialog')) assert.ok(document.querySelector(`#${dialog.getAttribute('aria-labelledby')}`));
     for (const input of document.querySelectorAll('input,textarea')) assert.ok(document.querySelector(`label[for="${input.id}"]`), `Missing label for ${input.id}`);
-    assert.ok(document.querySelector('[aria-live="polite"]')); assert.equal(document.querySelector('#task-panel').open, true);
+    assert.ok(document.querySelector('[aria-live="polite"]')); assert.equal(document.querySelector('#activity-dialog').open, false);
+    for (const tab of document.querySelectorAll('[role="tab"]')) {
+      const panel = document.querySelector(`#${tab.getAttribute('aria-controls')}`);
+      assert.equal(panel?.getAttribute('role'), 'tabpanel'); assert.equal(panel.getAttribute('aria-labelledby'), tab.id);
+    }
   });
   test('CSP-compatible external modules/styles, no inline handlers, injected token, storage or eval', () => {
     assert.match(html, /src="\/assets\/panel\.mjs"/); assert.match(html, /href="\/assets\/panel\.css"/);
@@ -594,16 +722,26 @@ async function main() {
     const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '').replace(/"[^"\n]*"|'[^'\n]*'/g, '');
     const stack = [], pair = { ')': '(', ']': '[', '}': '{' };
     for (const char of stripped) { if ('([{'.includes(char)) stack.push(char); else if (')]}'.includes(char)) assert.equal(stack.pop(), pair[char]); }
-    assert.equal(stack.length, 0); assert.match(css, /minmax\(min\(100%, 320px\), 1fr\)/);
+    assert.equal(stack.length, 0);
+    assert.match(css, /container: page \/ inline-size/); assert.match(css, /@container page \(max-width: 620px\)/);
+    assert.match(css, /@media \(max-width: 680px\)/); assert.match(css, /#app\[data-view="detail"\] \.sidebar \{ display: none; \}/);
+    assert.match(css, /@media \(prefers-reduced-motion: no-preference\)/); assert.doesNotMatch(css, /minmax\(max-content/);
     assert.match(css, /flex-wrap: wrap/); assert.match(css, /:focus-visible/);
     assert.doesNotMatch(css, /body\s*\{[^}]*overflow:\s*hidden/);
   });
-  test('secondary text has at least 4.5:1 contrast on all main surfaces', () => {
-    const color = name => css.match(new RegExp(`--${name}: (#[a-f0-9]{6})`))[1];
+  test('secondary and status text has at least 4.5:1 contrast on all main surfaces in both themes', () => {
     const luminance = hex => [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16) / 255)
       .map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4)
       .reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
-    for (const surface of ['bg', 'surface', 'surface-raised']) assert.ok((luminance(color('muted')) + .05) / (luminance(color(surface)) + .05) >= 4.5);
+    const themes = css.split('@media (prefers-color-scheme: light)');
+    assert.equal(themes.length, 2);
+    for (const theme of themes) {
+      const color = name => luminance(theme.match(new RegExp(`--${name}: (#[a-f0-9]{6})`))[1]);
+      for (const fg of ['muted', 'accent-text', 'ok-text', 'warn-text']) for (const surface of ['bg', 'surface', 'surface-raised']) {
+        const [high, low] = [color(fg), color(surface)].sort((a, b) => b - a);
+        assert.ok((high + .05) / (low + .05) >= 4.5, `${fg} on ${surface}`);
+      }
+    }
   });
   test('shipped ESM modules and test entry point parse with node --check', () => {
     for (const file of ['app/ui/model.mjs', 'app/ui/panel.mjs', 'tools/check-ui.js']) execFileSync(process.execPath, ['--check', path.join(root, file)], { stdio: 'pipe' });

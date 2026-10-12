@@ -44,7 +44,7 @@ Windows 上的本地与远程 [DeepSeek Harness](https://github.com/deepseek-ai/
 
 ## 添加远端
 
-先确保对应 SSH 别名可以连接，再在面板选择“添加服务器”，或使用命名参数：
+先确保对应 SSH 别名可以连接，再在面板选择“添加远端”，或使用命名参数：
 
 <augment_code_snippet path="dsh.ps1" mode="EXCERPT">
 ````powershell

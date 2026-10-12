@@ -543,12 +543,46 @@ const routes = {
     await launchDesktop('explorer.exe', [resolved]);
     return { ok: true, opened: 'directory' };
   },
+
+  'POST /api/open-window': async (ctx) => {
+    // An instance page in a Chrome/Edge --app window: no tab strip or address
+    // bar, sharing the panel's browser profile. Without either browser it falls
+    // back to the default browser, exactly like the explicit system open.
+    const raw = ctx.body && ctx.body.url ? String(ctx.body.url) : '';
+    let target = null;
+    try { target = new URL(raw); } catch (_) { target = null; }
+    if (!target || target.protocol !== 'http:' || target.hostname !== HOST || target.username || target.password) {
+      throw problem(400, 'INVALID_URL', '这里只能打开本机 loopback 上的实例地址。');
+    }
+    const browser = findAppBrowser();
+    if (!browser) {
+      await launchDesktop('rundll32.exe', ['url.dll,FileProtocolHandler', target.href]);
+      return { ok: true, opened: 'browser', appWindow: false };
+    }
+    await launchDesktop(browser, [`--app=${target.href}`, `--user-data-dir=${path.join(LAUNCHER_DIR, 'browser-profile')}`,
+      '--no-first-run', '--no-default-browser-check', '--window-size=1280,860'], { windowsHide: false });
+    return { ok: true, opened: 'app-window', appWindow: true };
+  },
 };
 
-async function launchDesktop(command, args) {
+// Same search order as Open-Instance -AsAppWindow in launcher/Desktop.ps1.
+function findAppBrowser() {
+  if (options.findBrowser) return options.findBrowser();
+  const env = process.env;
+  const candidates = [
+    env.ProgramFiles && path.join(env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    env['ProgramFiles(x86)'] && path.join(env['ProgramFiles(x86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    env.ProgramFiles && path.join(env.ProgramFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    env['ProgramFiles(x86)'] && path.join(env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  ].filter(Boolean);
+  return candidates.find(file => { try { return fs.statSync(file).isFile(); } catch (_) { return false; } }) || null;
+}
+
+async function launchDesktop(command, args, { windowsHide = true } = {}) {
   if (options.launchDesktop) return options.launchDesktop(command, args);
   await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide });
     child.once('error', () => reject(problem(502, 'OPEN_FAILED', '无法启动桌面应用。')));
     child.once('spawn', () => { child.unref(); resolve(); });
   });

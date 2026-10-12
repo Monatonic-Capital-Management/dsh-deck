@@ -58,6 +58,7 @@ async function fixture(t, overrides = {}) {
   };
   const desktop = [];
   const app = createApp({ run, token: secret, persist: false, poll: false, trace: () => {},
+    findBrowser: overrides.findBrowser || (() => null),
     launchDesktop: async (command, args) => desktop.push({ command, args }) });
   const { port } = await app.start();
   t.after(() => app.close());
@@ -238,6 +239,21 @@ test('desktop reveal refuses executable files and non-loopback URLs without laun
     assert.equal((await f.request('/api/reveal', { method: 'POST', body: { path: value } })).status, 400);
   }
   assert.equal(f.desktop.length, 0);
+});
+test('instance windows open as a frameless --app window on loopback only, with a system-browser fallback', async t => {
+  const f = await fixture(t, { findBrowser: () => 'C:\\fixture\\chrome.exe' });
+  for (const value of ['https://example.invalid', 'http://example.invalid/', 'file:///example.exe', 'http://user:pw@127.0.0.1:3080/', '']) {
+    assert.equal((await f.request('/api/open-window', { method: 'POST', body: { url: value } })).status, 400);
+  }
+  assert.equal(f.desktop.length, 0);
+  const r = await f.request('/api/open-window', { method: 'POST', body: { url: 'http://127.0.0.1:3080/?t=x' } });
+  assert.equal(r.status, 200); assert.equal(r.data.appWindow, true);
+  assert.equal(f.desktop[0].command, 'C:\\fixture\\chrome.exe');
+  assert.ok(f.desktop[0].args.includes('--app=http://127.0.0.1:3080/?t=x'));
+  assert.ok(f.desktop[0].args.some(arg => arg.startsWith('--user-data-dir=') && arg.endsWith('browser-profile')));
+  const g = await fixture(t);
+  const fallback = await g.request('/api/open-window', { method: 'POST', body: { url: 'http://127.0.0.1:3080/' } });
+  assert.equal(fallback.data.appWindow, false); assert.equal(g.desktop[0].command, 'rundll32.exe');
 });
 test('strict JSON parser refuses mixed console text and tolerates UTF-8 BOM', () => {
   assert.equal(parseJson('[ok] progress\n{"ok":true}'), null);
